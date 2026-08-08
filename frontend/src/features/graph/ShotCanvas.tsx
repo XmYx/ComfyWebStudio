@@ -1,6 +1,7 @@
-import { useCallback, useMemo } from 'react'
+import { useCallback, useEffect, useMemo } from 'react'
 import {
-  Background, BackgroundVariant, Controls, ReactFlow, ReactFlowProvider,
+  applyNodeChanges,
+  Background, BackgroundVariant, Controls, ReactFlow, ReactFlowProvider, useNodesState, useReactFlow,
   type Connection, type Edge, type Node, type NodeChange,
 } from '@xyflow/react'
 
@@ -8,6 +9,7 @@ import { api, ApiError } from '@/api/client'
 import type { Project, Shot } from '@/api/types'
 import { KIND_COLOR, canConnect } from '@/lib/kinds'
 import { useStudio } from '@/store/studio'
+import { useLayout } from '@/store/layout'
 import { Empty, useToast } from '@/components/ui'
 import { StepNode, type StepNodeData } from './StepNode'
 
@@ -36,11 +38,15 @@ export function ShotCanvas(props: Props) {
 
 function Canvas({ project, shot, onChanged, onRunStep }: Props) {
   const toast = useToast()
+  const flow = useReactFlow()
+  const setCanvas = useLayout((s) => s.setCanvas)
   const liveSteps = useStudio((s) => s.liveSteps)
   const selectedStepId = useStudio((s) => s.selectedStepId)
   const selectStep = useStudio((s) => s.selectStep)
 
-  const nodes = useMemo<Node<StepNodeData>[]>(
+  // React Flow is used in controlled mode, so a drag only moves a node if the change is applied back to
+  // the nodes we hand it. `derived` is the truth from the server; `nodes` is what the canvas edits.
+  const derived = useMemo<Node<StepNodeData>[]>(
     () =>
       shot.steps.map((step) => {
         const live = liveSteps[step.id]
@@ -68,6 +74,17 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     [shot.steps, project, liveSteps, selectedStepId, onRunStep, onChanged],
   )
 
+  const [nodes, setNodes] = useNodesState<Node<StepNodeData>>(derived)
+
+  // Fold server updates (progress, new previews, added or removed steps) into the canvas without
+  // disturbing a position the user is currently dragging.
+  useEffect(() => {
+    setNodes((current) => {
+      const positions = new Map(current.map((node) => [node.id, node.position]))
+      return derived.map((node) => ({ ...node, position: positions.get(node.id) ?? node.position }))
+    })
+  }, [derived, setNodes])
+
   const edges = useMemo<Edge[]>(
     () =>
       shot.links.map((link) => {
@@ -86,6 +103,18 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       }),
     [shot.links, shot.steps, project.workflows, liveSteps],
   )
+
+  // Hand the Window menu a handle on this canvas, and take it back on unmount so a stale one cannot
+  // outlive the view it belonged to.
+  useEffect(() => {
+    setCanvas({
+      zoomIn: () => flow.zoomIn({ duration: 150 }),
+      zoomOut: () => flow.zoomOut({ duration: 150 }),
+      fitView: () => flow.fitView({ padding: 0.25, duration: 200 }),
+      selectAll: () => setNodes((current) => current.map((n) => ({ ...n, selected: true }))),
+    })
+    return () => setCanvas(null)
+  }, [flow, setCanvas, setNodes])
 
   const portOf = useCallback(
     (stepId: string | null, portKey: string | null | undefined, direction: 'in' | 'out') => {
@@ -140,7 +169,10 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
   )
 
   const onNodesChange = useCallback(
-    (changes: NodeChange[]) => {
+    (changes: NodeChange<Node<StepNodeData>>[]) => {
+      // Apply first — without this the node snaps back and dragging does nothing.
+      setNodes((current) => applyNodeChanges(changes, current))
+
       for (const change of changes) {
         if (change.type === 'position' && change.dragging === false && change.position) {
           // Persist only on drag end: saving every intermediate position would hammer the API.
@@ -153,7 +185,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
         }
       }
     },
-    [project.id, selectStep],
+    [project.id, selectStep, setNodes],
   )
 
   const onNodesDelete = useCallback(

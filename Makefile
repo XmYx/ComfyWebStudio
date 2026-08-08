@@ -47,6 +47,7 @@ test-frontend: ## Run frontend unit tests and typecheck
 
 ui-smoke: ## Browser smoke test against a running app (needs `make backend` and a project with a run)
 	$(PY) scripts/ui_smoke.py --shots-dir .data/screenshots
+	$(PY) scripts/ui_menus.py --shots-dir .data/screenshots
 
 lint: ## Ruff check
 	$(PY) -m ruff check backend tests

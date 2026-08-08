@@ -10,8 +10,10 @@ from fastapi import APIRouter
 
 from . import (
     bridge,
+    comfy_browse,
     events,
     media,
+    plugins,
     projects,
     runs,
     settings_api,
@@ -24,11 +26,13 @@ from . import (
 ROUTERS: list[APIRouter] = [
     projects.router,
     workflows.router,
+    comfy_browse.router,
     shots.router,
     runs.router,
     media.router,
     timeline.router,
     settings_api.router,
+    plugins.router,
     bridge.router,
     events.router,
 ]

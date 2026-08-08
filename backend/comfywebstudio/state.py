@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 from .comfy.backend import ComfyBackend, create_backend
 from .comfy.objectinfo import ObjectInfoCache
 from .core.errors import BackendUnavailable
+from .core.plugins import PluginStore
 from .core.store import ProjectStore
 from .execution.events import EventBus
 from .execution.orchestrator import Orchestrator
@@ -111,6 +113,7 @@ class AppState:
         self.store = ProjectStore(self.settings)
         self.media_store = MediaStore(self.store)
         self.media = MediaTransfer(self.store, self.media_store, self.settings.preview)
+        self.plugins = PluginStore(Path(self.settings.root) / "plugins", self.store)
         self.backends = BackendManager(self.settings, self.events)
         self.orchestrator = Orchestrator(
             self.store, self.media, self.settings, self.events, self.backends.get

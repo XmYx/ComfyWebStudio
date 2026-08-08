@@ -29,6 +29,7 @@ from typing import Any
 
 from ..settings import AppSettings
 from .errors import Conflict, NotFound, ValidationFailed
+from .history import ProjectHistory
 from .ids import safe_component, slugify
 from .migrations import migrate
 from .models import Project, Run, WorkflowRef
@@ -44,9 +45,11 @@ EXPORT_FORMAT_VERSION = 1
 class ProjectStore:
     """Reads and writes projects under ``settings.projects_dir``."""
 
-    def __init__(self, settings: AppSettings):
+    def __init__(self, settings: AppSettings, history: ProjectHistory | None = None):
         self.settings = settings
         self._dir_cache: dict[str, Path] = {}
+        #: Every mutation funnels through save(), so snapshotting there covers all of them.
+        self.history = history or ProjectHistory()
 
     @property
     def root(self) -> Path:
@@ -158,8 +161,23 @@ class ProjectStore:
         for sub in ("workflows", "runs", "assets", "thumbs", "renders"):
             (directory / sub).mkdir(parents=True, exist_ok=True)
 
-        _atomic_write_json(directory / PROJECT_FILE, project.model_dump(mode="json"))
-        return directory / PROJECT_FILE
+        path = directory / PROJECT_FILE
+        # Snapshot the state we are about to replace, so this edit becomes undoable.
+        if path.is_file():
+            try:
+                self.history.record(project.id, json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.debug("Could not snapshot %s for undo: %s", project.id, exc)
+
+        _atomic_write_json(path, project.model_dump(mode="json"))
+        return path
+
+    def restore(self, snapshot: dict[str, Any]) -> Project:
+        """Write a snapshot back without recording it as a new undo step."""
+        project = Project.model_validate(migrate(snapshot))
+        with self.history.suspend(project.id):
+            self.save(project)
+        return project
 
     def delete(self, project_id: str) -> None:
         directory = self.project_dir(project_id)

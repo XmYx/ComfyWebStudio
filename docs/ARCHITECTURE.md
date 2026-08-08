@@ -130,6 +130,24 @@ default origin-only middleware (`server.py:147-185`) 403s cross-origin browser r
 encodes with **PyAV**, which bundles its own FFmpeg — no system `ffmpeg` needed. A clip references
 `(shot, step, port)` rather than a file, so re-running a shot updates the cut without touching the edit.
 
+## The menu layer
+
+`frontend/src/features/menu/commands.ts` holds one list of commands, each declaring its label, optional
+shortcut, when it is `enabled`, and (for toggles) whether it is `checked`. The menu bar, the keyboard
+handler and any future command palette all render from that list, so a menu item and its shortcut cannot
+drift apart.
+
+Two supporting pieces on the backend:
+
+* **Undo/redo** (`core/history.py`) snapshots the project inside `ProjectStore.save`, so every mutation is
+  undoable without each endpoint opting in. History is in memory and bounded — undo that survived a restart
+  would be surprising, and could resurrect a state the user deliberately moved past. Operations that should
+  be one undo step are made one *save*: creating a step accepts its name and parameters, so pasting is a
+  single request and therefore a single Ctrl+Z.
+* **Plugins** (`core/plugins.py`) package workflows and shot templates into a `.cwsplugin` zip. Applying one
+  copies its content into a project with fresh ids, so the plugin stays a template. Plugins are content
+  only, never executable code — otherwise "load a plugin someone sent you" would be a dangerous action.
+
 ## Extension points
 
 | To add | Edit |
@@ -138,3 +156,4 @@ encodes with **PyAV**, which bundles its own FFmpeg — no system `ffmpeg` neede
 | A ComfyUI transport | subclass `ComfyBackend`, call `register_backend` |
 | An API surface | a module in `api/`, listed in `api/__init__.py` |
 | A preview or widget | one entry in the frontend's `RENDERERS` / `WIDGETS` maps |
+| A menu item or shortcut | one entry in `COMMANDS`, referenced from `MENUS` |

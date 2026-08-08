@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/.idea/comfyui-webstudio.iml" filepath="$PROJECT_DIR$/.idea/comfyui-webstudio.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/comfywebstudio.iml" filepath="$PROJECT_DIR$/.idea/comfywebstudio.iml" />
+    </modules>
+  </component>
+</project>

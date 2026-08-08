@@ -88,11 +88,22 @@ async function frameworkFetch(binding, path, init = {}) {
 async function openStep(request) {
   setBadge("Loading…", "pending");
   const payload = await frameworkFetch(request, `/api/bridge/workflow/${encodeURIComponent(request.stepId)}`);
-  if (!payload.workflow) throw new Error("framework returned no workflow");
 
-  await app.loadGraphData(payload.workflow, true, true, null);
+  if (payload.workflow && payload.workflow.nodes?.length) {
+    await app.loadGraphData(payload.workflow, true, true, null);
+  } else if (payload.prompt) {
+    // Imported in API format, so there is no LiteGraph document to load. ComfyUI can build one from the
+    // prompt itself; saving back then gives the framework a real editable graph for next time.
+    await app.loadApiJson(payload.prompt, payload.name || "WebStudio workflow");
+  } else {
+    throw new Error("the framework returned no graph for this workflow");
+  }
+
   storeBinding({ ...request, label: payload.label || request.label || request.stepId });
-  setBadge(`Linked: ${state.binding.label}`, "ok");
+  setBadge(
+    payload.has_ui_graph ? `Linked: ${state.binding.label}` : `Linked: ${state.binding.label} · save to sync`,
+    "ok",
+  );
 }
 
 async function saveBack({ silent = false } = {}) {

@@ -309,3 +309,15 @@ export interface ResolvedTimeline {
     artifacts: Artifact[]
   }>
 }
+
+export interface PluginInfo {
+  id: string
+  name: string
+  version: string
+  author: string
+  description: string
+  created: string
+  enabled: boolean
+  workflows: Array<{ id: string; name: string; has_ui_graph: boolean; ports: PortSpec[] }>
+  shot_templates: Array<{ name: string; steps: unknown[]; links: unknown[] }>
+}

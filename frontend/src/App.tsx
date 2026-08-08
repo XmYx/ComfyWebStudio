@@ -5,6 +5,8 @@ import { useQueryClient } from '@tanstack/react-query'
 import { eventStream, useStudioEvents } from '@/api/events'
 import { useStudio } from '@/store/studio'
 import { Header } from '@/features/shell/Header'
+import { MenuBar } from '@/features/menu/MenuBar'
+import { AppDialogs } from '@/features/menu/Dialogs'
 import { ProjectsPage } from '@/features/projects/ProjectsPage'
 import { ShotsPage } from '@/features/shots/ShotsPage'
 import { TimelinePage } from '@/features/timeline/TimelinePage'
@@ -122,6 +124,7 @@ function ProjectShell({ children }: { children: React.ReactNode }) {
 export default function App() {
   return (
     <div className="flex h-full flex-col">
+      <MenuBar />
       <Header />
       <main className="min-h-0 flex-1">
         <Routes>
@@ -140,6 +143,7 @@ export default function App() {
           <Route path="*" element={<Navigate to="/projects" replace />} />
         </Routes>
       </main>
+      <AppDialogs />
     </div>
   )
 }

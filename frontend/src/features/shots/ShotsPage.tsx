@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError } from '@/api/client'
 import type { RunMode } from '@/api/types'
 import { useStudio } from '@/store/studio'
+import { useLayout } from '@/store/layout'
 import { ShotCanvas } from '@/features/graph/ShotCanvas'
 import { WorkflowLibrary } from './WorkflowLibrary'
 import { StepInspector } from './StepInspector'
@@ -22,6 +23,8 @@ export function ShotsPage() {
   const selectedStepId = useStudio((s) => s.selectedStepId)
   const activeRun = useStudio((s) => s.activeRun)
   const seedFromResults = useStudio((s) => s.seedFromResults)
+  const showLeftPanel = useLayout((s) => s.showLeftPanel)
+  const showInspector = useLayout((s) => s.showInspector)
 
   const { data: project, isLoading, error } = useQuery({
     queryKey: ['project', projectId],
@@ -90,8 +93,19 @@ export function ShotsPage() {
   const running = activeRun?.status === 'running' || startRun.isPending
 
   return (
-    <div className="grid h-full grid-cols-[260px_1fr_340px] gap-2 p-2">
+    <div
+      className="grid h-full gap-2 p-2"
+      style={{
+        // Hiding a panel collapses its column entirely, so the canvas actually gains the space.
+        gridTemplateColumns: [
+          showLeftPanel ? '260px' : null,
+          '1fr',
+          showInspector ? '340px' : null,
+        ].filter(Boolean).join(' '),
+      }}
+    >
       {/* Left: shots and workflow library */}
+      {showLeftPanel && (
       <div className="grid min-h-0 grid-rows-[auto_1fr] gap-2">
         <Panel>
           <PanelHeader
@@ -126,6 +140,7 @@ export function ShotsPage() {
 
         <WorkflowLibrary project={project} shot={shot} onChanged={invalidate} />
       </div>
+      )}
 
       {/* Centre: the canvas */}
       <Panel className="flex min-h-0 flex-col overflow-hidden">
@@ -198,6 +213,7 @@ export function ShotsPage() {
       </Panel>
 
       {/* Right: inspector */}
+      {showInspector && (
       <div className="min-h-0">
         {selectedStep && shot ? (
           <StepInspector
@@ -216,6 +232,7 @@ export function ShotsPage() {
           </Panel>
         )}
       </div>
+      )}
     </div>
   )
 }

@@ -16,7 +16,9 @@ cd frontend && npm run typecheck && npx vitest run
 | `tests/test_api.py` | the whole API surface, bridge, timeline, render | fake ComfyUI |
 | `tests/nodepack/` | node registration, tensor round-trips, path safety | ComfyUI's own venv |
 | `frontend/src/lib/*.test.ts` | kind compatibility, formatting | nothing |
+| `tests/test_menu_features.py` | undo/redo history, plugin build/install/apply | fake ComfyUI |
 | `scripts/ui_smoke.py` | the browser: canvas edges, previews, timeline, settings | a running app |
+| `scripts/ui_menus.py` | the menus: shortcuts, undo/redo, panel toggles, dialogs | a running app |
 
 The fake ComfyUI (`tests/fixtures/fake_comfy.py`) replays ComfyUI 0.24.1's real event ordering, including
 the detail the runner depends on: `execution_success` arrives *before* history is written, and the
@@ -76,6 +78,25 @@ API walkthrough below.
 - [ ] Export downloads a `.cwsproj`; importing it creates a *second* project with previews intact.
 - [ ] Deleting a workflow still used by a step is refused, naming the steps.
 
+### Menus
+- [ ] Every menu opens, and hovering **File → Import** expands the submenu.
+- [ ] **Edit → Paste** is greyed out until something has been copied.
+- [ ] Select a step, <kbd>Ctrl</kbd>+<kbd>C</kbd> then <kbd>Ctrl</kbd>+<kbd>V</kbd>: a copy appears with
+      the same parameters and no links.
+- [ ] <kbd>Ctrl</kbd>+<kbd>Z</kbd> removes the whole paste in **one** press; <kbd>Ctrl</kbd>+
+      <kbd>Shift</kbd>+<kbd>Z</kbd> brings it back.
+- [ ] <kbd>Ctrl</kbd>+<kbd>1</kbd> / <kbd>Ctrl</kbd>+<kbd>2</kbd> collapse the side panels and the canvas
+      takes the space; the choice survives a reload.
+- [ ] <kbd>Ctrl</kbd>+<kbd>/</kbd> opens the shortcut list; **Help → About** shows the connected backends.
+
+### Plugins
+- [ ] **File → Export as Plugin…** with a workflow and a shot ticked downloads a `.cwsplugin`.
+- [ ] **Plugins → Load Plugin…** installs it; loading it a second time is refused as already installed.
+- [ ] **Apply to project** on a fresh project recreates the workflows *and* the shot, with its links
+      wired between the new steps and its parameter overrides intact.
+- [ ] Applying twice does not produce two workflows with the same name.
+- [ ] Uninstalling a plugin leaves projects that used it untouched.
+
 ### Settings
 - [ ] **Test** reports ComfyUI version, GPU and node-pack status.
 - [ ] For a local backend without the pack, **Install** creates the symlink and says a restart is needed.
@@ -89,3 +110,7 @@ API walkthrough below.
 - **Remote backends** need the node pack installed there to chain anything other than images —
   `POST /upload/image` only accepts images.
 - ComfyUI must be **restarted** after installing the node pack; packs are imported once at startup.
+- **Undo history is in memory**, bounded to 50 steps per project, and is cleared when the server restarts.
+  Run results are never undone — they live in `runs/` and are append-only.
+- **Plugins contain content, not code.** A plugin can carry workflows and shot templates; it deliberately
+  cannot execute anything, so installing one someone sent you is safe.

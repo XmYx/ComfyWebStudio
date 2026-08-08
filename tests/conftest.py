@@ -110,3 +110,30 @@ async def app_state(settings, fake_comfy):
         yield state
     finally:
         await state.shutdown()
+
+
+@pytest.fixture
+async def client(settings, fake_comfy):
+    """The real FastAPI app, wired to the fake ComfyUI, driven over ASGI."""
+    import httpx
+    from asgi_lifespan import LifespanManager
+
+    from comfywebstudio.app import create_app
+
+    settings.backends = [
+        ComfyBackendConfig(
+            id="local",
+            name="Fake",
+            kind="local",
+            base_url=fake_comfy.base_url,
+            comfy_root=str(fake_comfy.root),
+        )
+    ]
+    settings.default_backend_id = "local"
+
+    app = create_app(settings)
+    async with LifespanManager(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            http.app_state = app.state.studio  # type: ignore[attr-defined]
+            yield http

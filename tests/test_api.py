@@ -10,36 +10,7 @@ import asyncio
 import io
 import json
 
-import httpx
-import pytest
-from asgi_lifespan import LifespanManager
-
-from comfywebstudio.app import create_app
-
 from .test_execution import consumer_prompt, generator_prompt
-
-
-@pytest.fixture
-async def client(settings, fake_comfy):
-    from comfywebstudio.settings import ComfyBackendConfig
-
-    settings.backends = [
-        ComfyBackendConfig(
-            id="local",
-            name="Fake",
-            kind="local",
-            base_url=fake_comfy.base_url,
-            comfy_root=str(fake_comfy.root),
-        )
-    ]
-    settings.default_backend_id = "local"
-
-    app = create_app(settings)
-    async with LifespanManager(app):
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
-            http.app_state = app.state.studio  # type: ignore[attr-defined]
-            yield http
 
 
 async def make_project(client, name="Demo") -> dict:
@@ -378,13 +349,14 @@ async def test_bridge_round_trip_updates_ports(client):
     ).json()
     token = opened["token"]
 
-    # The extension asks for the graph...
+    # The extension asks for the graph. This workflow was imported in API format only, so it gets the
+    # prompt instead — ComfyUI can build a graph from that itself.
     fetched = await client.get(
         f"/api/bridge/workflow/{workflow['id']}", headers={"X-WebStudio-Token": token}
     )
-    # This workflow was imported in API format only, so there is no editable graph — and we say so.
-    assert fetched.status_code == 404
-    assert "API format" in fetched.json()["message"]
+    assert fetched.status_code == 200
+    assert fetched.json()["has_ui_graph"] is False
+    assert fetched.json()["prompt"]
 
     # ...and later posts an edited graph back, with a new port added.
     edited = generator_prompt()
@@ -611,3 +583,127 @@ async def test_export_and_reimport_through_the_api(client):
         await client.get(f"/api/projects/{payload['id']}/shots/{payload['shots'][0]['id']}/results")
     ).json()
     assert results
+
+
+# -- ComfyUI workflow browsing ---------------------------------------------------------------------------
+
+
+async def test_lists_workflows_saved_in_comfyui(client, fake_comfy):
+    """The picker reads ComfyUI's own /userdata rather than asking the user for a file."""
+    import json as _json
+
+    workflows_dir = fake_comfy.root / "user" / "default" / "workflows"
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+    (workflows_dir / "portrait.json").write_text(
+        _json.dumps({"nodes": [{"id": 1, "type": "EmptyImage", "widgets_values": [64, 64]}], "links": []})
+    )
+    (workflows_dir / ".index.json").write_text('{"favorites": []}')
+
+    payload = (await client.get("/api/comfy/workflows")).json()
+
+    assert payload["reachable"] is True
+    names = {w["name"] for w in payload["workflows"]}
+    assert "portrait" in names
+    assert ".index" not in names, "the frontend's bookmark file is not a workflow"
+
+
+async def test_unreachable_comfyui_does_not_break_the_picker(client, fake_comfy):
+    await fake_comfy.stop()
+    payload = (await client.get("/api/comfy/workflows")).json()
+    assert payload["reachable"] is False
+    assert payload["workflows"] == []
+    assert payload["error"]
+
+
+async def test_import_a_workflow_straight_from_comfyui(client, fake_comfy):
+    import json as _json
+
+    project = await make_project(client)
+    workflows_dir = fake_comfy.root / "user" / "default" / "workflows"
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+    (workflows_dir / "chain.json").write_text(
+        _json.dumps(
+            {
+                "nodes": [
+                    {"id": 1, "type": "WSStringInput", "widgets_values": ["prompt", "a cat"]},
+                    {"id": 2, "type": "EmptyImage", "widgets_values": [64, 64],
+                     "outputs": [{"name": "IMAGE", "type": "IMAGE"}]},
+                    {"id": 3, "type": "WSImageOutput", "widgets_values": ["image", "png", ""],
+                     "inputs": [{"name": "image", "type": "IMAGE", "link": 1}]},
+                ],
+                "links": [[1, 2, 0, 3, 0, "IMAGE"]],
+            }
+        )
+    )
+
+    response = await client.post(
+        f"/api/comfy/projects/{project['id']}/import", json={"path": "chain.json"}
+    )
+    assert response.status_code == 201, response.text
+    workflow = response.json()
+
+    assert workflow["name"] == "chain"
+    # Converted from the LiteGraph document, so our ports were discovered.
+    assert {p["key"] for p in workflow["ports"]} == {"prompt", "image"}
+    assert workflow["comfy_userdata_path"] == "workflows/chain.json"
+
+    listed = (await client.get(f"/api/projects/{project['id']}/workflows")).json()
+    assert len(listed) == 1
+
+
+async def test_importing_a_missing_comfy_workflow_is_a_clean_404(client):
+    project = await make_project(client)
+    response = await client.post(
+        f"/api/comfy/projects/{project['id']}/import", json={"path": "nope.json"}
+    )
+    assert response.status_code == 404
+
+
+async def test_bridge_serves_an_api_only_workflow_as_a_prompt(client):
+    """A workflow imported in API format has no LiteGraph document, but ComfyUI can build one."""
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Generate", generator_prompt())
+
+    token = (
+        await client.post(
+            f"/api/projects/{project['id']}/workflows/{workflow['id']}/open-in-comfy"
+        )
+    ).json()["token"]
+
+    response = await client.get(
+        f"/api/bridge/workflow/{workflow['id']}", headers={"X-WebStudio-Token": token}
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+
+    assert payload["has_ui_graph"] is False
+    assert payload["workflow"] is None
+    assert payload["prompt"]["1"]["class_type"] == "WSStringInput"
+
+
+async def test_bridge_prefers_the_ui_graph_when_one_exists(client, fake_comfy):
+    import json as _json
+
+    project = await make_project(client)
+    workflows_dir = fake_comfy.root / "user" / "default" / "workflows"
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+    (workflows_dir / "ui.json").write_text(
+        _json.dumps({"nodes": [{"id": 1, "type": "EmptyImage", "widgets_values": [64, 64]}], "links": []})
+    )
+    workflow = (
+        await client.post(f"/api/comfy/projects/{project['id']}/import", json={"path": "ui.json"})
+    ).json()
+
+    token = (
+        await client.post(
+            f"/api/projects/{project['id']}/workflows/{workflow['id']}/open-in-comfy"
+        )
+    ).json()["token"]
+    payload = (
+        await client.get(
+            f"/api/bridge/workflow/{workflow['id']}", headers={"X-WebStudio-Token": token}
+        )
+    ).json()
+
+    assert payload["has_ui_graph"] is True
+    assert payload["workflow"]["nodes"]

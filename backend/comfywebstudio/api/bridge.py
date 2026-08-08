@@ -54,23 +54,43 @@ def fetch_workflow(
     workflow_id: str,
     x_webstudio_token: str | None = Header(default=None),
 ) -> dict:
-    """Hand the bridge extension the graph to load."""
+    """Hand the bridge extension something it can load.
+
+    A workflow imported in API format has no LiteGraph document, but ComfyUI's frontend can build one from
+    an API prompt itself (``app.loadApiJson``). So we send whichever we have and let the extension pick —
+    the user then saves it back and we get a proper editable graph from then on.
+    """
     binding = _authorize(state, x_webstudio_token, workflow_id)
     project = state.store.load(binding["project_id"])
     workflow = project.workflow(workflow_id)
     if workflow is None:
         raise NotFound(f"No workflow {workflow_id!r}")
 
-    graph = state.store.read_workflow(project.id, workflow_id, "ui")
-    if not graph or not graph.get("nodes"):
-        # Nothing importable — most likely an API-format-only import. Say so rather than opening a blank
-        # canvas that the user might then save over the real graph.
-        raise NotFound(
-            f"{workflow.name!r} has no editable graph stored (it was imported in API format). "
-            "Open the original in ComfyUI and use 'Save to ComfyWebStudio'."
-        )
+    graph: dict[str, Any] | None = None
+    try:
+        candidate = state.store.read_workflow(project.id, workflow_id, "ui")
+        if candidate and candidate.get("nodes"):
+            graph = candidate
+    except NotFound:
+        graph = None
 
-    return {"workflow": graph, "label": f"{project.name} · {workflow.name}", "name": workflow.name}
+    prompt: dict[str, Any] | None = None
+    if graph is None:
+        try:
+            prompt = state.store.read_workflow(project.id, workflow_id, "api")
+        except NotFound:
+            prompt = None
+
+    if graph is None and not prompt:
+        raise NotFound(f"{workflow.name!r} has no stored graph at all; re-import it.")
+
+    return {
+        "workflow": graph,
+        "prompt": prompt,
+        "has_ui_graph": graph is not None,
+        "label": f"{project.name} · {workflow.name}",
+        "name": workflow.name,
+    }
 
 
 @router.post("/workflow")

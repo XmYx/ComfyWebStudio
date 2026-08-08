@@ -6,6 +6,8 @@ import type { Project, Shot, WorkflowRef } from '@/api/types'
 import { KIND_COLOR } from '@/lib/kinds'
 import { relativeTime } from '@/lib/format'
 import { Badge, Button, Panel, PanelHeader, Spinner, useToast } from '@/components/ui'
+import { ComfyWorkflowBrowser } from './ComfyWorkflowBrowser'
+import { useLayout } from '@/store/layout'
 
 interface Props {
   project: Project
@@ -19,6 +21,11 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
   const queryClient = useQueryClient()
   const fileInput = useRef<HTMLInputElement>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
+  // The File menu opens this dialog too, so its visibility lives in the layout store rather than here.
+  const dialog = useLayout((s) => s.dialog)
+  const openDialog = useLayout((s) => s.openDialog)
+  const closeDialog = useLayout((s) => s.closeDialog)
+  const browsing = dialog === 'comfyBrowser'
 
   const upload = useMutation({
     mutationFn: (file: File) => api.workflows.upload(project.id, file),
@@ -79,8 +86,21 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
                 e.target.value = ''
               }}
             />
-            <Button size="sm" onClick={() => fileInput.current?.click()} disabled={upload.isPending}>
-              {upload.isPending ? <Spinner /> : '+'} Import
+            <Button
+              size="sm"
+              onClick={() => openDialog('comfyBrowser')}
+              title="Browse the workflows already saved in ComfyUI"
+            >
+              From ComfyUI
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => fileInput.current?.click()}
+              disabled={upload.isPending}
+              title="Import a workflow JSON file"
+            >
+              {upload.isPending ? <Spinner /> : '+'} File
             </Button>
           </>
         }
@@ -91,8 +111,8 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
       <div className="min-h-0 flex-1 overflow-y-auto p-2">
         {!workflows.length ? (
           <div className="p-3 text-xs leading-relaxed text-[var(--color-ink-dim)]">
-            Import a ComfyUI workflow JSON to get started. Use <b>Export (API)</b> in ComfyUI for the most
-            reliable import, or drop in a normal workflow and open it in ComfyUI to sync it back exactly.
+            Press <b>From ComfyUI</b> to pick one of the workflows you already have saved there, or
+            <b> File</b> to import a JSON you exported.
           </div>
         ) : (
           <div className="space-y-2">
@@ -187,6 +207,12 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
           </div>
         )}
       </div>
+
+      <ComfyWorkflowBrowser
+        open={browsing}
+        onClose={closeDialog}
+        projectId={project.id}
+      />
     </Panel>
   )
 }

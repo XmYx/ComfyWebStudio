@@ -30,6 +30,10 @@ class CreateStepRequest(BaseModel):
     workflow_id: str
     name: str | None = None
     ui_pos: Vec2 | None = None
+    # Supplied when duplicating or pasting, so the whole operation is one save and therefore one
+    # undo step — a user pressing Ctrl+Z after a paste expects the paste to disappear, not half of it.
+    param_overrides: dict | None = None
+    seed_mode: str | None = None
 
 
 class UpdateStepRequest(BaseModel):
@@ -141,6 +145,8 @@ def create_step(
         name=body.name or workflow.name,
         workflow_id=workflow.id,
         ui_pos=body.ui_pos or Vec2(x=40 + 260 * len(shot.steps), y=80),
+        param_overrides=dict(body.param_overrides or {}),
+        seed_mode=body.seed_mode,  # type: ignore[arg-type]
     )
     shot.steps.append(step)
     state.store.save(project)

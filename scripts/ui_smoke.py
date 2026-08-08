@@ -73,7 +73,7 @@ def main() -> int:
             page.screenshot(path=str(shots / "02-shot-editor.png"))
 
         print("Step inspector")
-        page.locator(".react-flow__node").first.click()
+        page.locator(".react-flow__node").first.locator("div").first.click(position={"x": 90, "y": 10})
         page.wait_for_selector("text=Parameters", timeout=10000)
         check(page.locator("text=Parameters").count() > 0, "inspector opened on the Parameters tab")
         check(

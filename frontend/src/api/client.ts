@@ -7,7 +7,7 @@
 
 import type {
   AppSettings, Asset, BackendConfig, BackendStatus, BindableWidget, Clip, GraphReport,
-  Link, Project, ProjectSummary, ResolvedTimeline, Run, RunMode, Shot, Step, StepRun,
+  Link, PluginInfo, Project, ProjectSummary, ResolvedTimeline, Run, RunMode, Shot, Step, StepRun,
   Timeline, Track, TrackKind, WorkflowRef,
 } from './types'
 
@@ -64,7 +64,17 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 const json = (body: unknown) => JSON.stringify(body)
 
 export const api = {
-  health: () => request<{ ok: boolean; version: string; backends: any[] }>('/api/health'),
+  health: () =>
+    request<{
+      ok: boolean
+      version: string
+      protocol: number
+      root: string
+      backends: Array<{
+        id: string; name: string; kind: string; base_url: string
+        enabled: boolean; shared_filesystem: boolean
+      }>
+    }>('/api/health'),
 
   // -- projects ------------------------------------------------------------------------------------
   projects: {
@@ -75,6 +85,9 @@ export const api = {
     update: (id: string, patch: Partial<Project>) =>
       request<Project>(`/api/projects/${id}`, { method: 'PATCH', body: json(patch) }),
     remove: (id: string) => request<void>(`/api/projects/${id}`, { method: 'DELETE' }),
+    undo: (id: string) => request<Project>(`/api/projects/${id}/undo`, { method: 'POST' }),
+    redo: (id: string) => request<Project>(`/api/projects/${id}/redo`, { method: 'POST' }),
+    history: (id: string) => request<{ undo: number; redo: number }>(`/api/projects/${id}/history`),
     duplicate: (id: string, name?: string) =>
       request<Project>(`/api/projects/${id}/duplicate${name ? `?name=${encodeURIComponent(name)}` : ''}`, {
         method: 'POST',
@@ -119,6 +132,19 @@ export const api = {
       }),
     unexpose: (projectId: string, id: string, key: string) =>
       request<void>(`/api/projects/${projectId}/workflows/${id}/expose/${key}`, { method: 'DELETE' }),
+    /** Workflows already saved inside the ComfyUI instance. */
+    fromComfy: (backendId?: string) =>
+      request<{
+        reachable: boolean
+        error: string | null
+        backend?: string
+        workflows: Array<{ path: string; name: string; size: number; modified: number }>
+      }>(`/api/comfy/workflows${backendId ? `?backend_id=${backendId}` : ''}`),
+    importFromComfy: (projectId: string, path: string, name?: string) =>
+      request<WorkflowRef>(`/api/comfy/projects/${projectId}/import`, {
+        method: 'POST',
+        body: json({ path, name }),
+      }),
     openInComfy: (projectId: string, id: string) =>
       request<{ url: string; node_pack_installed: boolean; hint: string | null }>(
         `/api/projects/${projectId}/workflows/${id}/open-in-comfy`,
@@ -148,10 +174,20 @@ export const api = {
   },
 
   steps: {
-    create: (projectId: string, shotId: string, workflowId: string, uiPos?: { x: number; y: number }) =>
+    create: (
+      projectId: string,
+      shotId: string,
+      workflowId: string,
+      extra?: {
+        ui_pos?: { x: number; y: number }
+        name?: string
+        param_overrides?: Record<string, unknown>
+        seed_mode?: string | null
+      },
+    ) =>
       request<Step>(`/api/projects/${projectId}/shots/${shotId}/steps`, {
         method: 'POST',
-        body: json({ workflow_id: workflowId, ui_pos: uiPos }),
+        body: json({ workflow_id: workflowId, ...extra }),
       }),
     update: (projectId: string, stepId: string, patch: Partial<Step>) =>
       request<Step>(`/api/projects/${projectId}/steps/${stepId}`, {
@@ -260,6 +296,32 @@ export const api = {
       request<Array<{ name: string; path: string; size: number; modified: number }>>(
         `/api/projects/${projectId}/timeline/renders`,
       ),
+  },
+
+  // -- plugins -------------------------------------------------------------------------------------
+  plugins: {
+    list: () => request<PluginInfo[]>('/api/plugins'),
+    install: (file: File, overwrite = false) => {
+      const form = new FormData()
+      form.append('file', file)
+      return request<PluginInfo>(`/api/plugins/install?overwrite=${overwrite}`, {
+        method: 'POST',
+        body: form,
+      })
+    },
+    uninstall: (id: string) => request<void>(`/api/plugins/${id}`, { method: 'DELETE' }),
+    setEnabled: (id: string, enabled: boolean) =>
+      request<{ id: string; enabled: boolean }>(
+        `/api/plugins/${id}/enabled?enabled=${enabled}`,
+        { method: 'POST' },
+      ),
+    apply: (id: string, projectId: string, includeShots = true) =>
+      request<{ plugin: string; workflows_added: number; shots_added: number }>(
+        `/api/plugins/${id}/apply`,
+        { method: 'POST', body: json({ project_id: projectId, include_shots: includeShots }) },
+      ),
+    downloadUrl: (id: string) => `/api/plugins/${id}/download`,
+    buildUrl: (projectId: string) => `/api/projects/${projectId}/plugins/build`,
   },
 
   // -- settings ------------------------------------------------------------------------------------
