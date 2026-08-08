@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Runtime data (projects live outside the repo by default; this covers dev overrides)
+.data/
+*.cwsproj

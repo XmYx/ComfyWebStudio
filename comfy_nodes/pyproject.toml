@@ -1,0 +1,16 @@
+[project]
+name = "comfyui-webstudio"
+version = "0.1.0"
+description = "Typed input/output nodes that let ComfyWebStudio chain multiple ComfyUI workflows together."
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/magix/ComfyWebStudio"
+
+[tool.comfy]
+PublisherId = "magix"
+DisplayName = "ComfyWebStudio IO"
+Icon = ""
+web = "web"

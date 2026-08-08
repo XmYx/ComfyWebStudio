@@ -1,0 +1,613 @@
+"""API tests driving the real FastAPI app against the fake ComfyUI.
+
+These walk the flow a user actually takes: create a project, import workflows, wire steps together, run,
+preview, cut a timeline, render, export and re-import.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+
+import httpx
+import pytest
+from asgi_lifespan import LifespanManager
+
+from comfywebstudio.app import create_app
+
+from .test_execution import consumer_prompt, generator_prompt
+
+
+@pytest.fixture
+async def client(settings, fake_comfy):
+    from comfywebstudio.settings import ComfyBackendConfig
+
+    settings.backends = [
+        ComfyBackendConfig(
+            id="local",
+            name="Fake",
+            kind="local",
+            base_url=fake_comfy.base_url,
+            comfy_root=str(fake_comfy.root),
+        )
+    ]
+    settings.default_backend_id = "local"
+
+    app = create_app(settings)
+    async with LifespanManager(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            http.app_state = app.state.studio  # type: ignore[attr-defined]
+            yield http
+
+
+async def make_project(client, name="Demo") -> dict:
+    response = await client.post("/api/projects", json={"name": name})
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+async def import_workflow(client, project_id, name, prompt) -> dict:
+    response = await client.post(
+        f"/api/projects/{project_id}/workflows",
+        json={"name": name, "prompt": prompt},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+async def build_chain(client) -> tuple[dict, dict, list[dict]]:
+    project = await make_project(client)
+    gen = await import_workflow(client, project["id"], "Generate", generator_prompt())
+    con = await import_workflow(client, project["id"], "Consume", consumer_prompt())
+
+    shot = (
+        await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Shot 1"})
+    ).json()
+
+    steps = []
+    for workflow in (gen, con):
+        response = await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+            json={"workflow_id": workflow["id"]},
+        )
+        assert response.status_code == 201, response.text
+        steps.append(response.json())
+
+    link = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/links",
+        json={
+            "from_step": steps[0]["id"], "from_port": "image",
+            "to_step": steps[1]["id"], "to_port": "image",
+        },
+    )
+    assert link.status_code == 201, link.text
+    return project, shot, steps
+
+
+async def run_and_wait(client, project_id, shot_id, **body) -> dict:
+    response = await client.post(
+        f"/api/projects/{project_id}/shots/{shot_id}/run", json=body or {"mode": "shot"}
+    )
+    assert response.status_code == 202, response.text
+    run = response.json()
+
+    orchestrator = client.app_state.orchestrator
+    task = orchestrator._tasks.get(run["id"])
+    if task is not None:
+        await asyncio.wait_for(asyncio.shield(task), timeout=30)
+    return (await client.get(f"/api/projects/{project_id}/runs/{run['id']}")).json()
+
+
+# -- meta ----------------------------------------------------------------------------------------------
+
+
+async def test_health_reports_backends(client):
+    payload = (await client.get("/api/health")).json()
+    assert payload["ok"] is True
+    assert payload["backends"][0]["shared_filesystem"] is True
+
+
+# -- projects ------------------------------------------------------------------------------------------
+
+
+async def test_project_crud(client):
+    project = await make_project(client, "My Film")
+    assert project["name"] == "My Film"
+
+    listed = (await client.get("/api/projects")).json()
+    assert [p["id"] for p in listed] == [project["id"]]
+
+    patched = (
+        await client.patch(f"/api/projects/{project['id']}", json={"name": "Renamed"})
+    ).json()
+    assert patched["name"] == "Renamed"
+
+    assert (await client.delete(f"/api/projects/{project['id']}")).status_code == 204
+    assert (await client.get(f"/api/projects/{project['id']}")).status_code == 404
+
+
+async def test_unknown_project_returns_structured_error(client):
+    response = await client.get("/api/projects/proj_nope")
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
+
+
+# -- workflows -----------------------------------------------------------------------------------------
+
+
+async def test_import_discovers_ports_and_params(client):
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Generate", generator_prompt())
+
+    ports = {p["key"]: p for p in workflow["ports"]}
+    assert ports["prompt"]["direction"] == "in"
+    assert ports["image"]["direction"] == "out" and ports["image"]["kind"] == "image"
+    assert {p["key"] for p in workflow["params"]} == {"prompt"}
+
+
+async def test_upload_workflow_json_file(client):
+    project = await make_project(client)
+    payload = json.dumps(generator_prompt()).encode()
+
+    response = await client.post(
+        f"/api/projects/{project['id']}/workflows/upload",
+        files={"file": ("txt2img.json", io.BytesIO(payload), "application/json")},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["name"] == "txt2img"
+
+
+async def test_workflow_without_ws_nodes_warns(client):
+    project = await make_project(client)
+    workflow = await import_workflow(
+        client, project["id"], "Plain", {"1": {"class_type": "EmptyImage", "inputs": {"width": 8}}}
+    )
+    assert any("No ComfyWebStudio input or output nodes" in w for w in workflow["warnings"])
+
+
+async def test_deleting_a_workflow_in_use_is_refused(client):
+    project, _shot, _steps = await build_chain(client)
+    workflow_id = (await client.get(f"/api/projects/{project['id']}/workflows")).json()[0]["id"]
+
+    response = await client.delete(f"/api/projects/{project['id']}/workflows/{workflow_id}")
+    assert response.status_code == 422
+    assert "still used by" in response.json()["message"]
+
+
+async def test_expose_and_unexpose_a_raw_widget(client):
+    project = await make_project(client)
+    prompt = generator_prompt()
+    prompt["9"] = {
+        "class_type": "KSampler",
+        "inputs": {"model": ["2", 0], "seed": 1, "steps": 20, "cfg": 8.0, "sampler_name": "euler"},
+    }
+    workflow = await import_workflow(client, project["id"], "Sampled", prompt)
+
+    bindable = (
+        await client.get(f"/api/projects/{project['id']}/workflows/{workflow['id']}/bindable")
+    ).json()
+    steps_widget = next(b for b in bindable if b["node_id"] == "9" and b["input_name"] == "steps")
+    assert steps_widget["exposed"] is False
+    assert steps_widget["current"] == 20
+
+    exposed = (
+        await client.post(
+            f"/api/projects/{project['id']}/workflows/{workflow['id']}/expose",
+            json={"node_id": "9", "input_name": "steps"},
+        )
+    ).json()
+    param = next(p for p in exposed["params"] if p["key"] == "@9.steps")
+    assert param["source"] == "raw_widget" and param["default"] == 20
+
+    assert (
+        await client.delete(
+            f"/api/projects/{project['id']}/workflows/{workflow['id']}/expose/@9.steps"
+        )
+    ).status_code == 204
+
+
+async def test_open_in_comfy_returns_a_bridge_url(client):
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Generate", generator_prompt())
+
+    payload = (
+        await client.post(
+            f"/api/projects/{project['id']}/workflows/{workflow['id']}/open-in-comfy"
+        )
+    ).json()
+
+    assert "ws_open=" in payload["url"]
+    assert payload["node_pack_installed"] is True
+    assert payload["token"] in client.app_state.bridge_tokens
+
+
+# -- shots and links -----------------------------------------------------------------------------------
+
+
+async def test_link_validation_rejects_bad_connections(client):
+    project, shot, steps = await build_chain(client)
+
+    # Wrong kinds.
+    response = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/links",
+        json={"from_step": steps[0]["id"], "from_port": "image",
+              "to_step": steps[1]["id"], "to_port": "caption"},
+    )
+    assert response.status_code == 422
+    assert "Cannot connect" in response.json()["message"]
+
+    # Already connected.
+    response = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/links",
+        json={"from_step": steps[0]["id"], "from_port": "image",
+              "to_step": steps[1]["id"], "to_port": "image"},
+    )
+    assert response.status_code == 422
+    assert "already connected" in response.json()["message"]
+
+    # Cycle.
+    response = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/links",
+        json={"from_step": steps[1]["id"], "from_port": "final",
+              "to_step": steps[0]["id"], "to_port": "prompt"},
+    )
+    assert response.status_code == 422
+
+
+async def test_validate_endpoint_reports_the_graph(client):
+    project, shot, steps = await build_chain(client)
+    report = (
+        await client.get(f"/api/projects/{project['id']}/shots/{shot['id']}/validate")
+    ).json()
+    assert report["ok"] is True
+    assert report["order"] == [s["id"] for s in steps]
+
+
+async def test_deleting_a_step_removes_its_links(client):
+    project, shot, steps = await build_chain(client)
+    assert (await client.delete(f"/api/projects/{project['id']}/steps/{steps[0]['id']}")).status_code == 204
+
+    updated = (await client.get(f"/api/projects/{project['id']}/shots/{shot['id']}")).json()
+    assert updated["links"] == []
+    assert len(updated["steps"]) == 1
+
+
+async def test_duplicate_shot_gets_fresh_ids(client):
+    project, shot, _steps = await build_chain(client)
+    copy = (
+        await client.post(f"/api/projects/{project['id']}/shots/{shot['id']}/duplicate")
+    ).json()
+
+    assert copy["id"] != shot["id"]
+    assert {s["id"] for s in copy["steps"]}.isdisjoint({s["id"] for s in shot["steps"]})
+    # Links must point at the copy's own steps, not the original's.
+    assert copy["links"][0]["from_step"] in {s["id"] for s in copy["steps"]}
+
+
+# -- running -------------------------------------------------------------------------------------------
+
+
+async def test_run_a_chain_through_the_api(client):
+    project, shot, steps = await build_chain(client)
+    run = await run_and_wait(client, project["id"], shot["id"])
+
+    assert run["status"] == "success", run.get("error")
+    assert [sr["status"] for sr in run["step_runs"]] == ["success", "success"]
+    assert run["step_runs"][1]["outputs"]
+
+
+async def test_results_endpoint_repopulates_previews(client):
+    project, shot, steps = await build_chain(client)
+    await run_and_wait(client, project["id"], shot["id"])
+
+    results = (
+        await client.get(f"/api/projects/{project['id']}/shots/{shot['id']}/results")
+    ).json()
+    assert set(results) == {steps[0]["id"], steps[1]["id"]}
+    assert results[steps[0]["id"]]["step_run"]["outputs"]
+
+
+async def test_media_endpoint_serves_an_artifact(client):
+    project, shot, _steps = await build_chain(client)
+    run = await run_and_wait(client, project["id"], shot["id"])
+    artifact = next(a for a in run["step_runs"][0]["outputs"] if a["kind"] == "image")
+
+    response = await client.get(
+        f"/api/projects/{project['id']}/media", params={"path": artifact["path"]}
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content[:4] == b"\x89PNG"
+
+
+async def test_media_endpoint_refuses_traversal(client):
+    project = await make_project(client)
+    response = await client.get(
+        f"/api/projects/{project['id']}/media", params={"path": "../../../etc/passwd"}
+    )
+    assert response.status_code == 422
+
+
+async def test_run_with_a_parameter_override(client):
+    project, shot, steps = await build_chain(client)
+    await client.patch(
+        f"/api/projects/{project['id']}/steps/{steps[0]['id']}",
+        json={"param_overrides": {"prompt": "a lighthouse"}},
+    )
+
+    run = await run_and_wait(client, project["id"], shot["id"])
+    caption = next(a for a in run["step_runs"][0]["outputs"] if a["port_key"] == "caption")
+    assert caption["meta"]["value"] == "a lighthouse"
+
+
+async def test_events_websocket_streams_a_run(client, settings, fake_comfy):
+    """The websocket is exercised through the same app instance the REST calls use."""
+    project, shot, _steps = await build_chain(client)
+    state = client.app_state
+
+    received: list[str] = []
+
+    async def listen():
+        async with state.events.subscribe(project["id"]) as stream:
+            async for event in stream:
+                received.append(event.type)
+                if event.type == "run.finished":
+                    return
+
+    listener = asyncio.create_task(listen())
+    await asyncio.sleep(0)
+    await run_and_wait(client, project["id"], shot["id"])
+    await asyncio.wait_for(listener, timeout=10)
+
+    assert "run.started" in received and "run.finished" in received
+
+
+# -- bridge --------------------------------------------------------------------------------------------
+
+
+async def test_bridge_round_trip_updates_ports(client):
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Generate", generator_prompt())
+
+    opened = (
+        await client.post(
+            f"/api/projects/{project['id']}/workflows/{workflow['id']}/open-in-comfy"
+        )
+    ).json()
+    token = opened["token"]
+
+    # The extension asks for the graph...
+    fetched = await client.get(
+        f"/api/bridge/workflow/{workflow['id']}", headers={"X-WebStudio-Token": token}
+    )
+    # This workflow was imported in API format only, so there is no editable graph — and we say so.
+    assert fetched.status_code == 404
+    assert "API format" in fetched.json()["message"]
+
+    # ...and later posts an edited graph back, with a new port added.
+    edited = generator_prompt()
+    edited["5"] = {
+        "class_type": "WSStringInput",
+        "inputs": {"port_name": "negative", "value": "blurry"},
+    }
+    response = await client.post(
+        "/api/bridge/workflow",
+        headers={"X-WebStudio-Token": token},
+        json={"step_id": workflow["id"], "workflow": {"nodes": [], "links": []}, "prompt": edited},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["ok"] is True
+
+    updated = (
+        await client.get(f"/api/projects/{project['id']}/workflows/{workflow['id']}")
+    ).json()
+    assert "negative" in {p["key"] for p in updated["ports"]}
+    assert "negative" in {p["key"] for p in updated["params"]}
+
+
+async def test_bridge_rejects_an_unknown_token(client):
+    response = await client.post(
+        "/api/bridge/workflow",
+        headers={"X-WebStudio-Token": "nope"},
+        json={"step_id": "wf_x", "workflow": {}, "prompt": {"1": {"class_type": "X", "inputs": {}}}},
+    )
+    assert response.status_code == 401
+
+
+async def test_bridge_token_is_scoped_to_one_workflow(client):
+    project = await make_project(client)
+    first = await import_workflow(client, project["id"], "A", generator_prompt())
+    second = await import_workflow(client, project["id"], "B", consumer_prompt())
+
+    token = (
+        await client.post(f"/api/projects/{project['id']}/workflows/{first['id']}/open-in-comfy")
+    ).json()["token"]
+
+    response = await client.post(
+        "/api/bridge/workflow",
+        headers={"X-WebStudio-Token": token},
+        json={"step_id": second["id"], "workflow": {}, "prompt": generator_prompt()},
+    )
+    assert response.status_code == 401
+
+
+async def test_bridge_sync_drops_links_to_removed_ports(client):
+    project, shot, steps = await build_chain(client)
+    workflows = (await client.get(f"/api/projects/{project['id']}/workflows")).json()
+    generator = next(w for w in workflows if w["name"] == "Generate")
+
+    token = (
+        await client.post(
+            f"/api/projects/{project['id']}/workflows/{generator['id']}/open-in-comfy"
+        )
+    ).json()["token"]
+
+    stripped = generator_prompt()
+    del stripped["3"]  # the WSImageOutput the link depends on
+
+    response = await client.post(
+        "/api/bridge/workflow",
+        headers={"X-WebStudio-Token": token},
+        json={"step_id": generator["id"], "workflow": {"nodes": []}, "prompt": stripped},
+    )
+    assert response.status_code == 200
+    assert "image" in response.json()["removed_ports"]
+    assert response.json()["broken_links"]
+
+    updated = (await client.get(f"/api/projects/{project['id']}/shots/{shot['id']}")).json()
+    assert updated["links"] == []
+
+
+# -- timeline and render -------------------------------------------------------------------------------
+
+
+async def test_build_timeline_from_shots_and_render(client, tmp_path):
+    project, shot, steps = await build_chain(client)
+    await run_and_wait(client, project["id"], shot["id"])
+
+    timeline = (
+        await client.post(f"/api/projects/{project['id']}/timeline/from-shots")
+    ).json()
+    assert timeline["tracks"], "no track was created"
+    assert timeline["tracks"][0]["clips"], "no clip was placed"
+
+    resolved = (await client.get(f"/api/projects/{project['id']}/timeline/resolved")).json()
+    assert resolved["duration"] > 0
+    assert all(c["error"] is None for c in resolved["clips"]), resolved["clips"]
+
+    # Render a still — fast, and proves the compositor resolves clips to real pixels.
+    state = client.app_state
+    done = asyncio.Event()
+    payload: dict = {}
+
+    async def listen():
+        async with state.events.subscribe(project["id"]) as stream:
+            async for event in stream:
+                if event.type == "render.finished":
+                    payload.update(event.data)
+                    done.set()
+                    return
+
+    listener = asyncio.create_task(listen())
+    await asyncio.sleep(0)
+
+    response = await client.post(
+        f"/api/projects/{project['id']}/timeline/render",
+        json={"still": True, "name": "poster"},
+    )
+    assert response.status_code == 202
+    await asyncio.wait_for(done.wait(), timeout=30)
+    listener.cancel()
+
+    assert payload["ok"] is True, payload.get("error")
+    served = await client.get(
+        f"/api/projects/{project['id']}/media", params={"path": payload["path"]}
+    )
+    assert served.status_code == 200 and served.content[:4] == b"\x89PNG"
+
+
+async def test_render_video_produces_a_playable_file(client):
+    project, shot, _steps = await build_chain(client)
+    await run_and_wait(client, project["id"], shot["id"])
+    await client.post(f"/api/projects/{project['id']}/timeline/from-shots")
+
+    # Keep it short: a couple of frames is enough to prove the encoder path.
+    await client.patch(f"/api/projects/{project['id']}/timeline", json={"fps": 4, "width": 64, "height": 64})
+    tracks = (await client.get(f"/api/projects/{project['id']}/timeline")).json()["tracks"]
+    track, clip = tracks[0], tracks[0]["clips"][0]
+    await client.patch(
+        f"/api/projects/{project['id']}/timeline/tracks/{track['id']}/clips/{clip['id']}",
+        json={"duration": 0.5},
+    )
+
+    state = client.app_state
+    payload: dict = {}
+    done = asyncio.Event()
+
+    async def listen():
+        async with state.events.subscribe(project["id"]) as stream:
+            async for event in stream:
+                if event.type == "render.finished":
+                    payload.update(event.data)
+                    done.set()
+                    return
+
+    listener = asyncio.create_task(listen())
+    await asyncio.sleep(0)
+    await client.post(f"/api/projects/{project['id']}/timeline/render", json={"name": "cut"})
+    await asyncio.wait_for(done.wait(), timeout=60)
+    listener.cancel()
+
+    assert payload["ok"] is True, payload.get("error")
+    assert payload["kind"] == "video"
+
+    import av
+
+    path = state.store.resolve(project["id"], payload["path"])
+    with av.open(str(path)) as container:
+        stream = next(s for s in container.streams if s.type == "video")
+        assert stream.codec_context.width == 64
+        assert sum(1 for _ in container.decode(stream)) >= 1
+
+
+# -- settings ------------------------------------------------------------------------------------------
+
+
+async def test_settings_round_trip(client):
+    settings = (await client.get("/api/settings")).json()
+    assert settings["port"]
+
+    updated = (
+        await client.patch("/api/settings", json={"execution": {"max_concurrent_steps": 3}})
+    ).json()
+    assert updated["execution"]["max_concurrent_steps"] == 3
+
+
+async def test_backend_test_endpoint_reports_the_node_pack(client):
+    backends = (await client.get("/api/settings/backends")).json()
+    result = (await client.post(f"/api/settings/backends/{backends[0]['id']}/test")).json()
+
+    assert result["reachable"] is True
+    assert result["comfyui_version"] == "0.24.1"
+    assert result["node_pack"]["pack_version"] == "0.1.0"
+    assert result["protocol_ok"] is True
+
+
+async def test_adding_a_backend_validates_the_root(client, tmp_path):
+    response = await client.post(
+        "/api/settings/backends",
+        json={"name": "Bad", "kind": "local", "base_url": "http://x:1", "comfy_root": str(tmp_path)},
+    )
+    assert response.status_code == 422
+    assert "main.py" in response.json()["message"]
+
+
+# -- export / import -----------------------------------------------------------------------------------
+
+
+async def test_export_and_reimport_through_the_api(client):
+    project, shot, _steps = await build_chain(client)
+    await run_and_wait(client, project["id"], shot["id"])
+
+    exported = await client.get(f"/api/projects/{project['id']}/export")
+    assert exported.status_code == 200
+    assert exported.content[:2] == b"PK"
+
+    reimported = await client.post(
+        "/api/projects/import",
+        files={"file": ("copy.cwsproj", io.BytesIO(exported.content), "application/zip")},
+        params={"name": "Reimported"},
+    )
+    assert reimported.status_code == 201, reimported.text
+    payload = reimported.json()
+    assert payload["name"] == "Reimported"
+    assert payload["id"] != project["id"]
+    assert len(payload["shots"][0]["steps"]) == 2
+
+    # The imported copy still has its artifacts, so previews work immediately.
+    results = (
+        await client.get(f"/api/projects/{payload['id']}/shots/{payload['shots'][0]['id']}/results")
+    ).json()
+    assert results

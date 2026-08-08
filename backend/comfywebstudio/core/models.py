@@ -1,0 +1,439 @@
+"""The domain model.
+
+A **project** holds workflows, shots and a timeline. A **shot** is a small DAG of **steps**; each step runs
+one ComfyUI workflow. **Links** carry a named output port of one step into a named input port of another.
+
+Everything here is plain pydantic and serialises straight to ``project.json`` — there is no database, which
+is what makes export/import a file copy rather than a migration exercise.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, computed_field
+
+from .ids import new_id
+
+#: Bumped when ``project.json`` changes shape; ``migrations.py`` maps older files forward.
+PROJECT_SCHEMA_VERSION = 1
+
+PortKind = Literal[
+    "image", "mask", "video", "audio", "latent", "string", "int", "float", "boolean", "file"
+]
+PortDirection = Literal["in", "out"]
+ParamKind = Literal["string", "int", "float", "boolean", "choice"]
+SeedMode = Literal["fixed", "randomize", "increment"]
+RunMode = Literal["step", "chain", "shot", "timeline"]
+TrackKind = Literal["video", "audio", "text", "overlay"]
+
+RunStatus = Literal["pending", "queued", "running", "success", "error", "cancelled", "skipped", "cached"]
+
+TERMINAL_STATUSES: frozenset[str] = frozenset({"success", "error", "cancelled", "skipped", "cached"})
+FAILED_STATUSES: frozenset[str] = frozenset({"error", "cancelled"})
+
+
+def utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+class Base(BaseModel):
+    model_config = ConfigDict(extra="ignore", validate_assignment=False)
+
+
+# -- workflow description ------------------------------------------------------------------------------
+
+
+class PortSpec(Base):
+    """One named input or output port, discovered from a ``WS*Input``/``WS*Output`` node."""
+
+    key: str
+    direction: PortDirection
+    kind: PortKind
+    node_id: str
+    label: str = ""
+    group: str = ""
+    order: int = 0
+    optional: bool = False
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def display_name(self) -> str:
+        return self.label or self.key
+
+
+class ParamSpec(Base):
+    """One editable parameter.
+
+    ``source`` distinguishes the two discovery paths: ``ws_node`` for our own input nodes, ``raw_widget``
+    for an arbitrary widget on a stock node that the user chose to expose. Both render identically.
+    """
+
+    key: str
+    kind: ParamKind
+    label: str = ""
+    default: Any = None
+    min: float | None = None
+    max: float | None = None
+    step: float | None = None
+    choices: list[str] | None = None
+    multiline: bool = False
+    tooltip: str = ""
+    group: str = ""
+    order: int = 0
+    node_id: str
+    input_name: str
+    source: Literal["ws_node", "raw_widget"] = "ws_node"
+    #: Set for seed parameters so the runner knows it may randomise them.
+    is_seed: bool = False
+
+    @property
+    def display_name(self) -> str:
+        return self.label or self.key
+
+
+class WorkflowRef(Base):
+    """A sub-workflow belonging to the project.
+
+    Both formats are kept: the UI graph is what opens in ComfyUI, the API prompt is what executes. They are
+    produced together by ComfyUI's own ``graphToPrompt()`` via the bridge extension.
+    """
+
+    id: str = Field(default_factory=lambda: new_id("wf"))
+    name: str = "Workflow"
+    #: Hash of the API prompt; changes here invalidate cached step results.
+    hash: str = ""
+    ports: list[PortSpec] = Field(default_factory=list)
+    params: list[ParamSpec] = Field(default_factory=list)
+    #: Path inside ComfyUI's user workflow directory, when we pushed a copy there for editing.
+    comfy_userdata_path: str | None = None
+    last_synced: datetime | None = None
+    #: Node classes referenced by the graph that the target ComfyUI does not have installed.
+    missing_nodes: list[str] = Field(default_factory=list)
+    #: Non-fatal problems found during import or conversion, surfaced in the UI.
+    warnings: list[str] = Field(default_factory=list)
+    created: datetime = Field(default_factory=utcnow)
+
+    def port(self, key: str, direction: PortDirection | None = None) -> PortSpec | None:
+        for p in self.ports:
+            if p.key == key and (direction is None or p.direction == direction):
+                return p
+        return None
+
+    def param(self, key: str) -> ParamSpec | None:
+        return next((p for p in self.params if p.key == key), None)
+
+    @property
+    def inputs(self) -> list[PortSpec]:
+        return [p for p in self.ports if p.direction == "in"]
+
+    @property
+    def outputs(self) -> list[PortSpec]:
+        return [p for p in self.ports if p.direction == "out"]
+
+
+# -- shots ---------------------------------------------------------------------------------------------
+
+
+class Vec2(Base):
+    x: float = 0.0
+    y: float = 0.0
+
+
+class Step(Base):
+    """One workflow execution inside a shot."""
+
+    id: str = Field(default_factory=lambda: new_id("step"))
+    name: str = "Step"
+    workflow_id: str
+    enabled: bool = True
+    #: ``param key -> value``. Absent keys fall back to the workflow's declared default.
+    param_overrides: dict[str, Any] = Field(default_factory=dict)
+    seed_mode: SeedMode | None = None
+    #: Overrides the project's backend, so one step can run on a remote GPU and the rest locally.
+    backend_id: str | None = None
+    notes: str = ""
+    ui_pos: Vec2 = Field(default_factory=Vec2)
+
+
+class Link(Base):
+    """An output port feeding an input port."""
+
+    id: str = Field(default_factory=lambda: new_id("link"))
+    from_step: str
+    from_port: str
+    to_step: str
+    to_port: str
+
+
+class Shot(Base):
+    id: str = Field(default_factory=lambda: new_id("shot"))
+    name: str = "Shot"
+    notes: str = ""
+    color: str | None = None
+    steps: list[Step] = Field(default_factory=list)
+    links: list[Link] = Field(default_factory=list)
+    created: datetime = Field(default_factory=utcnow)
+
+    def step(self, step_id: str) -> Step | None:
+        return next((s for s in self.steps if s.id == step_id), None)
+
+    def links_into(self, step_id: str) -> list[Link]:
+        return [link for link in self.links if link.to_step == step_id]
+
+    def links_out_of(self, step_id: str) -> list[Link]:
+        return [link for link in self.links if link.from_step == step_id]
+
+
+# -- run results ---------------------------------------------------------------------------------------
+
+
+class ComfyRef(Base):
+    """A file as ComfyUI names it, kept so we can re-fetch or re-preview without guessing."""
+
+    filename: str
+    subfolder: str = ""
+    type: str = "output"
+
+
+class Artifact(Base):
+    """One concrete output of a step run."""
+
+    id: str = Field(default_factory=lambda: new_id("art"))
+    kind: PortKind
+    port_key: str
+    #: Project-relative path when ingested into the asset store; absolute when referenced in place.
+    path: str
+    comfy_ref: ComfyRef | None = None
+    thumb: str | None = None
+    #: Content hash, used as the cache key for downstream steps.
+    sha256: str = ""
+    meta: dict[str, Any] = Field(default_factory=dict)
+    created: datetime = Field(default_factory=utcnow)
+
+
+class StepRun(Base):
+    step_id: str
+    status: RunStatus = "pending"
+    prompt_id: str | None = None
+    started: datetime | None = None
+    finished: datetime | None = None
+    progress: float = 0.0
+    current_node: str | None = None
+    outputs: list[Artifact] = Field(default_factory=list)
+    error: str | None = None
+    error_node: str | None = None
+    #: True when we reused a previous run's outputs instead of executing.
+    cached: bool = False
+    #: The resolved parameter values actually submitted, so a result is reproducible.
+    resolved_params: dict[str, Any] = Field(default_factory=dict)
+    cache_key: str = ""
+    logs: list[str] = Field(default_factory=list)
+
+    def output(self, port_key: str) -> Artifact | None:
+        return next((a for a in self.outputs if a.port_key == port_key), None)
+
+    @property
+    def duration_s(self) -> float | None:
+        if self.started and self.finished:
+            return (self.finished - self.started).total_seconds()
+        return None
+
+
+class Run(Base):
+    id: str = Field(default_factory=lambda: new_id("run"))
+    shot_id: str | None = None
+    mode: RunMode = "shot"
+    status: RunStatus = "pending"
+    started: datetime = Field(default_factory=utcnow)
+    finished: datetime | None = None
+    step_runs: list[StepRun] = Field(default_factory=list)
+    error: str | None = None
+
+    def step_run(self, step_id: str) -> StepRun | None:
+        return next((sr for sr in self.step_runs if sr.step_id == step_id), None)
+
+    @property
+    def progress(self) -> float:
+        if not self.step_runs:
+            return 0.0
+        done = sum(1.0 if sr.status in TERMINAL_STATUSES else sr.progress for sr in self.step_runs)
+        return min(1.0, done / len(self.step_runs))
+
+
+# -- timeline ------------------------------------------------------------------------------------------
+
+
+class ClipSource(Base):
+    """Where a clip's media comes from.
+
+    Referencing ``(shot, step, port)`` rather than a file means re-running a shot updates the timeline
+    automatically; a fixed ``asset_id`` is for imported media that no step produces.
+    """
+
+    kind: Literal["step_output", "asset"] = "step_output"
+    shot_id: str | None = None
+    step_id: str | None = None
+    port_key: str | None = None
+    asset_id: str | None = None
+
+
+class Transform(Base):
+    scale: float = 1.0
+    offset_x: float = 0.0
+    offset_y: float = 0.0
+    rotation: float = 0.0
+    fit: Literal["contain", "cover", "stretch", "none"] = "contain"
+
+
+class Transition(Base):
+    kind: Literal["none", "fade", "dissolve"] = "none"
+    duration: float = 0.0
+
+
+class Clip(Base):
+    id: str = Field(default_factory=lambda: new_id("clip"))
+    name: str = ""
+    source: ClipSource = Field(default_factory=ClipSource)
+    #: Seconds on the timeline.
+    start: float = 0.0
+    duration: float = 1.0
+    #: Seconds into the source media.
+    in_point: float = 0.0
+    out_point: float | None = None
+    transform: Transform = Field(default_factory=Transform)
+    transition_in: Transition = Field(default_factory=Transition)
+    transition_out: Transition = Field(default_factory=Transition)
+    opacity: float = 1.0
+    volume: float = 1.0
+    #: Text tracks render this instead of media.
+    text: str = ""
+    text_style: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+    @property
+    def end(self) -> float:
+        return self.start + self.duration
+
+
+class Track(Base):
+    id: str = Field(default_factory=lambda: new_id("track"))
+    kind: TrackKind = "video"
+    name: str = "Track"
+    muted: bool = False
+    locked: bool = False
+    clips: list[Clip] = Field(default_factory=list)
+
+    def clip(self, clip_id: str) -> Clip | None:
+        return next((c for c in self.clips if c.id == clip_id), None)
+
+
+class Timeline(Base):
+    fps: float = 24.0
+    width: int = 1024
+    height: int = 1024
+    background: str = "#000000"
+    tracks: list[Track] = Field(default_factory=list)
+
+    # Serialised so the UI does not have to re-derive it from every clip on every render. It is ignored
+    # on input (``extra="ignore"``), so a round trip cannot corrupt it.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def duration(self) -> float:
+        return max(
+            (clip.end for track in self.tracks for clip in track.clips if clip.enabled),
+            default=0.0,
+        )
+
+    def track(self, track_id: str) -> Track | None:
+        return next((t for t in self.tracks if t.id == track_id), None)
+
+
+# -- project -------------------------------------------------------------------------------------------
+
+
+class Asset(Base):
+    """Media in the project that no step produced — imported footage, reference images, music."""
+
+    id: str = Field(default_factory=lambda: new_id("asset"))
+    name: str = ""
+    kind: PortKind = "image"
+    path: str
+    thumb: str | None = None
+    sha256: str = ""
+    meta: dict[str, Any] = Field(default_factory=dict)
+    created: datetime = Field(default_factory=utcnow)
+
+
+class ProjectSettings(Base):
+    fps: float = 24.0
+    width: int = 1024
+    height: int = 1024
+    #: Default ComfyUI backend for this project's steps; individual steps may override it.
+    backend_id: str | None = None
+
+
+class Project(Base):
+    schema_version: int = PROJECT_SCHEMA_VERSION
+    id: str = Field(default_factory=lambda: new_id("proj"))
+    name: str = "Untitled Project"
+    description: str = ""
+    created: datetime = Field(default_factory=utcnow)
+    modified: datetime = Field(default_factory=utcnow)
+    settings: ProjectSettings = Field(default_factory=ProjectSettings)
+    workflows: dict[str, WorkflowRef] = Field(default_factory=dict)
+    shots: list[Shot] = Field(default_factory=list)
+    timeline: Timeline = Field(default_factory=Timeline)
+    assets: dict[str, Asset] = Field(default_factory=dict)
+
+    def shot(self, shot_id: str) -> Shot | None:
+        return next((s for s in self.shots if s.id == shot_id), None)
+
+    def workflow(self, workflow_id: str) -> WorkflowRef | None:
+        return self.workflows.get(workflow_id)
+
+    def find_step(self, step_id: str) -> tuple[Shot, Step] | None:
+        for shot in self.shots:
+            step = shot.step(step_id)
+            if step is not None:
+                return shot, step
+        return None
+
+    def touch(self) -> None:
+        self.modified = utcnow()
+
+
+# -- port compatibility --------------------------------------------------------------------------------
+
+#: Kinds a port of the key kind will accept, beyond an exact match. Deliberately conservative: an implicit
+#: conversion the user did not ask for is worse than a link they have to think about.
+_IMPLICIT_CONVERSIONS: dict[str, set[str]] = {
+    "image": {"mask"},          # a mask is a single-channel image
+    "mask": {"image"},          # take luminance
+    "float": {"int"},
+    "string": {"int", "float", "boolean"},
+    "file": {"image", "video", "audio", "latent", "mask"},  # anything on disk can be passed as a path
+}
+
+
+def can_connect(from_kind: str, to_kind: str) -> bool:
+    """Whether an output of ``from_kind`` may feed an input of ``to_kind``."""
+    return from_kind == to_kind or from_kind in _IMPLICIT_CONVERSIONS.get(to_kind, set())
+
+
+def conversion_note(from_kind: str, to_kind: str) -> str | None:
+    """Human-readable warning when a link is legal but lossy, so the UI can say so up front."""
+    if from_kind == to_kind:
+        return None
+    if not can_connect(from_kind, to_kind):
+        return None
+    notes = {
+        ("image", "mask"): "Image will be converted to a mask using its luminance.",
+        ("mask", "image"): "Mask will be expanded to a greyscale image.",
+        ("int", "float"): "Integer will be widened to a float.",
+        ("int", "string"): "Number will be formatted as text.",
+        ("float", "string"): "Number will be formatted as text.",
+        ("boolean", "string"): "Boolean will be formatted as text.",
+    }
+    return notes.get((from_kind, to_kind), f"{from_kind} will be adapted to {to_kind}.")

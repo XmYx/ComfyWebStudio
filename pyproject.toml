@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "comfywebstudio"
+version = "0.1.0"
+description = "Shot-based orchestration framework for chained ComfyUI workflows"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "httpx>=0.28",
+    "websockets>=13",
+    "python-multipart>=0.0.12",
+    "pillow>=10.4",
+    "av>=13",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "aiohttp>=3.10",
+    "asgi-lifespan>=2.1",
+    "pytest-timeout>=2.3",
+    "ruff>=0.7",
+]
+
+[project.scripts]
+comfywebstudio = "comfywebstudio.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/comfywebstudio"]
+
+[tool.ruff]
+line-length = 110
+src = ["backend", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["comfywebstudio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["backend"]
+filterwarnings = ["ignore::DeprecationWarning"]

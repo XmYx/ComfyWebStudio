@@ -1,0 +1,62 @@
+@import 'tailwindcss';
+@import '@xyflow/react/dist/style.css';
+
+@theme {
+  --color-surface: #0f1115;
+  --color-panel: #161a21;
+  --color-panel-2: #1d222b;
+  --color-edge: #272e39;
+  --color-ink: #e6e9ef;
+  --color-ink-dim: #98a2b3;
+  --color-accent: #5b8cff;
+  --color-ok: #3fb950;
+  --color-warn: #d29922;
+  --color-bad: #f85149;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Port-kind colours are shared by the graph handles, the parameter form and the preview chips, so a kind
+   is recognisable wherever it appears. */
+:root {
+  --kind-image: #5b8cff;
+  --kind-mask: #8b7fff;
+  --kind-video: #ff7b5b;
+  --kind-audio: #3fb9a0;
+  --kind-latent: #d29922;
+  --kind-string: #9aa4b2;
+  --kind-int: #7aa2f7;
+  --kind-float: #7aa2f7;
+  --kind-boolean: #b3b3b3;
+  --kind-file: #6b7280;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-edge); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #37404e; }
+
+/* React Flow theming */
+.react-flow__background { background: var(--color-surface); }
+.react-flow__edge-path { stroke: #46506180; stroke-width: 2; }
+.react-flow__edge.selected .react-flow__edge-path { stroke: var(--color-accent); }
+.react-flow__handle { border: 2px solid var(--color-panel); width: 11px; height: 11px; }
+.react-flow__attribution { display: none; }
+.react-flow__controls-button {
+  background: var(--color-panel-2);
+  border-bottom: 1px solid var(--color-edge);
+  fill: var(--color-ink-dim);
+}
+
+input[type='range'] { accent-color: var(--color-accent); }
