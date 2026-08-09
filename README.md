@@ -50,6 +50,10 @@ pack (ComfyUI needs a restart afterwards).
 Workflows built from **subgraphs** work as they are: the inputs a subgraph promotes become editable
 parameters automatically, so you get the author's intended knobs without opening it up.
 
+**Open in ComfyUI** opens the workflow as a properly named, saved ComfyUI workflow — one imported from
+ComfyUI reopens its original file — so <kbd>Ctrl</kbd>+<kbd>S</kbd> there just saves, and the change syncs
+straight back.
+
 <details>
 <summary>Using make instead</summary>
 

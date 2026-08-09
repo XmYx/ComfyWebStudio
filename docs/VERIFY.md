@@ -21,6 +21,7 @@ cd frontend && npm run typecheck && npx vitest run
 | `scripts/ui_menus.py` | the menus: shortcuts, undo/redo, panel toggles, dialogs | a running app |
 | `scripts/ui_features.py` | node resize, context menus, history panel and element restore | a running app |
 | `scripts/ui_dismiss.py` | menus close on a click elsewhere, including surfaces that swallow mousedown | a running app |
+| `scripts/ui_open_in_comfy.py` | opening a workflow lands on a *named, saved* ComfyUI workflow | app + real ComfyUI |
 
 The fake ComfyUI (`tests/fixtures/fake_comfy.py`) replays ComfyUI 0.24.1's real event ordering, including
 the detail the runner depends on: `execution_success` arrives *before* history is written, and the
@@ -63,6 +64,12 @@ afterwards, so they are repeatable and never touch your real work.
 
 ### Editing in ComfyUI
 - [ ] "Open in ComfyUI" opens a new tab with the graph loaded and a green **WebStudio · Linked** badge.
+- [ ] The ComfyUI tab shows the workflow's **name**, not "Unsaved Workflow", and <kbd>Ctrl</kbd>+<kbd>S</kbd>
+      there saves in place without asking for a name.
+- [ ] A workflow imported with **From ComfyUI** reopens *its original file* — check the tab name matches and
+      that saving updates that file rather than creating a copy.
+- [ ] A workflow imported in API format gets saved under `ComfyWebStudio/<project>/` on first open, and
+      appears in ComfyUI's own workflow list from then on.
 - [ ] Add a `WS Text Input` named `negative`, save (or press the badge). A toast reports the new port.
 - [ ] The new parameter appears in the inspector without reloading ComfyWebStudio.
 - [ ] Delete a port that a link uses, save: the toast says the link was disconnected, and the canvas

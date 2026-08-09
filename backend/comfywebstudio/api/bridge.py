@@ -14,6 +14,7 @@ from fastapi import APIRouter, Header
 from pydantic import BaseModel
 
 from ..comfy.discovery import NodeKindMap, discover, find_missing_nodes, prompt_hash, subgraph_params
+from ..comfy.userdata import ensure_saved_in_comfy
 from ..core.errors import NotFound, StudioError
 from ..core.models import utcnow
 from .deps import StateDep
@@ -88,6 +89,9 @@ def fetch_workflow(
         "workflow": graph,
         "prompt": prompt,
         "has_ui_graph": graph is not None,
+        # Set once the workflow has been saved into ComfyUI; the extension opens this rather than loading
+        # a bare graph, so the tab is a named workflow instead of an unsaved one.
+        "comfy_path": workflow.comfy_userdata_path,
         "label": f"{project.name} · {workflow.name}",
         "name": workflow.name,
     }
@@ -149,6 +153,15 @@ async def save_workflow(
     state.store.write_workflow(project.id, workflow.id, "api", body.prompt)
     state.store.write_workflow(project.id, workflow.id, "ui", body.workflow)
 
+    # Keep ComfyUI's own copy in step, so the file the user reopens is never behind what we hold. This
+    # also gives an API-format-only import a real saved identity the first time it is edited.
+    comfy_path = workflow.comfy_userdata_path
+    try:
+        backend = await state.backends.get()
+        comfy_path = await ensure_saved_in_comfy(backend, project, workflow, body.workflow) or comfy_path
+    except Exception as exc:  # noqa: BLE001 - syncing back must not fail over a userdata write
+        logger.debug("Could not refresh ComfyUI's copy of %r: %s", workflow.name, exc)
+
     removed = previous_ports - {p.key for p in workflow.ports}
     broken = _drop_dangling_links(project, workflow.id, removed)
     state.store.save(project)
@@ -173,6 +186,7 @@ async def save_workflow(
     return {
         "ok": True,
         "workflow_id": workflow.id,
+        "comfy_path": comfy_path,
         "port_count": len(workflow.ports),
         "param_count": len(workflow.params),
         "removed_ports": sorted(removed),

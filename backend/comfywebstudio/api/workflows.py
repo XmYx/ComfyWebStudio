@@ -23,6 +23,7 @@ from ..comfy.discovery import (
 )
 from ..comfy.graph_convert import ui_graph_to_prompt
 from ..comfy.objectinfo import WidgetSpec
+from ..comfy.userdata import ensure_saved_in_comfy, is_managed, remove_from_comfy
 from ..core.errors import NotFound, ValidationFailed
 from ..core.models import WorkflowRef, utcnow
 from .deps import ProjectDep, StateDep
@@ -184,8 +185,9 @@ def get_graph(state: StateDep, project: ProjectDep, workflow_id: str, fmt: str =
 
 
 @router.delete("/{workflow_id}", status_code=204)
-def delete_workflow(state: StateDep, project: ProjectDep, workflow_id: str) -> None:
-    if workflow_id not in project.workflows:
+async def delete_workflow(state: StateDep, project: ProjectDep, workflow_id: str) -> None:
+    workflow = project.workflows.get(workflow_id)
+    if workflow is None:
         raise NotFound(f"No workflow {workflow_id!r}")
 
     in_use = [
@@ -198,6 +200,14 @@ def delete_workflow(state: StateDep, project: ProjectDep, workflow_id: str) -> N
         raise ValidationFailed(
             "This workflow is still used by: " + ", ".join(in_use[:5]) + ". Remove those steps first."
         )
+
+    # Only remove ComfyUI's copy when we put it there. A workflow imported from ComfyUI keeps its
+    # original path, and that file belongs to the user.
+    if is_managed(workflow.comfy_userdata_path):
+        try:
+            await remove_from_comfy(await state.backends.get(), workflow)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not tidy up ComfyUI's copy: %s", exc)
 
     project.workflows.pop(workflow_id)
     state.store.delete_workflow_files(project.id, workflow_id)
@@ -363,15 +373,27 @@ async def open_in_comfy(
 ) -> dict:
     """Build the URL that opens this workflow in ComfyUI, linked back to us.
 
-    The bridge extension in our node pack reads ``ws_open``, fetches the graph from this server and loads
-    it. The token scopes the write-back to this one workflow, so a stale tab cannot overwrite something
-    else later.
+    The workflow is first saved into ComfyUI's own user directory, so the tab that opens is a real named
+    workflow rather than an unsaved document — Ctrl+S there saves in place instead of asking the user to
+    invent a name. The token scopes the write-back to this one workflow, so a stale tab cannot overwrite
+    something else later.
     """
     workflow = project.workflow(workflow_id)
     if workflow is None:
         raise NotFound(f"No workflow {workflow_id!r}")
 
     backend = await state.backends.get(backend_id)
+
+    comfy_path = None
+    try:
+        graph = state.store.read_workflow(project.id, workflow_id, "ui")
+    except NotFound:
+        graph = {}
+    if graph:
+        comfy_path = await ensure_saved_in_comfy(backend, project, workflow, graph)
+        if comfy_path:
+            state.store.save(project)
+
     token = secrets.token_urlsafe(24)
     state.bridge_tokens[token] = {"project_id": project.id, "workflow_id": workflow_id}
 
@@ -387,6 +409,7 @@ async def open_in_comfy(
     return {
         "url": f"{backend.config.base_url}/?ws_open={encoded}",
         "token": token,
+        "comfy_path": comfy_path,
         "node_pack_installed": pack is not None,
         "hint": None
         if pack

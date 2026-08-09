@@ -109,8 +109,12 @@ ComfyUI's frontend has **no `?workflow=` deep-link parameter** (verified against
 `comfyui-frontend-package` 1.44.19), and there is **no server-side UI→API graph converter** — ComfyUI does
 that in the browser. Both gaps are filled by `comfy_nodes/web/js/webstudio.js`:
 
-- **Open**: the framework mints a scoped token and opens `?ws_open=<base64>`. The extension fetches the
-  graph from us and calls `app.loadGraphData()`.
+- **Open**: the framework first writes the workflow into ComfyUI's own user directory (`comfy/userdata.py`),
+  then mints a scoped token and opens `?ws_open=<base64>`. The extension looks the file up via
+  `extensionManager.workflow.getWorkflowByPath()` and opens *that*, so the tab is a real named workflow —
+  Ctrl+S saves in place instead of prompting for a name, and it saves to the same file we read back.
+  Workflows imported from ComfyUI keep their original path; everything else lives under
+  `workflows/ComfyWebStudio/<project>/`. Loading a bare graph remains the fallback when the write fails.
 - **Save back**: the extension calls `app.graphToPrompt()` and POSTs **both** formats to
   `/api/bridge/workflow`. Because ComfyUI's own converter produced the API prompt, the conversion is exact.
 

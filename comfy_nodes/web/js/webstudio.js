@@ -85,34 +85,67 @@ async function frameworkFetch(binding, path, init = {}) {
   return response.json();
 }
 
+/**
+ * Opens a workflow that ComfyUI already has saved, by path.
+ *
+ * This is what makes the tab a *named* workflow: Ctrl+S saves it in place instead of prompting for a name
+ * and a folder, and the file it saves to is the same one the framework reads back.
+ */
+async function openSavedWorkflow(path) {
+  const store = app.extensionManager?.workflow;
+  if (!path || !store?.getWorkflowByPath) return false;
+
+  try {
+    // The framework may have only just written the file, so refresh before looking it up.
+    await store.syncWorkflows();
+    const workflow = store.getWorkflowByPath(path);
+    if (!workflow) return false;
+    // Deliberately not forcing: if this workflow is already open with unsaved edits, leave them be.
+    await store.openWorkflow(workflow);
+    return true;
+  } catch (err) {
+    console.warn("[WebStudio] could not open the saved workflow, falling back", err);
+    return false;
+  }
+}
+
 async function openStep(request) {
   setBadge("Loading…", "pending");
   const payload = await frameworkFetch(request, `/api/bridge/workflow/${encodeURIComponent(request.stepId)}`);
+
+  storeBinding({ ...request, label: payload.label || request.label || request.stepId });
+
+  if (await openSavedWorkflow(payload.comfy_path)) {
+    setBadge(`Linked: ${state.binding.label}`, "ok");
+    return;
+  }
 
   if (payload.workflow && payload.workflow.nodes?.length) {
     await app.loadGraphData(payload.workflow, true, true, null);
   } else if (payload.prompt) {
     // Imported in API format, so there is no LiteGraph document to load. ComfyUI can build one from the
-    // prompt itself; saving back then gives the framework a real editable graph for next time.
+    // prompt itself; pushing it straight back gives the workflow a saved identity, so the next open —
+    // and Ctrl+S right now — behave like any other saved workflow.
     await app.loadApiJson(payload.prompt, payload.name || "WebStudio workflow");
+    const result = await saveBack({ silent: true });
+    if (result?.comfy_path && (await openSavedWorkflow(result.comfy_path))) {
+      setBadge(`Linked: ${state.binding.label}`, "ok");
+      return;
+    }
   } else {
     throw new Error("the framework returned no graph for this workflow");
   }
 
-  storeBinding({ ...request, label: payload.label || request.label || request.stepId });
-  setBadge(
-    payload.has_ui_graph ? `Linked: ${state.binding.label}` : `Linked: ${state.binding.label} · save to sync`,
-    "ok",
-  );
+  setBadge(`Linked: ${state.binding.label} · save to sync`, "ok");
 }
 
 async function saveBack({ silent = false } = {}) {
   const binding = state.binding;
   if (!binding) {
     if (!silent) alert("This ComfyUI tab is not linked to a ComfyWebStudio step.");
-    return;
+    return null;
   }
-  if (state.busy) return;
+  if (state.busy) return null;
   state.busy = true;
   setBadge("Syncing…", "pending");
   try {
@@ -125,10 +158,12 @@ async function saveBack({ silent = false } = {}) {
     });
     const ports = result.port_count ?? 0;
     setBadge(`Synced · ${ports} port${ports === 1 ? "" : "s"}`, "ok");
+    return result;
   } catch (err) {
     console.error("[WebStudio] save-back failed", err);
     setBadge("Sync failed", "error");
     if (!silent) alert(`ComfyWebStudio sync failed:\n${err.message}`);
+    return null;
   } finally {
     state.busy = false;
   }

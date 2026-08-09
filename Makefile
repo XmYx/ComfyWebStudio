@@ -50,6 +50,7 @@ ui-smoke: ## Browser smoke test against a running app (needs `make backend` and 
 	$(PY) scripts/ui_menus.py --shots-dir .data/screenshots
 	$(PY) scripts/ui_features.py --shots-dir .data/screenshots
 	$(PY) scripts/ui_dismiss.py
+	$(PY) scripts/ui_open_in_comfy.py
 
 lint: ## Ruff check
 	$(PY) -m ruff check backend tests
