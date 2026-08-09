@@ -17,12 +17,18 @@ interface Props {
   overrides: Record<string, unknown>
   /** Port keys currently driven by a link — those values come from upstream, so they are read-only here. */
   linkedKeys: Set<string>
+  /** Parameter keys pinned to the canvas node. */
+  pinnedKeys?: Set<string>
   onChange: (overrides: Record<string, unknown>) => void
   onReset: () => void
   onUnexpose?: (key: string) => void
+  /** Pin or unpin a parameter from the step's node on the canvas. */
+  onTogglePinned?: (key: string, pinned: boolean) => void
 }
 
-export function ParamForm({ params, overrides, linkedKeys, onChange, onReset, onUnexpose }: Props) {
+export function ParamForm({
+  params, overrides, linkedKeys, pinnedKeys, onChange, onReset, onUnexpose, onTogglePinned,
+}: Props) {
   const [draft, setDraft] = useState<Record<string, unknown>>(overrides)
   const timer = useRef<number>()
 
@@ -68,8 +74,10 @@ export function ParamForm({ params, overrides, linkedKeys, onChange, onReset, on
                 param={param}
                 value={draft[param.key] ?? param.default}
                 linked={linkedKeys.has(param.key)}
+                pinned={pinnedKeys?.has(param.key) ?? false}
                 onChange={(value) => update(param.key, value)}
                 onUnexpose={onUnexpose}
+                onTogglePinned={onTogglePinned}
               />
             ))}
           </div>
@@ -84,18 +92,30 @@ export function ParamForm({ params, overrides, linkedKeys, onChange, onReset, on
 }
 
 function ParamRow({
-  param, value, linked, onChange, onUnexpose,
+  param, value, linked, pinned, onChange, onUnexpose, onTogglePinned,
 }: {
   param: ParamSpec
   value: unknown
   linked: boolean
+  pinned: boolean
   onChange: (value: unknown) => void
   onUnexpose?: (key: string) => void
+  onTogglePinned?: (key: string, pinned: boolean) => void
 }) {
   return (
     <div>
       <div className="mb-1 flex items-center justify-between gap-2">
         <span className="flex items-center gap-1.5 text-xs font-medium" title={param.tooltip}>
+          {onTogglePinned && (
+            <input
+              type="checkbox"
+              checked={pinned}
+              onChange={(e) => onTogglePinned(param.key, e.target.checked)}
+              title="Show this parameter on the step's node in the graph"
+              aria-label={`Show ${param.label || param.key} on the node`}
+              className="size-3 shrink-0 accent-[var(--color-accent)]"
+            />
+          )}
           {param.label || param.key}
           {param.is_seed && <Badge tone="muted">seed</Badge>}
           {param.source === 'raw_widget' && <Badge tone="info" title="Exposed from a node widget">raw</Badge>}
@@ -176,10 +196,18 @@ const WIDGETS: Record<string, (props: WidgetProps) => ReactNode> = {
   ),
 }
 
-function Widget({ param, value, onChange }: WidgetProps) {
+/**
+ * One parameter's editor.
+ *
+ * Exported so the canvas node can render a pinned parameter with the same control the inspector uses —
+ * a slider here and a text box there for the same value would just be confusing.
+ */
+export function ParamWidget({ param, value, onChange }: WidgetProps) {
   const render = WIDGETS[param.kind] ?? WIDGETS.string
   return <>{render({ param, value, onChange })}</>
 }
+
+const Widget = ParamWidget
 
 function NumberWidget({
   param, value, onChange, integer,

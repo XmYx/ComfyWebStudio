@@ -239,6 +239,7 @@ export const COMMANDS: Command[] = [
               ui_pos: { x: source.ui_pos.x + 40, y: source.ui_pos.y + 40 },
               name: `${source.name} copy`,
               param_overrides: source.param_overrides,
+              exposed_params: source.exposed_params,
               seed_mode: source.seed_mode,
             }),
           'Step pasted.',

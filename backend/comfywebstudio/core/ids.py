@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import secrets
 import unicodedata
+import uuid
 
 _ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
@@ -19,6 +20,16 @@ def new_id(prefix: str, length: int = 10) -> str:
     """A new id such as ``shot_k3f9x2a1qd``."""
     body = "".join(secrets.choice(_ALPHABET) for _ in range(length))
     return f"{prefix}_{body}"
+
+
+def new_uuid() -> str:
+    """A plain UUID4 string.
+
+    Used where something outside the framework dictates the format — ComfyUI validates the caller-supplied
+    ``prompt_id`` as a real UUID (it rejects anything else with "prompt_id must be a valid UUID"), so our
+    own prefixed ids are not usable there.
+    """
+    return str(uuid.uuid4())
 
 
 def slugify(value: str, *, fallback: str = "untitled", max_length: int = 64) -> str:

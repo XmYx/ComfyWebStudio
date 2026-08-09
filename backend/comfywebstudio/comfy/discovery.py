@@ -125,12 +125,11 @@ def discover(api_prompt: dict[str, Any], *, kind_map: NodeKindMap | None = None)
         if not class_type:
             continue
         result.node_classes.add(class_type)
-        inputs = node.get("inputs") or {}
 
         if class_type in kinds.inputs:
-            _add_input(result, kinds, node_id, class_type, inputs, used_input_keys)
+            _add_input(result, kinds, node_id, class_type, node, used_input_keys)
         elif class_type in kinds.outputs:
-            _add_output(result, kinds, node_id, class_type, inputs, used_output_keys)
+            _add_output(result, kinds, node_id, class_type, node, used_output_keys)
 
     result.ports.sort(key=lambda p: (p.direction, p.group, p.order, p.key))
     result.params.sort(key=lambda p: (p.group, p.order, p.key))
@@ -150,19 +149,19 @@ def _add_input(
     kinds: NodeKindMap,
     node_id: str,
     class_type: str,
-    inputs: dict[str, Any],
+    node: dict[str, Any],
     used: dict[str, str],
 ) -> None:
+    inputs = node.get("inputs") or {}
     kind = kinds.inputs[class_type]
+    port_name = str(inputs.get("port_name") or "").strip()
     key = _unique_key(
-        str(inputs.get("port_name") or "").strip(),
-        node_id=node_id,
-        used=used,
-        result=result,
-        what="input port",
+        port_name, node_id=node_id, used=used, result=result, what="input port"
     )
 
     label = str(inputs.get("label") or "").strip()
+    if not label and not port_name:
+        label = _fallback_label(node, class_type, kind, "input")
     group = str(inputs.get("group") or "").strip()
     order = _as_int(inputs.get("order"), 0)
 
@@ -210,26 +209,38 @@ def _add_output(
     kinds: NodeKindMap,
     node_id: str,
     class_type: str,
-    inputs: dict[str, Any],
+    node: dict[str, Any],
     used: dict[str, str],
 ) -> None:
+    inputs = node.get("inputs") or {}
+    kind = kinds.outputs[class_type]
+    port_name = str(inputs.get("port_name") or "").strip()
     key = _unique_key(
-        str(inputs.get("port_name") or "").strip(),
-        node_id=node_id,
-        used=used,
-        result=result,
-        what="output port",
+        port_name, node_id=node_id, used=used, result=result, what="output port"
     )
     result.ports.append(
         PortSpec(
             key=key,
             direction="out",
-            kind=kinds.outputs[class_type],  # type: ignore[arg-type]
+            kind=kind,  # type: ignore[arg-type]
             node_id=node_id,
-            label=key,
+            label=port_name or _fallback_label(node, class_type, kind, "output"),
             meta={"class_type": class_type, "format": inputs.get("format")},
         )
     )
+
+
+def _fallback_label(node: dict[str, Any], class_type: str, kind: str, direction: str) -> str:
+    """Something readable for a port whose node carries no port name.
+
+    The *key* stays ``node_<id>`` because it has to survive a re-sync, but showing that in the port list
+    tells the user nothing — and an unnamed output is common enough (the widget defaults to empty) that it
+    is worth naming after whatever the node itself is called.
+    """
+    title = str(((node.get("_meta") or {}).get("title")) or "").strip()
+    if title and title != class_type:
+        return title
+    return f"Unnamed {kind} {direction}"
 
 
 def _unique_key(

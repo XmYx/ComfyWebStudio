@@ -659,6 +659,306 @@ async def test_importing_a_missing_comfy_workflow_is_a_clean_404(client):
     assert response.status_code == 404
 
 
+# -- value nodes -----------------------------------------------------------------------------------------
+
+
+async def test_value_node_round_trip(client):
+    project, shot, steps = await build_chain(client)
+
+    created = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/nodes",
+        json={"kind": "string", "name": "Shared caption", "value": "hello"},
+    )
+    assert created.status_code == 201, created.text
+    node = created.json()
+    assert node["value"] == "hello"
+
+    patched = await client.patch(
+        f"/api/projects/{project['id']}/nodes/{node['id']}", json={"value": "goodbye"}
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["value"] == "goodbye"
+
+    shots = (await client.get(f"/api/projects/{project['id']}/shots")).json()
+    assert [n["id"] for n in shots[0]["nodes"]] == [node["id"]]
+
+
+async def test_a_new_value_node_starts_with_a_usable_value(client):
+    project = await make_project(client)
+    shot = (await client.post(f"/api/projects/{project['id']}/shots", json={"name": "S"})).json()
+
+    for kind, expected in (("string", ""), ("int", 0), ("float", 0.0), ("boolean", False)):
+        created = await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/nodes", json={"kind": kind}
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["value"] == expected
+
+
+async def test_a_value_node_can_feed_a_step_input(client):
+    project, shot, steps = await build_chain(client)
+    node = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/nodes",
+            json={"kind": "string", "value": "wired"},
+        )
+    ).json()
+
+    link = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/links",
+        json={
+            "from_step": node["id"], "from_port": "value",
+            "to_step": steps[1]["id"], "to_port": "caption",
+        },
+    )
+    assert link.status_code == 201, link.text
+
+    report = (
+        await client.get(f"/api/projects/{project['id']}/shots/{shot['id']}/validate")
+    ).json()
+    assert report["ok"] is True, report["issues"]
+
+
+async def test_a_value_node_of_the_wrong_kind_is_refused(client):
+    project, shot, steps = await build_chain(client)
+    node = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/nodes", json={"kind": "boolean"}
+        )
+    ).json()
+
+    # The consumer's `image` input takes an image; a boolean is not one, and never converts to one.
+    response = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/links",
+        json={
+            "from_step": node["id"], "from_port": "value",
+            "to_step": steps[1]["id"], "to_port": "image",
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert "Cannot connect a boolean output to a image input" in response.json()["message"]
+
+
+async def test_deleting_a_value_node_removes_its_links(client):
+    project, shot, steps = await build_chain(client)
+    node = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/nodes",
+            json={"kind": "string", "value": "x"},
+        )
+    ).json()
+    await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/links",
+        json={
+            "from_step": node["id"], "from_port": "value",
+            "to_step": steps[1]["id"], "to_port": "caption",
+        },
+    )
+
+    response = await client.delete(f"/api/projects/{project['id']}/nodes/{node['id']}")
+    assert response.status_code == 204
+
+    shots = (await client.get(f"/api/projects/{project['id']}/shots")).json()
+    assert shots[0]["nodes"] == []
+    assert all(link["from_step"] != node["id"] for link in shots[0]["links"])
+
+
+async def test_duplicating_a_shot_gives_its_value_nodes_fresh_ids(client):
+    project, shot, steps = await build_chain(client)
+    node = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/nodes",
+            json={"kind": "string", "value": "x"},
+        )
+    ).json()
+    await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/links",
+        json={
+            "from_step": node["id"], "from_port": "value",
+            "to_step": steps[1]["id"], "to_port": "caption",
+        },
+    )
+
+    copy = (
+        await client.post(f"/api/projects/{project['id']}/shots/{shot['id']}/duplicate")
+    ).json()
+
+    assert len(copy["nodes"]) == 1
+    copied = copy["nodes"][0]
+    assert copied["id"] != node["id"], "the copy shares an id with the original"
+    # ...and the copied link points at the copy, not back at the original node.
+    assert [link["from_step"] for link in copy["links"] if link["from_port"] == "value"] == [
+        copied["id"]
+    ]
+
+
+# -- parameters pinned to the canvas node ----------------------------------------------------------------
+
+
+async def test_pinning_a_parameter_to_the_node(client):
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Generate", generator_prompt())
+    shot = (await client.post(f"/api/projects/{project['id']}/shots", json={"name": "S"})).json()
+    step = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+            json={"workflow_id": workflow["id"]},
+        )
+    ).json()
+    assert step["exposed_params"] == []
+
+    updated = await client.patch(
+        f"/api/projects/{project['id']}/steps/{step['id']}", json={"exposed_params": ["prompt"]}
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["exposed_params"] == ["prompt"]
+
+    # Replaced wholesale, so unpinning is just a shorter list.
+    cleared = await client.patch(
+        f"/api/projects/{project['id']}/steps/{step['id']}", json={"exposed_params": []}
+    )
+    assert cleared.json()["exposed_params"] == []
+
+
+# -- re-syncing a workflow edited inside ComfyUI ---------------------------------------------------------
+
+
+def _comfy_graph(*, with_output: bool) -> dict:
+    """A small LiteGraph document, optionally with our output node attached."""
+    nodes = [
+        {"id": 1, "type": "WSStringInput", "widgets_values": ["prompt", "a cat"]},
+        {"id": 2, "type": "EmptyImage", "widgets_values": [64, 64],
+         "outputs": [{"name": "IMAGE", "type": "IMAGE"}]},
+    ]
+    links: list[list] = []
+    if with_output:
+        nodes.append(
+            {"id": 3, "type": "WSImageOutput", "widgets_values": ["image", "png", ""],
+             "inputs": [{"name": "image", "type": "IMAGE", "link": 1}]}
+        )
+        links.append([1, 2, 0, 3, 0, "IMAGE"])
+    return {"nodes": nodes, "links": links}
+
+
+async def _import_from_comfy(client, fake_comfy, project_id, graph, path="edited.json") -> dict:
+    workflows_dir = fake_comfy.root / "user" / "default" / "workflows"
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+    (workflows_dir / path).write_text(json.dumps(graph))
+    response = await client.post(
+        f"/api/comfy/projects/{project_id}/import", json={"path": path}
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+async def test_sync_picks_up_an_output_node_added_in_comfyui(client, fake_comfy):
+    """The regression this endpoint exists for.
+
+    ComfyUI's own Ctrl+S writes its user directory and notifies nobody, so a workflow imported before the
+    user attached an output node kept reporting no outputs — while ``last_synced`` claimed it was current.
+    """
+    project = await make_project(client)
+    workflow = await _import_from_comfy(
+        client, fake_comfy, project["id"], _comfy_graph(with_output=False)
+    )
+    assert {p["key"] for p in workflow["ports"]} == {"prompt"}
+
+    # The user opens it in ComfyUI, adds the output node and presses Ctrl+S.
+    (fake_comfy.root / "user" / "default" / "workflows" / "edited.json").write_text(
+        json.dumps(_comfy_graph(with_output=True))
+    )
+
+    synced = await client.post(
+        f"/api/projects/{project['id']}/workflows/{workflow['id']}/rediscover"
+    )
+    assert synced.status_code == 200, synced.text
+    ports = {p["key"]: p["direction"] for p in synced.json()["ports"]}
+    assert ports == {"prompt": "in", "image": "out"}
+
+    # ...and the stored graphs are the ones ComfyUI now has, not the ones we imported.
+    stored = (
+        await client.get(f"/api/projects/{project['id']}/workflows/{workflow['id']}/graph?fmt=api")
+    ).json()
+    assert any(n["class_type"] == "WSImageOutput" for n in stored.values())
+
+
+async def test_sync_without_pull_only_re_reads_the_stored_graph(client, fake_comfy):
+    project = await make_project(client)
+    workflow = await _import_from_comfy(
+        client, fake_comfy, project["id"], _comfy_graph(with_output=False)
+    )
+    (fake_comfy.root / "user" / "default" / "workflows" / "edited.json").write_text(
+        json.dumps(_comfy_graph(with_output=True))
+    )
+
+    synced = await client.post(
+        f"/api/projects/{project['id']}/workflows/{workflow['id']}/rediscover?pull=false"
+    )
+    assert synced.status_code == 200, synced.text
+    assert {p["key"] for p in synced.json()["ports"]} == {"prompt"}
+
+
+async def test_sync_falls_back_to_the_stored_graph_when_comfyui_is_down(client, fake_comfy):
+    project = await make_project(client)
+    workflow = await _import_from_comfy(
+        client, fake_comfy, project["id"], _comfy_graph(with_output=True)
+    )
+    await fake_comfy.stop()
+
+    synced = await client.post(
+        f"/api/projects/{project['id']}/workflows/{workflow['id']}/rediscover"
+    )
+    assert synced.status_code == 200, synced.text
+    body = synced.json()
+    # The ports we already knew about survive...
+    assert {p["key"] for p in body["ports"]} == {"prompt", "image"}
+    # ...and the user is told this is not a fresh read.
+    assert any("could not be read" in w for w in body["warnings"])
+
+
+async def test_sync_drops_links_to_a_port_deleted_in_comfyui(client, fake_comfy):
+    project = await make_project(client)
+    source = await _import_from_comfy(
+        client, fake_comfy, project["id"], _comfy_graph(with_output=True), path="source.json"
+    )
+    target = await import_workflow(client, project["id"], "Consume", consumer_prompt())
+
+    shot = (
+        await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Shot 1"})
+    ).json()
+    steps = []
+    for workflow in (source, target):
+        steps.append(
+            (
+                await client.post(
+                    f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+                    json={"workflow_id": workflow["id"]},
+                )
+            ).json()
+        )
+    link = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/links",
+        json={
+            "from_step": steps[0]["id"], "from_port": "image",
+            "to_step": steps[1]["id"], "to_port": "image",
+        },
+    )
+    assert link.status_code == 201, link.text
+
+    # The user removes the output node in ComfyUI and saves.
+    (fake_comfy.root / "user" / "default" / "workflows" / "source.json").write_text(
+        json.dumps(_comfy_graph(with_output=False))
+    )
+    synced = await client.post(
+        f"/api/projects/{project['id']}/workflows/{source['id']}/rediscover"
+    )
+    assert synced.status_code == 200, synced.text
+    assert {p["key"] for p in synced.json()["ports"]} == {"prompt"}
+
+    shots = (await client.get(f"/api/projects/{project['id']}/shots")).json()
+    assert shots[0]["links"] == [], "a link to a port that no longer exists must not survive"
+
+
 async def test_bridge_serves_an_api_only_workflow_as_a_prompt(client):
     """A workflow imported in API format has no LiteGraph document, but ComfyUI can build one."""
     project = await make_project(client)

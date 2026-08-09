@@ -8,7 +8,7 @@
 import type {
   AppSettings, Asset, BackendConfig, BackendStatus, BindableWidget, Clip, GraphReport,
   Link, PluginInfo, Project, ProjectSummary, ResolvedTimeline, Run, RunMode, Shot, Step, StepRun,
-  Timeline, Track, TrackKind, Version, WorkflowRef,
+  Timeline, Track, TrackKind, ValueNode, ValueNodeKind, Version, WorkflowRef,
 } from './types'
 
 export class ApiError extends Error {
@@ -183,6 +183,7 @@ export const api = {
         ui_size?: { w: number; h: number }
         name?: string
         param_overrides?: Record<string, unknown>
+        exposed_params?: string[]
         seed_mode?: string | null
       },
     ) =>
@@ -202,6 +203,32 @@ export const api = {
       }),
     remove: (projectId: string, stepId: string) =>
       request<void>(`/api/projects/${projectId}/steps/${stepId}`, { method: 'DELETE' }),
+  },
+
+  /** Value nodes: constants placed on the shot canvas, feeding step inputs. */
+  nodes: {
+    create: (
+      projectId: string,
+      shotId: string,
+      body: { kind: ValueNodeKind } & Partial<Omit<ValueNode, 'id' | 'kind'>>,
+    ) =>
+      request<ValueNode>(`/api/projects/${projectId}/shots/${shotId}/nodes`, {
+        method: 'POST',
+        body: json(body),
+      }),
+    // `clear_value` / `clear_asset` exist because null is a legitimate value: an empty text node and a
+    // node whose text the caller simply is not changing look identical in JSON otherwise.
+    update: (
+      projectId: string,
+      nodeId: string,
+      patch: Partial<ValueNode> & { clear_value?: boolean; clear_asset?: boolean },
+    ) =>
+      request<ValueNode>(`/api/projects/${projectId}/nodes/${nodeId}`, {
+        method: 'PATCH',
+        body: json(patch),
+      }),
+    remove: (projectId: string, nodeId: string) =>
+      request<void>(`/api/projects/${projectId}/nodes/${nodeId}`, { method: 'DELETE' }),
   },
 
   links: {

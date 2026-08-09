@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -226,8 +227,28 @@ class FakeComfy:
     async def _prompt(self, request: web.Request) -> web.Response:
         body = await request.json()
         prompt = body.get("prompt") or {}
-        prompt_id = body.get("prompt_id") or "generated"
         self.submitted.append(body)
+
+        # Same rule as the real server (server.py, post_prompt): a caller-supplied prompt_id has to be a
+        # canonical UUID. Enforcing it here is what stops us regressing to our own prefixed ids, which
+        # ComfyUI 0.31 rejects outright with "prompt_id must be a valid UUID".
+        supplied = body.get("prompt_id")
+        if supplied is None:
+            prompt_id = str(uuid.uuid4())
+        else:
+            try:
+                prompt_id = str(uuid.UUID(str(supplied)))
+            except ValueError:
+                return web.json_response(
+                    {
+                        "error": {
+                            "type": "invalid_prompt_id",
+                            "message": "prompt_id must be a valid UUID",
+                        },
+                        "node_errors": {},
+                    },
+                    status=400,
+                )
 
         if self.reject_prompt:
             return web.json_response(

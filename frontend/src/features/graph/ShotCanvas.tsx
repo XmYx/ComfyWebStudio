@@ -6,7 +6,8 @@ import {
 } from '@xyflow/react'
 
 import { api, ApiError } from '@/api/client'
-import type { Project, Shot } from '@/api/types'
+import type { PortKind, Project, Shot, ValueNodeKind } from '@/api/types'
+import { VALUE_PORT } from '@/api/types'
 import { KIND_COLOR, canConnect } from '@/lib/kinds'
 import { useStudio } from '@/store/studio'
 import { useLayout } from '@/store/layout'
@@ -14,8 +15,46 @@ import { Empty, useToast } from '@/components/ui'
 import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
 import { useCommandContext } from '@/features/menu/useCommandContext'
 import { StepNode, type StepNodeData } from './StepNode'
+import { ValueNodeCard, VALUE_NODE_LABELS, type ValueNodeData } from './ValueNodeCard'
 
-const NODE_TYPES = { step: StepNode }
+const NODE_TYPES = { step: StepNode, value: ValueNodeCard }
+
+/** Offered by the "Add value node" menu, in the order they appear there. */
+const VALUE_NODE_KINDS: ValueNodeKind[] = ['string', 'int', 'float', 'boolean', 'media']
+
+/** Shared so a step with no links does not get a fresh Set on every render, remounting its node. */
+const EMPTY_KEYS: Set<string> = new Set()
+
+type CanvasNodeData = StepNodeData | ValueNodeData
+
+/** What a media value node offers. Mirrors `ValueNode.output_kind` in core/models.py. */
+function valueNodeKind(
+  project: Project, kind: ValueNodeKind, assetId: string | null, mediaKind: PortKind,
+): PortKind {
+  if (kind !== 'media') return kind
+  return (assetId && project.assets[assetId]?.kind) || mediaKind
+}
+
+/**
+ * The kind carried by the producing end of a link — a step's output port, or a value node.
+ *
+ * Both are sources on this canvas, so everything that needs to colour an edge or judge a connection has
+ * to look in both places.
+ */
+function sourceKind(
+  project: Project, shot: Shot, nodeId: string | null, portKey: string | null | undefined,
+): PortKind | undefined {
+  const step = shot.steps.find((s) => s.id === nodeId)
+  if (step) {
+    const workflow = project.workflows[step.workflow_id]
+    return workflow?.ports.find((p) => p.key === portKey && p.direction === 'out')?.kind
+  }
+  const node = shot.nodes.find((n) => n.id === nodeId)
+  if (node && portKey === VALUE_PORT) {
+    return valueNodeKind(project, node.kind, node.asset_id, node.media_kind)
+  }
+  return undefined
+}
 
 interface Props {
   project: Project
@@ -46,9 +85,45 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
   const selectedStepId = useStudio((s) => s.selectedStepId)
   const selectStep = useStudio((s) => s.selectStep)
 
+  const assets = useMemo(() => Object.values(project.assets), [project.assets])
+
+  // Value nodes share the canvas with steps but are a different shape: they carry a constant and never
+  // run, so they have their own node type and their own endpoints.
+  const derivedValueNodes = useMemo<Node<ValueNodeData>[]>(
+    () =>
+      shot.nodes.map((node) => ({
+        id: node.id,
+        type: 'value',
+        position: { x: node.ui_pos.x, y: node.ui_pos.y },
+        ...(node.ui_size?.w > 0 && node.ui_size?.h > 0
+          ? { width: node.ui_size.w, height: node.ui_size.h }
+          : {}),
+        data: {
+          node,
+          projectId: project.id,
+          assets,
+          outputKind: valueNodeKind(project, node.kind, node.asset_id, node.media_kind),
+          onChanged,
+        },
+      })),
+    [shot.nodes, project, assets, onChanged],
+  )
+
   // React Flow is used in controlled mode, so a drag only moves a node if the change is applied back to
   // the nodes we hand it. `derived` is the truth from the server; `nodes` is what the canvas edits.
-  const derived = useMemo<Node<StepNodeData>[]>(
+  // Input ports fed by a link, per step: a parameter pinned to a node has to show as driven from
+  // upstream rather than as something the user can type into.
+  const linkedByStep = useMemo(() => {
+    const map = new Map<string, Set<string>>()
+    for (const link of shot.links) {
+      const keys = map.get(link.to_step) ?? new Set<string>()
+      keys.add(link.to_port)
+      map.set(link.to_step, keys)
+    }
+    return map
+  }, [shot.links])
+
+  const derivedSteps = useMemo<Node<StepNodeData>[]>(
     () =>
       shot.steps.map((step) => {
         const live = liveSteps[step.id]
@@ -66,6 +141,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
             live,
             thumbUrl: preview?.thumb ? api.media.url(project.id, preview.thumb) : null,
             selected: step.id === selectedStepId,
+            linkedKeys: linkedByStep.get(step.id) ?? EMPTY_KEYS,
             onRun: onRunStep,
             onToggle: async (stepId: string) => {
               const target = shot.steps.find((s) => s.id === stepId)
@@ -73,13 +149,23 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
               await api.steps.update(project.id, stepId, { enabled: !target.enabled })
               onChanged()
             },
+            onParamChange: async (stepId: string, key: string, value: unknown) => {
+              // PATCH merges, so sending only the edited key leaves everything else alone.
+              await api.steps.update(project.id, stepId, { param_overrides: { [key]: value } })
+              onChanged()
+            },
           },
         }
       }),
-    [shot.steps, project, liveSteps, selectedStepId, onRunStep, onChanged],
+    [shot.steps, project, liveSteps, selectedStepId, linkedByStep, onRunStep, onChanged],
   )
 
-  const [nodes, setNodes] = useNodesState<Node<StepNodeData>>(derived)
+  const derived = useMemo<Node<CanvasNodeData>[]>(
+    () => [...derivedSteps, ...derivedValueNodes],
+    [derivedSteps, derivedValueNodes],
+  )
+
+  const [nodes, setNodes] = useNodesState<Node<CanvasNodeData>>(derived)
 
   // Fold server updates (progress, new previews, added or removed steps) into the canvas without
   // discarding canvas-owned state. Position and selection live here, not on the server between saves —
@@ -100,9 +186,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
   const edges = useMemo<Edge[]>(
     () =>
       shot.links.map((link) => {
-        const source = shot.steps.find((s) => s.id === link.from_step)
-        const workflow = source ? project.workflows[source.workflow_id] : undefined
-        const port = workflow?.ports.find((p) => p.key === link.from_port && p.direction === 'out')
+        const kind = sourceKind(project, shot, link.from_step, link.from_port)
         return {
           id: link.id,
           source: link.from_step,
@@ -110,10 +194,10 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
           target: link.to_step,
           targetHandle: link.to_port,
           animated: liveSteps[link.from_step]?.status === 'running',
-          style: { stroke: port ? KIND_COLOR[port.kind] : undefined, strokeWidth: 2 },
+          style: { stroke: kind ? KIND_COLOR[kind] : undefined, strokeWidth: 2 },
         }
       }),
-    [shot.links, shot.steps, project.workflows, liveSteps],
+    [shot, project, liveSteps],
   )
 
   // Hand the Window menu a handle on this canvas, and take it back on unmount so a stale one cannot
@@ -128,11 +212,11 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     return () => setCanvas(null)
   }, [flow, setCanvas, setNodes])
 
-  const portOf = useCallback(
-    (stepId: string | null, portKey: string | null | undefined, direction: 'in' | 'out') => {
+  const inputKindOf = useCallback(
+    (stepId: string | null, portKey: string | null | undefined) => {
       const step = shot.steps.find((s) => s.id === stepId)
       const workflow = step ? project.workflows[step.workflow_id] : undefined
-      return workflow?.ports.find((p) => p.key === portKey && p.direction === direction)
+      return workflow?.ports.find((p) => p.key === portKey && p.direction === 'in')?.kind
     },
     [shot.steps, project.workflows],
   )
@@ -140,12 +224,12 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
   const isValidConnection = useCallback(
     (connection: Connection | Edge) => {
       if (connection.source === connection.target) return false
-      const from = portOf(connection.source, connection.sourceHandle, 'out')
-      const to = portOf(connection.target, connection.targetHandle, 'in')
+      const from = sourceKind(project, shot, connection.source, connection.sourceHandle)
+      const to = inputKindOf(connection.target, connection.targetHandle)
       if (!from || !to) return false
-      return canConnect(from.kind, to.kind)
+      return canConnect(from, to)
     },
-    [portOf],
+    [project, shot, inputKindOf],
   )
 
   const onConnect = useCallback(
@@ -180,39 +264,51 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     [project.id, shot.id, onChanged, toast],
   )
 
+  // Steps and value nodes live at different endpoints, so every canvas gesture has to know which it just
+  // moved, resized or deleted.
+  const isValueNode = useCallback(
+    (nodeId: string) => shot.nodes.some((n) => n.id === nodeId),
+    [shot.nodes],
+  )
+
   const onNodesChange = useCallback(
-    (changes: NodeChange<Node<StepNodeData>>[]) => {
+    (changes: NodeChange<Node<CanvasNodeData>>[]) => {
       // Apply first — without this the node snaps back and dragging does nothing.
       setNodes((current) => applyNodeChanges(changes, current))
 
       for (const change of changes) {
+        const endpoint = 'id' in change && isValueNode(change.id) ? api.nodes : api.steps
+
         if (change.type === 'position' && change.dragging === false && change.position) {
           // Persist only on drag end: saving every intermediate position would hammer the API.
-          void api.steps.update(project.id, change.id, {
+          void endpoint.update(project.id, change.id, {
             ui_pos: { x: change.position.x, y: change.position.y },
           })
         }
         // React Flow reports resizing as dimension changes; `resizing === false` is the release.
         if (change.type === 'dimensions' && change.resizing === false && change.dimensions) {
-          void api.steps
+          void endpoint
             .update(project.id, change.id, {
               ui_size: { w: change.dimensions.width, h: change.dimensions.height },
             })
             .then(onChanged)
         }
         if (change.type === 'select' && change.selected) {
-          selectStep(change.id)
+          // Only steps have an inspector; selecting a value node clears it rather than leaving the
+          // previous step's parameters on screen next to a node they have nothing to do with.
+          selectStep(isValueNode(change.id) ? null : change.id)
         }
       }
     },
-    [project.id, selectStep, setNodes, onChanged],
+    [project.id, selectStep, setNodes, onChanged, isValueNode],
   )
 
   const onNodesDelete = useCallback(
     async (deleted: Node[]) => {
       for (const node of deleted) {
         try {
-          await api.steps.remove(project.id, node.id)
+          if (isValueNode(node.id)) await api.nodes.remove(project.id, node.id)
+          else await api.steps.remove(project.id, node.id)
         } catch (error) {
           toast.push('bad', (error as ApiError).message)
         }
@@ -220,7 +316,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       selectStep(null)
       onChanged()
     },
-    [project.id, onChanged, selectStep, toast],
+    [project.id, onChanged, selectStep, toast, isValueNode],
   )
 
   const commandContext = useCommandContext()
@@ -243,6 +339,25 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     [project, shot.id, onChanged, toast],
   )
 
+  /** Drops the node where the user right-clicked, rather than in a corner they then have to find. */
+  const addValueNodeItems = useCallback(
+    (event: React.MouseEvent): MenuItem[] =>
+      VALUE_NODE_KINDS.map((kind) => ({
+        type: 'action' as const,
+        label: VALUE_NODE_LABELS[kind],
+        onSelect: async () => {
+          try {
+            const at = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY })
+            await api.nodes.create(project.id, shot.id, { kind, ui_pos: at })
+            onChanged()
+          } catch (error) {
+            toast.push('bad', (error as ApiError).message)
+          }
+        },
+      })),
+    [project.id, shot.id, flow, onChanged, toast],
+  )
+
   const paneMenu = (event: React.MouseEvent): MenuItem[] => [
     { type: 'header', label: shot.name },
     {
@@ -251,6 +366,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       items: addStepItems(),
       disabled: !Object.keys(project.workflows).length,
     },
+    { type: 'submenu', label: 'Add value node', items: addValueNodeItems(event) },
     { type: 'command', id: 'file.importWorkflowComfy' },
     { type: 'separator' },
     { type: 'command', id: 'edit.paste' },
@@ -324,6 +440,44 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     { type: 'command', id: 'edit.delete' },
   ]
 
+  const valueNodeMenu = (node: (typeof shot.nodes)[number]): MenuItem[] => [
+    { type: 'header', label: node.name || VALUE_NODE_LABELS[node.kind] },
+    {
+      type: 'action',
+      label: 'Rename…',
+      onSelect: async () => {
+        const name = prompt('Node name', node.name)
+        if (name !== null && name !== node.name) {
+          await api.nodes.update(project.id, node.id, { name })
+          onChanged()
+        }
+      },
+    },
+    {
+      type: 'action',
+      label: 'Reset size',
+      disabled: !(node.ui_size?.w > 0),
+      onSelect: async () => {
+        await api.nodes.update(project.id, node.id, { ui_size: { w: 0, h: 0 } })
+        onChanged()
+      },
+    },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: 'Delete node',
+      danger: true,
+      onSelect: async () => {
+        try {
+          await api.nodes.remove(project.id, node.id)
+          onChanged()
+        } catch (error) {
+          toast.push('bad', (error as ApiError).message)
+        }
+      },
+    },
+  ]
+
   const edgeMenu = (edgeId: string): MenuItem[] => {
     const link = shot.links.find((l) => l.id === edgeId)
     return [
@@ -361,7 +515,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     }
   }
 
-  if (!shot.steps.length) {
+  if (!shot.steps.length && !shot.nodes.length) {
     return (
       <div
         className="h-full"
@@ -369,7 +523,8 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       >
         <Empty title="This shot has no steps yet">
           Add a workflow from the left panel, or right-click here. Each step runs one ComfyUI workflow;
-          connect an output port to an input port to chain them.
+          connect an output port to an input port to chain them. Right-click also adds value nodes —
+          text, numbers or imported media — to feed those inputs.
         </Empty>
         <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
       </div>
@@ -387,9 +542,15 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       onNodesDelete={onNodesDelete}
       isValidConnection={isValidConnection}
       onPaneClick={() => selectStep(null)}
-      onNodeClick={(_e, node) => selectStep(node.id)}
+      onNodeClick={(_e, node) => selectStep(isValueNode(node.id) ? null : node.id)}
       onPaneContextMenu={(event) => contextMenu.open(event as React.MouseEvent, paneMenu(event as React.MouseEvent))}
       onNodeContextMenu={(event, node) => {
+        const value = shot.nodes.find((n) => n.id === node.id)
+        if (value) {
+          selectStep(null)
+          contextMenu.open(event, valueNodeMenu(value))
+          return
+        }
         const step = shot.steps.find((s) => s.id === node.id)
         selectStep(node.id)
         if (step) contextMenu.open(event, nodeMenu(step))

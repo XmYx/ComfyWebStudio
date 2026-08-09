@@ -9,12 +9,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import uuid
 
 import pytest
 
 from comfywebstudio.comfy.discovery import discover, prompt_hash
 from comfywebstudio.core.errors import ExecutionFailed
-from comfywebstudio.core.models import Link, Project, Shot, Step, WorkflowRef
+from comfywebstudio.core.models import (
+    VALUE_PORT,
+    Asset,
+    Link,
+    Project,
+    Shot,
+    Step,
+    ValueNode,
+    WorkflowRef,
+)
 
 # -- workflow builders ---------------------------------------------------------------------------------
 
@@ -194,6 +204,120 @@ async def test_disabled_steps_are_not_run(app_state, chain_project):
 
     run = await run_to_completion(app_state, chain_project, shot)
     assert [sr.step_id for sr in run.step_runs] == [shot.steps[0].id]
+
+
+# -- value nodes ---------------------------------------------------------------------------------------
+
+
+def png_bytes() -> bytes:
+    """A real, tiny PNG — the media pipeline probes what it is handed, so a stub will not do."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+@pytest.fixture
+def valued_project(app_state):
+    """One step whose text input comes from a value node on the canvas rather than from a step."""
+    project = app_state.store.create("Valued")
+    con = register(app_state, project, "Consume", consumer_prompt())
+
+    step = Step(name="Consume", workflow_id=con.id)
+    caption = ValueNode(kind="string", name="Shared caption", value="from the canvas")
+    shot = Shot(
+        name="Shot 1",
+        steps=[step],
+        nodes=[caption],
+        links=[
+            Link(from_step=caption.id, from_port=VALUE_PORT, to_step=step.id, to_port="caption")
+        ],
+    )
+    project.shots = [shot]
+    app_state.store.save(project)
+    return project
+
+
+async def test_a_value_node_supplies_a_scalar_input(app_state, valued_project, fake_comfy):
+    shot = valued_project.shots[0]
+    run = await run_to_completion(app_state, valued_project, shot)
+
+    assert run.status == "success", run.error
+    # The value node overrode the workflow's own default, exactly as a chained scalar would.
+    assert fake_comfy.submitted[0]["prompt"]["2"]["inputs"]["value"] == "from the canvas"
+    assert run.step_runs[0].output("echo").meta["value"] == "from the canvas"
+
+
+async def test_a_value_node_does_not_become_a_step_to_run(app_state, valued_project):
+    """It supplies its value without executing, so it must never appear as something that ran."""
+    shot = valued_project.shots[0]
+    run = await run_to_completion(app_state, valued_project, shot)
+
+    assert [sr.step_id for sr in run.step_runs] == [shot.steps[0].id]
+
+
+async def test_editing_a_value_node_invalidates_the_cache(app_state, valued_project):
+    shot = valued_project.shots[0]
+    first = await run_to_completion(app_state, valued_project, shot)
+    assert first.step_runs[0].status == "success"
+
+    # Unchanged, the step is served from cache...
+    again = await run_to_completion(app_state, valued_project, shot)
+    assert again.step_runs[0].status == "cached"
+
+    # ...but a different value has to produce a different result.
+    shot.nodes[0].value = "something else"
+    app_state.store.save(valued_project)
+    after = await run_to_completion(app_state, valued_project, shot)
+    assert after.step_runs[0].status == "success"
+    assert after.step_runs[0].output("echo").meta["value"] == "something else"
+
+
+async def test_a_media_node_stages_its_asset_for_the_step(app_state, valued_project, fake_comfy):
+    """A media node hands the step a real file, the same way an upstream artifact would."""
+    project = valued_project
+    shot = project.shots[0]
+
+    relative, sha = app_state.media_store.ingest_bytes(
+        project.id, png_bytes(), kind="image", extension="png"
+    )
+    asset = Asset(name="imported.png", kind="image", path=relative, sha256=sha)
+    project.assets[asset.id] = asset
+
+    node = ValueNode(kind="media", name="Reference", asset_id=asset.id, media_kind="image")
+    shot.nodes.append(node)
+    shot.links.append(
+        Link(from_step=node.id, from_port=VALUE_PORT, to_step=shot.steps[0].id, to_port="image")
+    )
+    app_state.store.save(project)
+
+    run = await run_to_completion(app_state, project, shot)
+    assert run.status == "success", run.error
+
+    staged = fake_comfy.submitted[0]["prompt"]["1"]["inputs"]["source"]
+    assert staged == str(app_state.media_store.path(project.id, relative))
+
+
+async def test_a_media_node_with_nothing_selected_is_refused_before_running(
+    app_state, valued_project
+):
+    """Caught while validating, so the user hears about it instead of watching a step fail."""
+    shot = valued_project.shots[0]
+    node = ValueNode(kind="media", name="Reference", media_kind="image")
+    shot.nodes.append(node)
+    shot.links.append(
+        Link(from_step=node.id, from_port=VALUE_PORT, to_step=shot.steps[0].id, to_port="image")
+    )
+    app_state.store.save(valued_project)
+
+    with pytest.raises(ExecutionFailed) as caught:
+        await app_state.orchestrator.start(valued_project, shot)
+
+    issues = [i["message"] for i in caught.value.details["issues"]]
+    assert any("has no media selected" in message for message in issues)
 
 
 # -- caching -------------------------------------------------------------------------------------------
@@ -407,3 +531,23 @@ async def test_remote_backend_uploads_chained_media(settings, fake_comfy):
         assert staged.startswith("webstudio/"), f"expected an uploaded name, got {staged!r}"
     finally:
         await state.shutdown()
+
+
+async def test_prompt_id_is_a_uuid_comfyui_will_accept(app_state, chain_project, fake_comfy):
+    """ComfyUI 0.31 validates the caller-supplied prompt_id and 400s anything that is not a UUID.
+
+    We supply our own id so we can correlate websocket events without racing POST /prompt, which means the
+    format is not ours to choose. The fake server enforces the same rule, so a regression here fails the
+    run outright rather than only showing up against a real instance.
+    """
+    run = await run_to_completion(app_state, chain_project, chain_project.shots[0])
+
+    assert run.status == "success", run.error
+    submitted = [body["prompt_id"] for body in fake_comfy.submitted]
+    assert submitted, "nothing was submitted"
+    for prompt_id in submitted:
+        # Canonical lowercase hyphenated form, which is what validate_job_id() accepts.
+        assert str(uuid.UUID(prompt_id)) == prompt_id, f"{prompt_id!r} is not a canonical UUID"
+
+    # And the ids the framework kept for correlation are the ones it actually sent.
+    assert [sr.prompt_id for sr in run.step_runs] == submitted

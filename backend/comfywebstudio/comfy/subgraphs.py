@@ -274,25 +274,67 @@ def _default_for_slot(
     return None, False
 
 
-def _widget_value(node: dict[str, Any], input_name: str) -> Any:
-    """Read one widget's value out of a node's positional ``widgets_values``.
+#: Values a ``control_after_generate`` widget can hold. It is an editor-only control that occupies a slot
+#: in ``widgets_values`` without appearing in the node's ``inputs``, so it has to be stepped over.
+CONTROL_VALUES = frozenset({"fixed", "increment", "decrement", "randomize"})
 
-    Widget order follows the node's own ``inputs`` array, which for a saved LiteGraph node already lists
-    widget-backed inputs in declaration order — so this does not need ``/object_info``.
+
+def widget_names(node: dict[str, Any]) -> list[str]:
+    """Widget-backed inputs in the order ``widgets_values`` uses.
+
+    Taken from the node's own ``inputs`` array rather than reconstructed from ``/object_info``. That array
+    is what the frontend serialised, so it already reflects things the schema does not — dynamic combos
+    expanded into dotted entries like ``sampling_mode.temperature``, for instance. Rebuilding the order
+    from the schema silently mis-assigns every value after the first such input.
+    """
+    return [
+        str((slot.get("widget") or {}).get("name"))
+        for slot in node.get("inputs") or []
+        if (slot.get("widget") or {}).get("name")
+    ]
+
+
+def widget_values_by_name(
+    node: dict[str, Any], control_widgets: set[str] | None = None
+) -> dict[str, Any]:
+    """Map a node's positional ``widgets_values`` onto input names.
+
+    ``control_widgets`` names the inputs the schema marks ``control_after_generate``; each consumes an
+    extra slot. When that is not known, a mismatched count falls back to recognising the control value
+    itself, which covers seeds without needing the schema.
     """
     values = node.get("widgets_values")
     if isinstance(values, dict):
-        return values.get(input_name)
+        return dict(values)
     if not isinstance(values, list):
-        return None
+        return {}
 
-    widget_slots = [s for s in node.get("inputs") or [] if (s.get("widget") or {}).get("name")]
-    for index, slot in enumerate(widget_slots):
-        if (slot.get("widget") or {}).get("name") == input_name or slot.get("name") == input_name:
-            if index < len(values):
-                return values[index]
-            return None
-    return None
+    names = widget_names(node)
+    if not names:
+        return {}
+
+    control = control_widgets or set()
+    # Only guess when the counts disagree; otherwise a combo whose legitimate value happens to be
+    # "fixed" would be mistaken for a control widget.
+    guess = not control and len(values) > len(names)
+
+    mapped: dict[str, Any] = {}
+    index = 0
+    for name in names:
+        if index >= len(values):
+            break
+        mapped[name] = values[index]
+        index += 1
+        if name in control:
+            index += 1
+        elif guess and index < len(values) and values[index] in CONTROL_VALUES:
+            index += 1
+    return mapped
+
+
+def _widget_value(node: dict[str, Any], input_name: str) -> Any:
+    """Read one widget's value out of a node's ``widgets_values``."""
+    return widget_values_by_name(node).get(input_name)
 
 
 # -- flattening ------------------------------------------------------------------------------------------

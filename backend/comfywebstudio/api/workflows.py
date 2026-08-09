@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import secrets
+from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import APIRouter, UploadFile
@@ -23,9 +24,15 @@ from ..comfy.discovery import (
 )
 from ..comfy.graph_convert import ui_graph_to_prompt
 from ..comfy.objectinfo import WidgetSpec
-from ..comfy.userdata import ensure_saved_in_comfy, is_managed, remove_from_comfy
+from ..comfy.userdata import (
+    ensure_saved_in_comfy,
+    is_managed,
+    read_from_comfy,
+    remove_from_comfy,
+)
 from ..core.errors import NotFound, ValidationFailed
-from ..core.models import WorkflowRef, utcnow
+from ..core.graph import drop_links_for_removed_ports
+from ..core.models import ParamSpec, PortSpec, WorkflowRef, utcnow
 from .deps import ProjectDep, StateDep
 
 logger = logging.getLogger(__name__)
@@ -54,14 +61,32 @@ def _looks_like_api_format(data: dict[str, Any]) -> bool:
     return any(isinstance(v, dict) and "class_type" in v for v in data.values())
 
 
-async def _ingest(
-    state, project, name: str, ui_graph: dict | None, api_prompt: dict | None, backend_id: str | None
-) -> WorkflowRef:
-    """Store a workflow in both formats and discover its ports."""
+@dataclass(slots=True)
+class WorkflowAnalysis:
+    """Everything one pass over a workflow document tells us about it.
+
+    Import, re-sync and the ComfyUI bridge all produce one of these, so the three paths cannot drift on what
+    a workflow exposes — a port found on import is found on re-sync too.
+    """
+
+    api_prompt: dict[str, Any]
+    ui_graph: dict[str, Any]
+    ports: list[PortSpec] = field(default_factory=list)
+    params: list[ParamSpec] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    missing_nodes: list[str] = field(default_factory=list)
+    hash: str = ""
+
+
+async def analyse_workflow(
+    state, ui_graph: dict | None, api_prompt: dict | None, backend_id: str | None
+) -> WorkflowAnalysis:
+    """Convert the document if we only have the UI format, then find every port and parameter."""
     warnings: list[str] = []
+    ui_graph = ui_graph or {}
 
     if api_prompt is None:
-        if ui_graph is None:
+        if not ui_graph:
             raise ValidationFailed("Provide a workflow in either UI or API format.")
         try:
             object_info = await state.backends.object_info(backend_id)
@@ -84,14 +109,13 @@ async def _ingest(
         raise ValidationFailed("The workflow contains no executable nodes.")
 
     kind_map = NodeKindMap()
-    missing: list[str] = []
+    object_info = None
     try:
         backend = await state.backends.get(backend_id)
         kind_map = NodeKindMap.from_manifest(await backend.manifest())
         object_info = await state.backends.object_info(backend_id)
-        missing = await find_missing_nodes(set(), object_info)
-    except Exception as exc:  # noqa: BLE001 - importing offline is legitimate
-        logger.debug("Importing without a backend: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - working offline is legitimate
+        logger.debug("Analysing without a backend: %s", exc)
         warnings.append(
             "No ComfyUI was reachable, so this workflow was analysed using built-in node definitions."
         )
@@ -99,40 +123,53 @@ async def _ingest(
     result = discover(api_prompt, kind_map=kind_map)
     warnings.extend(result.warnings)
 
-    object_info = None
-    try:
-        object_info = await state.backends.object_info(backend_id)
+    missing: list[str] = []
+    if object_info is not None:
         missing = await find_missing_nodes(result.node_classes, object_info)
-    except Exception:  # noqa: BLE001
-        missing = []
 
     # Inputs a subgraph promotes are editable too — typed from the node they feed, so a model slot becomes
     # a real dropdown rather than a free-text field.
-    promoted = await subgraph_params(ui_graph or {}, api_prompt, object_info) if ui_graph else []
-
-    workflow = WorkflowRef(
-        name=name,
-        ports=result.ports,
-        params=[*result.params, *promoted],
-        hash=prompt_hash(api_prompt),
-        missing_nodes=missing,
-        warnings=warnings,
-        last_synced=utcnow(),
-    )
-
+    promoted = await subgraph_params(ui_graph, api_prompt, object_info) if ui_graph else []
     if promoted:
-        workflow.warnings.append(
+        warnings.append(
             f"Found {len(promoted)} parameter(s) promoted by this workflow's subgraph(s)."
         )
 
-    if not workflow.ports:
-        workflow.warnings.append(
+    if not result.ports:
+        warnings.append(
             "No ComfyWebStudio input or output nodes were found. Add WS nodes in ComfyUI to expose "
             "parameters and to let this workflow chain with others."
         )
 
-    state.store.write_workflow(project.id, workflow.id, "api", api_prompt)
-    state.store.write_workflow(project.id, workflow.id, "ui", ui_graph or {})
+    return WorkflowAnalysis(
+        api_prompt=api_prompt,
+        ui_graph=ui_graph,
+        ports=result.ports,
+        params=[*result.params, *promoted],
+        warnings=warnings,
+        missing_nodes=missing,
+        hash=prompt_hash(api_prompt),
+    )
+
+
+async def _ingest(
+    state, project, name: str, ui_graph: dict | None, api_prompt: dict | None, backend_id: str | None
+) -> WorkflowRef:
+    """Store a workflow in both formats and discover its ports."""
+    analysis = await analyse_workflow(state, ui_graph, api_prompt, backend_id)
+
+    workflow = WorkflowRef(
+        name=name,
+        ports=analysis.ports,
+        params=analysis.params,
+        hash=analysis.hash,
+        missing_nodes=analysis.missing_nodes,
+        warnings=analysis.warnings,
+        last_synced=utcnow(),
+    )
+
+    state.store.write_workflow(project.id, workflow.id, "api", analysis.api_prompt)
+    state.store.write_workflow(project.id, workflow.id, "ui", analysis.ui_graph)
     project.workflows[workflow.id] = workflow
     state.store.save(project)
     return workflow
@@ -214,61 +251,112 @@ async def delete_workflow(state: StateDep, project: ProjectDep, workflow_id: str
     state.store.save(project)
 
 
+def _stored_graph(state, project_id: str, workflow_id: str, fmt: str) -> dict:
+    """The stored graph in one format, or ``{}`` when that format was never written."""
+    try:
+        return state.store.read_workflow(project_id, workflow_id, fmt)
+    except NotFound:
+        return {}
+
+
 @router.post("/{workflow_id}/rediscover")
 async def rediscover(
-    state: StateDep, project: ProjectDep, workflow_id: str, backend_id: str | None = None
+    state: StateDep,
+    project: ProjectDep,
+    workflow_id: str,
+    backend_id: str | None = None,
+    pull: bool = True,
 ) -> WorkflowRef:
-    """Re-scan the stored graph for ports and parameters.
+    """Re-read the workflow from ComfyUI and re-scan it for ports and parameters.
 
-    Existing raw-widget bindings are preserved: they were an explicit user choice, and rediscovery must not
+    Pulling matters. ComfyUI's own <kbd>Ctrl</kbd>+<kbd>S</kbd> writes its user directory and tells nobody:
+    only the bridge extension's explicit "Save to ComfyWebStudio" pushes a graph back here. Re-scanning just
+    the stored copy therefore reports the workflow as it was at import time — which is exactly how an output
+    node added afterwards stays invisible while ``last_synced`` claims everything is current.
+
+    ``pull=false`` re-parses the stored copy only, for the rare case where ComfyUI's file has been changed in
+    a way the user does not want yet.
+
+    Existing raw-widget bindings are preserved: they were an explicit user choice, and a re-scan must not
     quietly throw them away.
     """
     workflow = project.workflow(workflow_id)
     if workflow is None:
         raise NotFound(f"No workflow {workflow_id!r}")
 
-    api_prompt = state.store.read_workflow(project.id, workflow_id, "api")
-    kind_map = NodeKindMap()
-    try:
-        backend = await state.backends.get(backend_id)
-        kind_map = NodeKindMap.from_manifest(await backend.manifest())
-    except Exception:  # noqa: BLE001
-        pass
+    stored_ui = _stored_graph(state, project.id, workflow_id, "ui")
+    stored_api = _stored_graph(state, project.id, workflow_id, "api")
 
-    result = discover(api_prompt, kind_map=kind_map)
+    ui_graph: dict = stored_ui
+    # Reusing the stored prompt keeps ComfyUI's own graphToPrompt() output whenever nothing has changed;
+    # only a genuinely newer document is worth putting through our fallback converter.
+    api_prompt: dict | None = stored_api or None
+    pull_warning: str | None = None
+
+    if pull and workflow.comfy_userdata_path:
+        try:
+            backend = await state.backends.get(backend_id)
+            fresh = await read_from_comfy(backend, workflow)
+        except Exception as exc:  # noqa: BLE001 - a stored copy is still perfectly usable
+            logger.debug("Could not re-read %r from ComfyUI: %s", workflow.name, exc)
+            fresh = None
+            pull_warning = (
+                f"ComfyUI's copy at {workflow.comfy_userdata_path} could not be read, so this is a re-scan "
+                "of the stored graph. Edits made in ComfyUI since the last sync are not included."
+            )
+        if fresh is not None and fresh != stored_ui:
+            logger.info("Re-syncing %r from ComfyUI's copy at %s", workflow.name, workflow.comfy_userdata_path)
+            ui_graph, api_prompt = fresh, None
+
+    if not ui_graph and api_prompt is None:
+        raise NotFound(f"{workflow.name!r} has no stored graph at all; re-import it.")
+
+    try:
+        analysis = await analyse_workflow(state, ui_graph, api_prompt, backend_id)
+    except ValidationFailed:
+        # ComfyUI's copy is there but unusable — mid-edit, or full of nodes this instance cannot type.
+        # Falling back to what we already hold beats refusing to sync at all.
+        if ui_graph is stored_ui:
+            raise
+        logger.warning("ComfyUI's copy of %r could not be converted; keeping the stored graph", workflow.name)
+        pull_warning = (
+            f"ComfyUI's copy at {workflow.comfy_userdata_path} could not be converted into a runnable "
+            "prompt, so the previously stored graph was kept. Open it in ComfyUI and use "
+            "'Save to ComfyWebStudio' to sync it exactly."
+        )
+        analysis = await analyse_workflow(state, stored_ui, stored_api or None, backend_id)
+
+    # Only bindings whose node survived: one pointing at a deleted node would silently write nothing.
     raw_params = [
-        p for p in workflow.params
-        if p.source == "raw_widget" and p.node_id in api_prompt
+        p for p in workflow.params if p.source == "raw_widget" and p.node_id in analysis.api_prompt
     ]
 
-    object_info = None
-    try:
-        object_info = await state.backends.object_info(backend_id)
-    except Exception:  # noqa: BLE001
-        pass
-
-    ui_graph: dict = {}
-    try:
-        ui_graph = state.store.read_workflow(project.id, workflow_id, "ui")
-    except Exception:  # noqa: BLE001 - an API-format-only import has no UI graph to read
-        pass
-    promoted = await subgraph_params(ui_graph, api_prompt, object_info) if ui_graph else []
-
-    workflow.ports = result.ports
-    workflow.params = [*result.params, *promoted, *raw_params]
-    workflow.hash = prompt_hash(api_prompt)
-    workflow.warnings = result.warnings
+    previous_ports = {p.key for p in workflow.ports}
+    workflow.ports = analysis.ports
+    workflow.params = [*analysis.params, *raw_params]
+    workflow.hash = analysis.hash
+    workflow.warnings = ([pull_warning] if pull_warning else []) + analysis.warnings
+    workflow.missing_nodes = analysis.missing_nodes
     workflow.last_synced = utcnow()
 
-    try:
-        if object_info is not None:
-            workflow.missing_nodes = await find_missing_nodes(result.node_classes, object_info)
-    except Exception:  # noqa: BLE001
-        pass
+    state.store.write_workflow(project.id, workflow_id, "api", analysis.api_prompt)
+    state.store.write_workflow(project.id, workflow_id, "ui", analysis.ui_graph)
 
+    removed = previous_ports - {p.key for p in workflow.ports}
+    broken = drop_links_for_removed_ports(project, workflow_id, removed)
     state.store.save(project)
+
     state.events.emit(
-        "workflow.synced", project_id=project.id, data={"workflow_id": workflow_id}
+        "workflow.synced",
+        project_id=project.id,
+        data={
+            "workflow_id": workflow_id,
+            "name": workflow.name,
+            "ports": len(workflow.ports),
+            "params": len(workflow.params),
+            "removed_ports": sorted(removed),
+            "broken_links": broken,
+        },
     )
     return workflow
 

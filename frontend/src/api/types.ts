@@ -65,6 +65,8 @@ export interface Step {
   workflow_id: string
   enabled: boolean
   param_overrides: Record<string, unknown>
+  /** Parameter keys pinned to the canvas node, in the order they appear there. */
+  exposed_params: string[]
   seed_mode: SeedMode | null
   backend_id: string | null
   notes: string
@@ -72,8 +74,28 @@ export interface Step {
   ui_size: Size
 }
 
+/** What a value node holds. `media` points at an imported asset; the rest are literals. */
+export type ValueNodeKind = 'string' | 'int' | 'float' | 'boolean' | 'media'
+
+/** The single output port every value node has. Mirrors VALUE_PORT in core/models.py. */
+export const VALUE_PORT = 'value'
+
+/** A constant on the shot canvas, feeding one or more step inputs. Never runs. */
+export interface ValueNode {
+  id: string
+  name: string
+  kind: ValueNodeKind
+  value: unknown
+  asset_id: string | null
+  /** What an empty media node offers, so it can be wired before the footage is chosen. */
+  media_kind: PortKind
+  ui_pos: Vec2
+  ui_size: Size
+}
+
 export interface Link {
   id: string
+  /** A step id or a value node id — both are sources on the canvas. */
   from_step: string
   from_port: string
   to_step: string
@@ -86,6 +108,7 @@ export interface Shot {
   notes: string
   color: string | null
   steps: Step[]
+  nodes: ValueNode[]
   links: Link[]
 }
 

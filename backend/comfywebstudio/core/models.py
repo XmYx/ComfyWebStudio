@@ -24,6 +24,8 @@ PortKind = Literal[
 ]
 PortDirection = Literal["in", "out"]
 ParamKind = Literal["string", "int", "float", "boolean", "choice"]
+#: What a value node on the shot canvas holds. ``media`` points at an imported asset; the rest are literals.
+ValueNodeKind = Literal["string", "int", "float", "boolean", "media"]
 SeedMode = Literal["fixed", "randomize", "increment"]
 RunMode = Literal["step", "chain", "shot", "timeline"]
 TrackKind = Literal["video", "audio", "text", "overlay"]
@@ -173,6 +175,11 @@ class Step(Base):
     enabled: bool = True
     #: ``param key -> value``. Absent keys fall back to the workflow's declared default.
     param_overrides: dict[str, Any] = Field(default_factory=dict)
+    #: Parameter keys the user pinned to the node itself, in the order they should appear there. A
+    #: workflow can expose dozens of knobs; these are the two or three worth seeing without selecting the
+    #: step. Keys that no longer exist are ignored rather than pruned, so re-adding a parameter in ComfyUI
+    #: brings back the choice the user already made.
+    exposed_params: list[str] = Field(default_factory=list)
     seed_mode: SeedMode | None = None
     #: Overrides the project's backend, so one step can run on a remote GPU and the rest locally.
     backend_id: str | None = None
@@ -182,8 +189,62 @@ class Step(Base):
     ui_size: Size = Field(default_factory=Size)
 
 
+#: The single output every value node has. Fixed, because a value node carries exactly one value.
+VALUE_PORT = "value"
+
+
+class ValueNode(Base):
+    """A constant on the shot canvas, feeding one or more step inputs.
+
+    Not a step: nothing executes and nothing is cached against it. It exists so a value several steps share
+    — a prompt, a frame count, a reference image — lives in one visible place on the canvas instead of
+    being retyped into each step's parameters, and so changing it changes every step at once.
+
+    ``media`` carries an imported :class:`Asset` rather than a literal, and takes that asset's kind as its
+    output kind, so an imported clip offers a ``video`` output and a still offers an ``image`` one.
+    """
+
+    id: str = Field(default_factory=lambda: new_id("val"))
+    name: str = ""
+    kind: ValueNodeKind = "string"
+    #: The literal, for every kind but ``media``.
+    value: Any = None
+    #: The imported asset, for ``media``.
+    asset_id: str | None = None
+    #: What an empty ``media`` node offers, so it can be wired up before the footage is chosen. Kept in
+    #: step with the asset once there is one — the asset is the truth, this is the placeholder.
+    media_kind: PortKind = "image"
+    ui_pos: Vec2 = Field(default_factory=Vec2)
+    ui_size: Size = Field(default_factory=Size)
+
+    @property
+    def display_name(self) -> str:
+        return self.name or DEFAULT_VALUE_NODE_NAMES.get(self.kind, "Value")
+
+    def output_kind(self, project: Project | None = None) -> PortKind:
+        """What this node's output port carries."""
+        if self.kind != "media":
+            return self.kind  # type: ignore[return-value]
+        asset = project.assets.get(self.asset_id or "") if project else None
+        return asset.kind if asset else self.media_kind
+
+
+#: Shown on the canvas until the user names a node.
+DEFAULT_VALUE_NODE_NAMES: dict[str, str] = {
+    "string": "Text",
+    "int": "Integer",
+    "float": "Number",
+    "boolean": "Boolean",
+    "media": "Media",
+}
+
+
 class Link(Base):
-    """An output port feeding an input port."""
+    """An output port feeding an input port.
+
+    ``from_step`` is a step id or a value node id — a value node is a source like any other as far as the
+    canvas and the executor are concerned, it simply never runs.
+    """
 
     id: str = Field(default_factory=lambda: new_id("link"))
     from_step: str
@@ -198,11 +259,16 @@ class Shot(Base):
     notes: str = ""
     color: str | None = None
     steps: list[Step] = Field(default_factory=list)
+    #: Value nodes on the same canvas as the steps, kept separate because they never execute.
+    nodes: list[ValueNode] = Field(default_factory=list)
     links: list[Link] = Field(default_factory=list)
     created: datetime = Field(default_factory=utcnow)
 
     def step(self, step_id: str) -> Step | None:
         return next((s for s in self.steps if s.id == step_id), None)
+
+    def node(self, node_id: str) -> ValueNode | None:
+        return next((n for n in self.nodes if n.id == node_id), None)
 
     def links_into(self, step_id: str) -> list[Link]:
         return [link for link in self.links if link.to_step == step_id]

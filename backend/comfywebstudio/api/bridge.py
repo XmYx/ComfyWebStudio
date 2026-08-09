@@ -13,11 +13,12 @@ from typing import Any
 from fastapi import APIRouter, Header
 from pydantic import BaseModel
 
-from ..comfy.discovery import NodeKindMap, discover, find_missing_nodes, prompt_hash, subgraph_params
 from ..comfy.userdata import ensure_saved_in_comfy
 from ..core.errors import NotFound, StudioError
+from ..core.graph import drop_links_for_removed_ports
 from ..core.models import utcnow
 from .deps import StateDep
+from .workflows import analyse_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -117,38 +118,18 @@ async def save_workflow(
     if not body.prompt:
         raise StudioError("ComfyUI sent an empty prompt; nothing was saved.")
 
-    kind_map = NodeKindMap()
-    try:
-        backend = await state.backends.get()
-        kind_map = NodeKindMap.from_manifest(await backend.manifest())
-    except Exception:  # noqa: BLE001
-        pass
-
-    result = discover(body.prompt, kind_map=kind_map)
+    # ComfyUI already flattened any subgraphs into the prompt, but only the UI document knows which inputs
+    # were promoted — so both go in, and the same analysis runs as on import and re-sync.
+    analysis = await analyse_workflow(state, body.workflow, body.prompt, None)
     raw_params = [p for p in workflow.params if p.source == "raw_widget" and p.node_id in body.prompt]
 
-    object_info = None
-    try:
-        object_info = await state.backends.object_info()
-    except Exception:  # noqa: BLE001
-        pass
-
-    # ComfyUI flattens subgraphs itself before handing us the prompt, but only the UI document knows which
-    # inputs were promoted — so the parameter map is read from there either way.
-    promoted = await subgraph_params(body.workflow or {}, body.prompt, object_info)
-
     previous_ports = {p.key for p in workflow.ports}
-    workflow.ports = result.ports
-    workflow.params = [*result.params, *promoted, *raw_params]
-    workflow.hash = prompt_hash(body.prompt)
-    workflow.warnings = result.warnings
+    workflow.ports = analysis.ports
+    workflow.params = [*analysis.params, *raw_params]
+    workflow.hash = analysis.hash
+    workflow.warnings = analysis.warnings
+    workflow.missing_nodes = analysis.missing_nodes
     workflow.last_synced = utcnow()
-
-    try:
-        if object_info is not None:
-            workflow.missing_nodes = await find_missing_nodes(result.node_classes, object_info)
-    except Exception:  # noqa: BLE001
-        pass
 
     state.store.write_workflow(project.id, workflow.id, "api", body.prompt)
     state.store.write_workflow(project.id, workflow.id, "ui", body.workflow)
@@ -163,7 +144,7 @@ async def save_workflow(
         logger.debug("Could not refresh ComfyUI's copy of %r: %s", workflow.name, exc)
 
     removed = previous_ports - {p.key for p in workflow.ports}
-    broken = _drop_dangling_links(project, workflow.id, removed)
+    broken = drop_links_for_removed_ports(project, workflow.id, removed)
     state.store.save(project)
 
     state.events.emit(
@@ -192,28 +173,3 @@ async def save_workflow(
         "removed_ports": sorted(removed),
         "broken_links": broken,
     }
-
-
-def _drop_dangling_links(project, workflow_id: str, removed_ports: set[str]) -> list[dict]:
-    """Remove links that referenced ports the user deleted in ComfyUI."""
-    if not removed_ports:
-        return []
-
-    affected: list[dict] = []
-    step_ids = {
-        step.id for shot in project.shots for step in shot.steps if step.workflow_id == workflow_id
-    }
-    for shot in project.shots:
-        keep = []
-        for link in shot.links:
-            broken = (link.from_step in step_ids and link.from_port in removed_ports) or (
-                link.to_step in step_ids and link.to_port in removed_ports
-            )
-            if broken:
-                affected.append(
-                    {"shot_id": shot.id, "link_id": link.id, "port": link.from_port or link.to_port}
-                )
-            else:
-                keep.append(link)
-        shot.links = keep
-    return affected

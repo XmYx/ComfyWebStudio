@@ -71,6 +71,27 @@ async def ensure_saved_in_comfy(
     return path
 
 
+async def read_from_comfy(backend: ComfyBackend, workflow: WorkflowRef) -> dict[str, Any] | None:
+    """The workflow document as ComfyUI currently holds it, or None when there is nothing to read.
+
+    ComfyUI's own Ctrl+S writes this file and tells nobody — the bridge extension only reports the graphs it
+    saves itself. So re-reading the file is the only way to notice an edit made without the extension, which
+    is most often *the node the user just added*.
+
+    Raises whatever the transport raises; a re-sync treats an unreachable ComfyUI as "no update available"
+    rather than an error, because the stored copy is still perfectly usable.
+    """
+    path = (workflow.comfy_userdata_path or "").strip()
+    if not path:
+        return None
+
+    graph = json.loads(await backend.http.read_userdata(path))
+    if not isinstance(graph, dict) or not graph.get("nodes"):
+        logger.debug("%s does not look like a LiteGraph document; ignoring it", path)
+        return None
+    return graph
+
+
 def is_managed(path: str | None) -> bool:
     """True when *we* created this file inside ComfyUI, so it is ours to clean up.
 

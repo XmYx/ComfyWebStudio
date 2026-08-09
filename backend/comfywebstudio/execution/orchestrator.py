@@ -17,7 +17,13 @@ import random
 from typing import Any
 
 from ..core.errors import ExecutionFailed, NotFound
-from ..core.graph import runnable_steps, topological_order, upstream_closure, validate_shot
+from ..core.graph import (
+    runnable_steps,
+    topological_order,
+    upstream_closure,
+    validate_shot,
+    value_nodes_into,
+)
 from ..core.models import (
     Artifact,
     Project,
@@ -33,7 +39,7 @@ from ..media.transfer import MediaTransfer
 from ..settings import AppSettings
 from .cache import CacheIndex
 from .events import EventBus
-from .runner import RunContext, StepRunner
+from .runner import PinnedInput, RunContext, StepRunner
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +187,10 @@ class Orchestrator:
         async def execute(step: Step) -> StepRun:
             async with semaphore:
                 upstream = self._collect_upstream(shot, step, artifacts)
-                return await runner.run(shot, step, upstream=upstream, force=force)
+                pinned = self._collect_pinned(project, shot, step)
+                return await runner.run(
+                    shot, step, upstream=upstream, pinned=pinned, force=force
+                )
 
         try:
             while remaining or in_flight:
@@ -282,6 +291,20 @@ class Orchestrator:
             if artifact is not None:
                 upstream[link.to_port] = artifact
         return upstream
+
+    def _collect_pinned(
+        self, project: Project, shot: Shot, step: Step
+    ) -> dict[str, PinnedInput]:
+        """Values feeding this step from canvas value nodes, keyed by *its* input port name."""
+        return {
+            port_key: PinnedInput(
+                kind=node.output_kind(project),
+                scalar=node.value,
+                asset=project.assets.get(node.asset_id or ""),
+                label=node.display_name,
+            )
+            for port_key, node in value_nodes_into(shot, step.id).items()
+        }
 
     def _merge(self, run: Run, step_run: StepRun) -> None:
         for index, existing in enumerate(run.step_runs):

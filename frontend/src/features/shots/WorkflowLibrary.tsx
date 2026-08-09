@@ -39,12 +39,13 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
     { type: 'action', label: 'Open in ComfyUI', onSelect: () => void openInComfy(workflow) },
     {
       type: 'action',
-      label: 'Re-scan for ports',
+      label: 'Sync from ComfyUI',
       onSelect: async () => {
         try {
+          // The detailed result — port counts, anything that disappeared — arrives as a workflow.synced
+          // event, the same channel a save from inside ComfyUI uses. No second toast here.
           await api.workflows.rediscover(project.id, workflow.id)
           queryClient.invalidateQueries({ queryKey: ['project', project.id] })
-          toast.push('ok', 'Re-scanned.')
         } catch (error) {
           toast.push('bad', (error as ApiError).message)
         }
@@ -195,7 +196,7 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
                         color: KIND_COLOR[port.kind],
                       }}
                     >
-                      {port.direction === 'in' ? '→' : '←'} {port.key}
+                      {port.direction === 'in' ? '→' : '←'} {port.label || port.key}
                     </span>
                   ))}
                   {!workflow.ports.length && <Badge tone="warn">no ports</Badge>}
@@ -224,18 +225,17 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
                   <Button
                     size="sm"
                     variant="ghost"
-                    title="Re-scan the stored graph for ports and parameters"
+                    title="Re-read this workflow from ComfyUI and re-scan it for ports and parameters"
                     onClick={async () => {
                       try {
                         await api.workflows.rediscover(project.id, workflow.id)
                         queryClient.invalidateQueries({ queryKey: ['project', project.id] })
-                        toast.push('ok', 'Re-scanned.')
                       } catch (error) {
                         toast.push('bad', (error as ApiError).message)
                       }
                     }}
                   >
-                    Re-scan
+                    Sync
                   </Button>
                   <Button
                     size="sm"

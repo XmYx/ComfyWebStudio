@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .objectinfo import ObjectInfoCache, combo_options
-from .subgraphs import SubgraphFlattener, subgraph_definitions
+from .subgraphs import SubgraphFlattener, subgraph_definitions, widget_names, widget_values_by_name
 
 logger = logging.getLogger(__name__)
 
@@ -146,20 +146,31 @@ def _apply_widget_values(
         inputs.update(values)
         return
 
-    names = _widget_names(schema)
+    control = {name for name, options in _widget_names(schema) if options.get("control_after_generate")}
+
+    # Prefer the node's own input order — it is what the frontend actually serialised.
+    if widget_names(node):
+        mapped = widget_values_by_name(node, control)
+        inputs.update(mapped)
+        consumed = len(mapped) + sum(1 for name in mapped if name in control)
+        if consumed < len(values):
+            result.warnings.append(
+                f"Node {node.get('id')} ({node.get('type')}) had {len(values) - consumed} unmapped "
+                "widget value(s); check its parameters."
+            )
+        return
+
+    # Older documents have no per-node input list; fall back to the schema's declaration order.
     index = 0
-    for name, options in names:
+    for name, options in _widget_names(schema):
         if index >= len(values):
             break
         inputs[name] = values[index]
         index += 1
-        # A seed-like INT widget is followed by its control_after_generate value, which is editor-only.
         if options.get("control_after_generate") and index < len(values):
             index += 1
 
     if index < len(values):
-        # Extra trailing values are usually control widgets we did not predict. Harmless, but a signal
-        # that the positional mapping may have drifted.
         result.warnings.append(
             f"Node {node.get('id')} ({node.get('type')}) had {len(values) - index} unmapped widget "
             "value(s); check its parameters."

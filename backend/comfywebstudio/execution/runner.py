@@ -25,8 +25,18 @@ from ..comfy.backend import ComfyBackend, ComfyFileRef
 from ..comfy.discovery import prompt_hash
 from ..comfy.http import ComfyError, ComfyPromptRejected
 from ..comfy.inject import prepare_prompt, resolve_param_values
-from ..core.ids import new_id
-from ..core.models import Artifact, Project, Shot, Step, StepRun, WorkflowRef, utcnow
+from ..core.ids import new_uuid
+from ..core.models import (
+    Artifact,
+    Asset,
+    PortKind,
+    Project,
+    Shot,
+    Step,
+    StepRun,
+    WorkflowRef,
+    utcnow,
+)
 from ..core.store import ProjectStore
 from ..media.transfer import MediaTransfer
 from ..settings import AppSettings
@@ -38,11 +48,38 @@ logger = logging.getLogger(__name__)
 #: Key our node pack writes into a node's ``ui`` payload.
 UI_KEY = "webstudio"
 
+#: Port kinds carrying a value the user types, rather than a file that has to be staged.
+SCALAR_KINDS: frozenset[str] = frozenset({"string", "int", "float", "boolean"})
+
 
 class StepFailed(RuntimeError):
     def __init__(self, message: str, *, node_id: str | None = None):
         super().__init__(message)
         self.node_id = node_id
+
+
+@dataclass(slots=True)
+class PinnedInput:
+    """A value a canvas value node feeds into one of this step's input ports.
+
+    Distinct from an upstream artifact because nothing produced it — there is no run behind it, so there is
+    no SHA to reuse and nothing to wait for. It still has to reach the cache key, or editing the node would
+    leave every step it feeds serving a stale result.
+    """
+
+    kind: PortKind
+    #: Set for a literal (string / int / float / boolean).
+    scalar: Any = None
+    #: Set for a media node. ``None`` on a media node whose asset has not been chosen.
+    asset: Asset | None = None
+    #: What to call it when something is wrong with it.
+    label: str = "value node"
+
+    @property
+    def fingerprint(self) -> str:
+        if self.asset is not None:
+            return self.asset.sha256 or self.asset.path
+        return f"{self.kind}:{self.scalar!r}"
 
 
 @dataclass(slots=True)
@@ -71,9 +108,15 @@ class StepRunner:
         step: Step,
         *,
         upstream: dict[str, Artifact],
+        pinned: dict[str, PinnedInput] | None = None,
         force: bool = False,
     ) -> StepRun:
-        """Execute one step. ``upstream`` maps this step's input port key to the artifact feeding it."""
+        """Execute one step.
+
+        ``upstream`` maps this step's input port key to the artifact feeding it; ``pinned`` maps it to a
+        value supplied directly by a value node on the canvas.
+        """
+        pinned = pinned or {}
         ctx = self.ctx
         project = ctx.project
         step_run = StepRun(step_id=step.id, status="pending")
@@ -106,7 +149,10 @@ class StepRunner:
         cache_key = compute_cache_key(
             workflow_hash=workflow.hash or prompt_hash(api_prompt),
             resolved_params=resolved,
-            upstream={key: artifact.sha256 for key, artifact in upstream.items()},
+            upstream={
+                **{key: artifact.sha256 for key, artifact in upstream.items()},
+                **{key: pin.fingerprint for key, pin in pinned.items()},
+            },
             output_ports=[p.key for p in workflow.outputs],
         )
         step_run.cache_key = cache_key
@@ -138,7 +184,7 @@ class StepRunner:
         )
 
         try:
-            staged = await self._stage_inputs(backend, workflow, step, upstream, resolved)
+            staged = await self._stage_inputs(backend, workflow, step, upstream, pinned)
             injected = prepare_prompt(
                 api_prompt,
                 workflow,
@@ -211,39 +257,69 @@ class StepRunner:
         workflow: WorkflowRef,
         step: Step,
         upstream: dict[str, Artifact],
-        resolved: dict[str, Any],
+        pinned: dict[str, PinnedInput],
     ) -> _Staged:
-        """Turn upstream artifacts into values this step's input nodes can read."""
+        """Turn everything feeding this step into values its input nodes can read.
+
+        Three sources, in the order they win: an upstream step's artifact, a value node on the canvas, and
+        finally an asset the user assigned to the port by hand. The first two are mutually exclusive by
+        validation — an input driven by two links is refused when the link is created.
+        """
         ctx = self.ctx
         media_sources: dict[str, str] = {}
         scalar_overrides: dict[str, Any] = {}
         run_key = f"{ctx.run_id}/{step.id}"
 
         for port in workflow.inputs:
+            scalar_port = port.kind in SCALAR_KINDS
             artifact = upstream.get(port.key)
-            if artifact is None:
-                # Not linked. Media inputs may still have a manually assigned asset.
-                assigned = step.param_overrides.get(port.key)
-                if assigned and port.kind not in {"string", "int", "float", "boolean"}:
-                    path = ctx.store.resolve(ctx.project.id, str(assigned))
-                    if not path.is_file():
-                        raise StepFailed(
-                            f"Input {port.display_name!r} points at a file that is missing: {assigned}"
-                        )
-                    media_sources[port.key] = (
-                        await backend.stage(path, run_key=run_key, kind=port.kind)
-                    ).source
+
+            if artifact is not None:
+                if scalar_port:
+                    # A chained scalar overwrites the step's own parameter value.
+                    scalar_overrides[port.key] = ctx.media.scalar_value(
+                        ctx.project.id, artifact, port.kind
+                    )
+                else:
+                    media_sources[port.key] = await ctx.media.stage_for_input(
+                        ctx.project.id, backend, artifact, target_kind=port.kind, run_key=run_key
+                    )
                 continue
 
-            if port.kind in {"string", "int", "float", "boolean"}:
-                # A chained scalar overwrites the step's own parameter value.
-                scalar_overrides[port.key] = ctx.media.scalar_value(ctx.project.id, artifact, port.kind)
-            else:
-                media_sources[port.key] = await ctx.media.stage_for_input(
-                    ctx.project.id, backend, artifact, target_kind=port.kind, run_key=run_key
+            pin = pinned.get(port.key)
+            if pin is not None:
+                if scalar_port:
+                    scalar_overrides[port.key] = pin.scalar
+                elif pin.asset is None:
+                    raise StepFailed(
+                        f"Input {port.display_name!r} is connected to {pin.label!r}, which has no media "
+                        "selected."
+                    )
+                else:
+                    media_sources[port.key] = await self._stage_file(
+                        backend, pin.asset.path, port.kind, run_key,
+                        what=f"{pin.label!r}, feeding input {port.display_name!r}",
+                    )
+                continue
+
+            # Nothing linked. Media inputs may still have an asset assigned to the port by hand.
+            assigned = step.param_overrides.get(port.key)
+            if assigned and not scalar_port:
+                media_sources[port.key] = await self._stage_file(
+                    backend, str(assigned), port.kind, run_key,
+                    what=f"input {port.display_name!r}",
                 )
 
         return self._Staged(media_sources=media_sources, scalar_overrides=scalar_overrides)
+
+    async def _stage_file(
+        self, backend: ComfyBackend, relative: str, kind: str, run_key: str, *, what: str
+    ) -> str:
+        """Put a project file where this backend can read it, naming what wanted it if it is gone."""
+        path = self.ctx.store.resolve(self.ctx.project.id, relative)
+        if not path.is_file():
+            raise StepFailed(f"{what} points at a file that is missing: {relative}")
+        return (await backend.stage(path, run_key=run_key, kind=kind)).source
 
     # -- execution ---------------------------------------------------------------------------------
 
@@ -256,7 +332,9 @@ class StepRunner:
         step: Step,
     ) -> list[Artifact]:
         ctx = self.ctx
-        prompt_id = new_id("prompt", 16)
+        # ComfyUI validates this as a UUID, so it cannot carry our run/step ids; StepRun.prompt_id
+        # is what correlates it back.
+        prompt_id = new_uuid()
         step_run.prompt_id = prompt_id
 
         if not await backend.ws.wait_connected(timeout=15.0):

@@ -682,7 +682,7 @@ function AddClipModal({
         for (const port of workflow?.ports.filter((p) => p.direction === 'out') ?? []) {
           out.push({
             key: `${shot.id}|${step.id}|${port.key}`,
-            label: `${shot.name} · ${step.name} · ${port.key}`,
+            label: `${shot.name} · ${step.name} · ${port.label || port.key}`,
             shot: shot.id, step: step.id, port: port.key, kind: port.kind,
           })
         }

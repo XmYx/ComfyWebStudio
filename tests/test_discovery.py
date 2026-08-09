@@ -101,6 +101,27 @@ def test_unnamed_port_warns_and_gets_a_fallback_key():
 
     assert [p.key for p in result.ports] == ["node_7"]
     assert any("no name" in w for w in result.warnings)
+    # The key has to stay addressable, but "node_7" tells the user nothing on its own.
+    assert result.ports[0].display_name == "Unnamed image output"
+
+
+def test_unnamed_port_is_labelled_with_the_node_title_when_there_is_one():
+    prompt = {
+        "7": {
+            "class_type": "WSVideoOutput",
+            "inputs": {"port_name": "", "run_key": ""},
+            "_meta": {"title": "Final render"},
+        }
+    }
+    result = discover(prompt)
+
+    assert result.ports[0].key == "node_7"
+    assert result.ports[0].display_name == "Final render"
+
+
+def test_a_named_port_keeps_its_name_as_its_label():
+    prompt = {"7": {"class_type": "WSImageOutput", "inputs": {"port_name": "hero", "run_key": ""}}}
+    assert discover(prompt).ports[0].display_name == "hero"
 
 
 def test_duplicate_port_names_are_disambiguated_and_reported():

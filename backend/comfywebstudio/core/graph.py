@@ -10,7 +10,68 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 from .errors import GraphError
-from .models import Link, Project, Shot, Step, can_connect, conversion_note
+from .models import (
+    VALUE_PORT,
+    Link,
+    PortKind,
+    Project,
+    Shot,
+    Step,
+    ValueNode,
+    can_connect,
+    conversion_note,
+)
+
+
+@dataclass(slots=True)
+class LinkSource:
+    """The producing end of a link, whichever kind of node it is.
+
+    Steps and value nodes are both sources on the canvas, and every consumer here cares about the same
+    three things — what to call it, what kind it carries, and whether it has to run first.
+    """
+
+    name: str
+    kind: PortKind
+    #: None for a value node: it produces its value without executing.
+    step: Step | None = None
+
+    @property
+    def is_step(self) -> bool:
+        return self.step is not None
+
+
+def resolve_link_source(project: Project, shot: Shot, link: Link) -> LinkSource | None:
+    """What feeds this link, or None when the source or its port has gone."""
+    step = shot.step(link.from_step)
+    if step is not None:
+        workflow = project.workflow(step.workflow_id)
+        port = workflow.port(link.from_port, "out") if workflow else None
+        return LinkSource(name=step.name, kind=port.kind, step=step) if port else None
+
+    node = shot.node(link.from_step)
+    if node is not None and link.from_port == VALUE_PORT:
+        return LinkSource(name=node.display_name, kind=node.output_kind(project))
+    return None
+
+
+def source_label(shot: Shot, node_id: str) -> str | None:
+    """What to call the producing end of a link in a message, whichever kind of node it is."""
+    step = shot.step(node_id)
+    if step is not None:
+        return step.name
+    node = shot.node(node_id)
+    return node.display_name if node is not None else None
+
+
+def value_nodes_into(shot: Shot, step_id: str) -> dict[str, ValueNode]:
+    """Value nodes feeding this step, keyed by the input port each one drives."""
+    by_id = {node.id: node for node in shot.nodes}
+    return {
+        link.to_port: by_id[link.from_step]
+        for link in shot.links_into(step_id)
+        if link.from_step in by_id and link.from_port == VALUE_PORT
+    }
 
 
 @dataclass(slots=True)
@@ -79,23 +140,26 @@ def topological_order(shot: Shot, *, only: set[str] | None = None) -> list[str]:
 
 
 def upstream_closure(shot: Shot, step_ids: set[str]) -> set[str]:
-    """``step_ids`` plus everything they transitively depend on.
+    """``step_ids`` plus every *step* they transitively depend on.
 
     This is what "run this step" actually means: a step whose inputs were never produced cannot run alone.
+    A value node upstream is skipped — it supplies its value without running, so it is never something the
+    closure has to schedule.
     """
     by_target: dict[str, list[Link]] = defaultdict(list)
     for link in shot.links:
         by_target[link.to_step].append(link)
 
+    steps = {step.id for step in shot.steps}
     seen: set[str] = set()
-    pending = deque(step_ids)
+    pending = deque(sid for sid in step_ids if sid in steps)
     while pending:
         current = pending.popleft()
         if current in seen:
             continue
         seen.add(current)
         for link in by_target.get(current, []):
-            if link.from_step not in seen:
+            if link.from_step in steps and link.from_step not in seen:
                 pending.append(link.from_step)
     return seen
 
@@ -123,50 +187,66 @@ def validate_shot(project: Project, shot: Shot) -> GraphReport:
                 )
             )
 
+    # A media node with nothing chosen has nothing to hand downstream, and the step it feeds will fail at
+    # run time rather than when the user wired it up.
+    wired = {link.from_step for link in shot.links}
+    for node in shot.nodes:
+        if node.kind == "media" and node.id in wired and not project.assets.get(node.asset_id or ""):
+            report.issues.append(
+                GraphIssue(
+                    "error",
+                    f"{node.display_name!r} has no media selected, so the step it feeds cannot run.",
+                )
+            )
+
     # An input port driven by two links would silently take whichever ran last.
     driven: dict[tuple[str, str], str] = {}
 
     for link in shot.links:
-        source = step_by_id.get(link.from_step)
+        source = resolve_link_source(project, shot, link)
         target = step_by_id.get(link.to_step)
-        if source is None or target is None:
+        if source is None:
+            origin = source_label(shot, link.from_step)
+            report.issues.append(
+                GraphIssue(
+                    "error",
+                    f"{origin!r} no longer has an output port {link.from_port!r}."
+                    if origin is not None
+                    else "A link starts at a node that is no longer in this shot.",
+                    link_id=link.id,
+                    port_key=link.from_port,
+                )
+            )
+            continue
+        if target is None:
             report.issues.append(
                 GraphIssue("error", "A link points at a step that no longer exists.", link_id=link.id)
             )
             continue
 
-        source_wf = project.workflow(source.workflow_id)
         target_wf = project.workflow(target.workflow_id)
-        if source_wf is None or target_wf is None:
+        if target_wf is None:
             continue
 
-        out_port = source_wf.port(link.from_port, "out")
         in_port = target_wf.port(link.to_port, "in")
-
-        if out_port is None:
-            report.issues.append(
-                GraphIssue("error", f"{source.name!r} has no output port {link.from_port!r}.",
-                           link_id=link.id, step_id=source.id, port_key=link.from_port)
-            )
         if in_port is None:
             report.issues.append(
                 GraphIssue("error", f"{target.name!r} has no input port {link.to_port!r}.",
                            link_id=link.id, step_id=target.id, port_key=link.to_port)
             )
-        if out_port is None or in_port is None:
             continue
 
-        if not can_connect(out_port.kind, in_port.kind):
+        if not can_connect(source.kind, in_port.kind):
             report.issues.append(
                 GraphIssue(
                     "error",
-                    f"Cannot connect {out_port.kind} output {out_port.display_name!r} to "
+                    f"Cannot connect {source.kind} output of {source.name!r} to "
                     f"{in_port.kind} input {in_port.display_name!r}.",
                     link_id=link.id,
                 )
             )
         else:
-            note = conversion_note(out_port.kind, in_port.kind)
+            note = conversion_note(source.kind, in_port.kind)
             if note:
                 report.issues.append(GraphIssue("warning", note, link_id=link.id))
 
@@ -219,27 +299,31 @@ def validate_new_link(project: Project, shot: Shot, link: Link) -> None:
     if link.from_step == link.to_step:
         raise GraphError("A step cannot feed itself.")
 
-    source = shot.step(link.from_step)
     target = shot.step(link.to_step)
-    if source is None or target is None:
-        raise GraphError("Both ends of a link must be steps in this shot.")
+    if target is None:
+        raise GraphError("A link must end at a step in this shot.")
 
-    source_wf = project.workflow(source.workflow_id)
+    source = resolve_link_source(project, shot, link)
+    if source is None:
+        label = source_label(shot, link.from_step)
+        raise GraphError(
+            f"{label!r} has no output port {link.from_port!r}."
+            if label is not None
+            else "A link must start at a step or value node in this shot."
+        )
+
     target_wf = project.workflow(target.workflow_id)
-    if source_wf is None or target_wf is None:
+    if target_wf is None:
         raise GraphError("A step references a workflow that is not in the project.")
 
-    out_port = source_wf.port(link.from_port, "out")
-    if out_port is None:
-        raise GraphError(f"{source.name!r} has no output port {link.from_port!r}.")
     in_port = target_wf.port(link.to_port, "in")
     if in_port is None:
         raise GraphError(f"{target.name!r} has no input port {link.to_port!r}.")
 
-    if not can_connect(out_port.kind, in_port.kind):
+    if not can_connect(source.kind, in_port.kind):
         raise GraphError(
-            f"Cannot connect a {out_port.kind} output to a {in_port.kind} input.",
-            details={"from_kind": out_port.kind, "to_kind": in_port.kind},
+            f"Cannot connect a {source.kind} output to a {in_port.kind} input.",
+            details={"from_kind": source.kind, "to_kind": in_port.kind},
         )
 
     existing = next(
@@ -262,3 +346,35 @@ def runnable_steps(shot: Shot, order: list[str]) -> list[Step]:
     """Steps in execution order, skipping disabled ones."""
     by_id = {s.id: s for s in shot.steps}
     return [by_id[sid] for sid in order if sid in by_id and by_id[sid].enabled]
+
+
+def drop_links_for_removed_ports(
+    project: Project, workflow_id: str, removed_ports: set[str]
+) -> list[dict[str, str]]:
+    """Remove links that referenced ports a re-sync no longer finds.
+
+    A link to a port that no longer exists is an error at run time and an error in :func:`validate_shot`, so
+    it is dropped here and reported instead — the caller tells the user which shots changed rather than
+    leaving them to discover it when a run fails.
+    """
+    if not removed_ports:
+        return []
+
+    affected: list[dict[str, str]] = []
+    step_ids = {
+        step.id for shot in project.shots for step in shot.steps if step.workflow_id == workflow_id
+    }
+    for shot in project.shots:
+        keep: list[Link] = []
+        for link in shot.links:
+            broken = (link.from_step in step_ids and link.from_port in removed_ports) or (
+                link.to_step in step_ids and link.to_port in removed_ports
+            )
+            if broken:
+                affected.append(
+                    {"shot_id": shot.id, "link_id": link.id, "port": link.from_port or link.to_port}
+                )
+            else:
+                keep.append(link)
+        shot.links = keep
+    return affected

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { api, ApiError } from '@/api/client'
@@ -21,6 +21,9 @@ interface Props {
 
 type Tab = 'params' | 'output' | 'history' | 'settings'
 
+/** Short: a tick should feel immediate, it only exists to coalesce a burst of them. */
+const PINNED_SAVE_DEBOUNCE_MS = 250
+
 export function StepInspector({ project, shot, step, onChanged, onRunStep }: Props) {
   const toast = useToast()
   const queryClient = useQueryClient()
@@ -39,6 +42,40 @@ export function StepInspector({ project, shot, step, onChanged, onRunStep }: Pro
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['project', project.id] }),
     onError: (error: ApiError) => toast.push('bad', error.message),
   })
+
+  // Which parameters are pinned to the canvas node, held locally and re-seeded only when a different
+  // step is selected. The ref is what a toggle reads: state updates are batched, so two boxes ticked in
+  // the same tick would both compute their new list from the same stale one and the second would drop
+  // the first. The save is debounced for the same reason — a burst of ticks becomes one request, which
+  // also removes any chance of two in-flight PATCHes landing out of order.
+  const [pinned, setPinned] = useState<string[]>(step.exposed_params)
+  const pinnedRef = useRef(step.exposed_params)
+  const pinnedSave = useRef<number>()
+
+  useEffect(() => {
+    pinnedRef.current = step.exposed_params
+    setPinned(step.exposed_params)
+  }, [step.id])  // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => window.clearTimeout(pinnedSave.current), [])
+
+  const togglePinned = (key: string, next: boolean) => {
+    // Order matters — it is the order they appear on the node — so append rather than rebuild from the
+    // workflow's own ordering.
+    const without = pinnedRef.current.filter((k) => k !== key)
+    const keys = next ? [...without, key] : without
+    pinnedRef.current = keys
+    setPinned(keys)
+
+    window.clearTimeout(pinnedSave.current)
+    pinnedSave.current = window.setTimeout(() => {
+      api.steps
+        .update(project.id, step.id, { exposed_params: pinnedRef.current })
+        .then(() => queryClient.invalidateQueries({ queryKey: ['project', project.id] }))
+        .catch((error: ApiError) => toast.push('bad', error.message))
+    }, PINNED_SAVE_DEBOUNCE_MS)
+  }
+
+  const pinnedKeys = useMemo(() => new Set(pinned), [pinned])
 
   if (!workflow) {
     return (
@@ -114,6 +151,8 @@ export function StepInspector({ project, shot, step, onChanged, onRunStep }: Pro
               params={workflow.params}
               overrides={step.param_overrides}
               linkedKeys={linkedKeys}
+              pinnedKeys={pinnedKeys}
+              onTogglePinned={togglePinned}
               onChange={(overrides) => saveParams.mutate(overrides)}
               onReset={async () => {
                 await api.steps.replaceParams(project.id, step.id, {})
