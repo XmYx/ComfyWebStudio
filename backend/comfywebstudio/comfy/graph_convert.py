@@ -9,10 +9,9 @@ This module exists for the cases where that is impossible: a workflow dragged in
 on a ComfyUI without our pack installed and picked up by the ``/userdata`` poller.
 
 Handled: widget-value ordering from ``/object_info``, link resolution, Reroute passthrough, muted and
-bypassed nodes, ``control_after_generate`` extra widget values, PrimitiveNode.
-
-**Not handled: subgraphs.** A graph containing subgraph definitions is reported as a conversion warning
-rather than silently mis-converted, because a wrong graph that still executes is far worse than a refusal.
+bypassed nodes, ``control_after_generate`` extra widget values, PrimitiveNode, and **subgraphs** — expanded
+recursively using ComfyUI's own ``<instance>:<inner>`` execution ids, so a graph converted here and the
+same graph flattened by ComfyUI address their nodes identically.
 """
 
 from __future__ import annotations
@@ -21,7 +20,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from .objectinfo import ObjectInfoCache
+from .objectinfo import ObjectInfoCache, combo_options
+from .subgraphs import SubgraphFlattener, subgraph_definitions
 
 logger = logging.getLogger(__name__)
 
@@ -48,54 +48,60 @@ class ConversionResult:
 async def ui_graph_to_prompt(
     ui_graph: dict[str, Any], object_info: ObjectInfoCache
 ) -> ConversionResult:
-    """Convert a LiteGraph workflow into an API-format prompt."""
+    """Convert a LiteGraph workflow into an API-format prompt, expanding any subgraphs."""
     result = ConversionResult()
 
-    if ui_graph.get("definitions", {}).get("subgraphs"):
-        result.reliable = False
-        result.warnings.append(
-            "This workflow contains subgraphs, which ComfyWebStudio cannot flatten on its own. "
-            "Open it in ComfyUI and use 'Save to ComfyWebStudio' so ComfyUI performs the conversion."
-        )
-
-    nodes = {str(n["id"]): n for n in ui_graph.get("nodes") or [] if "id" in n}
-    if not nodes:
+    if not (ui_graph.get("nodes") or []):
         result.warnings.append("The workflow contains no nodes.")
         return result
 
-    # link_id -> (origin_node_id, origin_slot)
-    links: dict[int, tuple[str, int]] = {}
-    for link in ui_graph.get("links") or []:
-        if isinstance(link, list) and len(link) >= 5:
-            links[int(link[0])] = (str(link[1]), int(link[2]))
+    flattener = SubgraphFlattener(ui_graph)
+    flat = flattener.flatten()
 
-    resolver = _LinkResolver(nodes, links, result)
+    names = subgraph_names(ui_graph)
+    if names:
+        result.warnings.append(
+            f"Expanded {len(names)} subgraph(s) ({', '.join(names[:3])}) into {len(flat.nodes)} nodes. "
+            "Their promoted inputs are available as parameters."
+        )
 
-    for node_id, node in nodes.items():
+    for exec_id, (scope, node) in flat.nodes.items():
         class_type = str(node.get("type") or "")
-        if class_type in VIRTUAL_NODES or node.get("mode") in {MODE_MUTED, MODE_BYPASS}:
-            continue
 
         schema = await object_info.node(class_type)
         if schema is None:
             result.reliable = False
             result.warnings.append(
-                f"Node type {class_type!r} (node {node_id}) is not installed on this ComfyUI, so its "
+                f"Node type {class_type!r} (node {exec_id}) is not installed on this ComfyUI, so its "
                 "inputs could not be typed."
             )
             continue
 
         inputs: dict[str, Any] = {}
         _apply_widget_values(node, schema, inputs, result)
-        _apply_linked_inputs(node, inputs, resolver)
+
+        for slot in node.get("inputs") or []:
+            name = slot.get("name")
+            if not name or slot.get("link") is None:
+                continue
+            source = flattener.resolve_input(scope, slot.get("link"))
+            if source is not None:
+                inputs[name] = [source[0], source[1]]
+            # A promoted input the parent left unconnected keeps the widget value written above, which is
+            # exactly what ComfyUI shows for an untouched promoted slot.
 
         entry: dict[str, Any] = {"class_type": class_type, "inputs": inputs}
         title = node.get("title")
         if title:
             entry["_meta"] = {"title": title}
-        result.prompt[node_id] = entry
+        result.prompt[exec_id] = entry
 
+    result.warnings.extend(flat.warnings)
     return result
+
+
+def subgraph_names(ui_graph: dict[str, Any]) -> list[str]:
+    return [str(sg.get("name") or sg.get("id")) for sg in subgraph_definitions(ui_graph).values()]
 
 
 def _widget_names(schema: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -119,7 +125,9 @@ def _widget_names(schema: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
             options = definition[1] if len(definition) > 1 and isinstance(definition[1], dict) else {}
             if options.get("forceInput"):
                 continue
-            is_combo = isinstance(raw_type, list)
+            # A combo is a widget whichever way it is encoded; missing this silently dropped every
+            # sampler, scheduler and model choice from converted graphs.
+            is_combo = combo_options(raw_type, options) is not None
             if not is_combo and str(raw_type) not in WIDGET_TYPES:
                 continue
             ordered.append((name, options))
@@ -156,80 +164,3 @@ def _apply_widget_values(
             f"Node {node.get('id')} ({node.get('type')}) had {len(values) - index} unmapped widget "
             "value(s); check its parameters."
         )
-
-
-def _apply_linked_inputs(node: dict[str, Any], inputs: dict[str, Any], resolver: _LinkResolver) -> None:
-    for slot in node.get("inputs") or []:
-        name = slot.get("name")
-        link_id = slot.get("link")
-        if not name or link_id is None:
-            continue
-        source = resolver.resolve(int(link_id))
-        if source is not None:
-            inputs[name] = [source[0], source[1]]
-        elif name in inputs:
-            # The slot was converted from a widget but has no link; keep the widget value.
-            continue
-
-
-class _LinkResolver:
-    """Follows a link back to a real node, hopping over reroutes and bypassed nodes."""
-
-    def __init__(
-        self,
-        nodes: dict[str, dict[str, Any]],
-        links: dict[int, tuple[str, int]],
-        result: ConversionResult,
-    ):
-        self.nodes = nodes
-        self.links = links
-        self.result = result
-
-    def resolve(self, link_id: int, depth: int = 0) -> tuple[str, int] | None:
-        if depth > 32:
-            self.result.warnings.append("A link chain was too deep to resolve; it was dropped.")
-            return None
-
-        origin = self.links.get(link_id)
-        if origin is None:
-            return None
-
-        node_id, slot = origin
-        node = self.nodes.get(node_id)
-        if node is None:
-            return None
-
-        node_type = str(node.get("type") or "")
-        mode = node.get("mode")
-
-        if node_type in VIRTUAL_NODES or mode in {MODE_BYPASS, MODE_MUTED}:
-            passthrough = self._passthrough_link(node, slot)
-            if passthrough is None:
-                if mode == MODE_MUTED:
-                    return None  # a muted node genuinely produces nothing
-                self.result.warnings.append(
-                    f"Could not trace through {node_type or 'node'} {node_id}; a link was dropped."
-                )
-                return None
-            return self.resolve(passthrough, depth + 1)
-
-        return (node_id, slot)
-
-    def _passthrough_link(self, node: dict[str, Any], out_slot: int) -> int | None:
-        """Which incoming link a bypassed or reroute node forwards from.
-
-        Reroute has one input. A bypassed node forwards the input whose type matches the output being
-        asked for, which is what ComfyUI's own bypass does.
-        """
-        slots = node.get("inputs") or []
-        if not slots:
-            return None
-        if len(slots) == 1:
-            return slots[0].get("link")
-
-        outputs = node.get("outputs") or []
-        wanted = outputs[out_slot].get("type") if out_slot < len(outputs) else None
-        for slot in slots:
-            if wanted is not None and slot.get("type") == wanted and slot.get("link") is not None:
-                return slot.get("link")
-        return next((s.get("link") for s in slots if s.get("link") is not None), None)

@@ -63,11 +63,19 @@ class PortSpec(Base):
         return self.label or self.key
 
 
+class ParamTarget(Base):
+    """One node input a parameter writes to."""
+
+    node_id: str
+    input_name: str
+
+
 class ParamSpec(Base):
     """One editable parameter.
 
-    ``source`` distinguishes the two discovery paths: ``ws_node`` for our own input nodes, ``raw_widget``
-    for an arbitrary widget on a stock node that the user chose to expose. Both render identically.
+    ``source`` distinguishes the three discovery paths: ``ws_node`` for our own input nodes,
+    ``raw_widget`` for an arbitrary widget on a stock node the user chose to expose, and ``subgraph`` for
+    an input a subgraph promotes. All three render identically.
     """
 
     key: str
@@ -84,9 +92,17 @@ class ParamSpec(Base):
     order: int = 0
     node_id: str
     input_name: str
-    source: Literal["ws_node", "raw_widget"] = "ws_node"
+    source: Literal["ws_node", "raw_widget", "subgraph"] = "ws_node"
+    #: Every input this parameter drives. A promoted subgraph input often feeds several at once — `width`
+    #: typically sets both the latent size and the scheduler — so one value must reach all of them.
+    #: Empty means the single ``(node_id, input_name)`` above.
+    targets: list[ParamTarget] = Field(default_factory=list)
     #: Set for seed parameters so the runner knows it may randomise them.
     is_seed: bool = False
+
+    @property
+    def all_targets(self) -> list[ParamTarget]:
+        return self.targets or [ParamTarget(node_id=self.node_id, input_name=self.input_name)]
 
     @property
     def display_name(self) -> str:
@@ -141,6 +157,13 @@ class Vec2(Base):
     y: float = 0.0
 
 
+class Size(Base):
+    """Canvas size of a node. Zero means "size to content"."""
+
+    w: float = 0.0
+    h: float = 0.0
+
+
 class Step(Base):
     """One workflow execution inside a shot."""
 
@@ -155,6 +178,8 @@ class Step(Base):
     backend_id: str | None = None
     notes: str = ""
     ui_pos: Vec2 = Field(default_factory=Vec2)
+    #: Left at 0×0 until the user resizes the node, so a default node still sizes to its own content.
+    ui_size: Size = Field(default_factory=Size)
 
 
 class Link(Base):

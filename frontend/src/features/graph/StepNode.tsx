@@ -1,4 +1,4 @@
-import { Handle, Position, type NodeProps } from '@xyflow/react'
+import { Handle, NodeResizer, Position, type NodeProps } from '@xyflow/react'
 import type { PortSpec, Step, WorkflowRef } from '@/api/types'
 import { KIND_COLOR } from '@/lib/kinds'
 import { Badge, ProgressBar, cx } from '@/components/ui'
@@ -14,6 +14,11 @@ export interface StepNodeData extends Record<string, unknown> {
   onToggle: (stepId: string) => void
 }
 
+/** Below this a node cannot show its ports legibly. */
+export const MIN_NODE_WIDTH = 180
+export const MIN_NODE_HEIGHT = 90
+export const DEFAULT_NODE_WIDTH = 240
+
 const STATUS_TONE = {
   running: 'info', success: 'ok', cached: 'ok', error: 'bad',
   cancelled: 'warn', skipped: 'warn', pending: 'muted', queued: 'muted',
@@ -25,21 +30,37 @@ const STATUS_TONE = {
  * Ports are the connection points — an input handle per input port on the left, an output handle per
  * output port on the right, colour-coded by kind so a mismatch is visible before you try to drag it.
  */
-export function StepNode({ data }: NodeProps) {
+export function StepNode({ data, selected }: NodeProps) {
   const { step, workflow, live, thumbUrl, onRun, onToggle } = data as StepNodeData
   const inputs = workflow?.ports.filter((p) => p.direction === 'in') ?? []
   const outputs = workflow?.ports.filter((p) => p.direction === 'out') ?? []
   const status = live?.status
 
+  // A node that has never been resized sizes to its own content; once resized, the stored size wins and
+  // the body scrolls rather than the node growing on its own.
+  const sized = step.ui_size?.w > 0 && step.ui_size?.h > 0
+
   return (
     <div
       className={cx(
-        'w-60 rounded-lg border bg-[var(--color-panel)] shadow-lg transition-all',
+        'flex flex-col overflow-hidden rounded-lg border bg-[var(--color-panel)] shadow-lg transition-colors',
         data.selected ? 'border-[var(--color-accent)]' : 'border-[var(--color-edge)]',
         !step.enabled && 'opacity-45',
       )}
+      style={
+        sized
+          ? { width: step.ui_size.w, height: step.ui_size.h }
+          : { width: DEFAULT_NODE_WIDTH }
+      }
     >
-      <div className="flex items-center gap-2 border-b border-[var(--color-edge)] px-2.5 py-2">
+      <NodeResizer
+        isVisible={Boolean(selected)}
+        minWidth={MIN_NODE_WIDTH}
+        minHeight={MIN_NODE_HEIGHT}
+        lineClassName="!border-[var(--color-accent)]"
+        handleClassName="!bg-[var(--color-accent)] !border-[var(--color-panel)] !size-2"
+      />
+      <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-edge)] px-2.5 py-2">
         <button
           title={step.enabled ? 'Disable this step' : 'Enable this step'}
           onClick={(e) => { e.stopPropagation(); onToggle(step.id) }}
@@ -75,8 +96,8 @@ export function StepNode({ data }: NodeProps) {
       )}
 
       {thumbUrl && (
-        <div className="border-b border-[var(--color-edge)] bg-black/40">
-          <img src={thumbUrl} alt="" className="h-24 w-full object-contain" />
+        <div className={cx('shrink-0 border-b border-[var(--color-edge)] bg-black/40', sized && 'min-h-0 flex-1')}>
+          <img src={thumbUrl} alt="" className={cx('w-full object-contain', sized ? 'h-full' : 'h-24')} />
         </div>
       )}
 
@@ -86,7 +107,7 @@ export function StepNode({ data }: NodeProps) {
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-x-2 py-2 text-[10px]">
+      <div className="grid min-h-0 flex-1 grid-cols-2 gap-x-2 overflow-y-auto py-2 text-[10px]">
         <div className="space-y-1.5">
           {inputs.map((port, index) => (
             <PortRow key={port.key} port={port} side="left" index={index} />

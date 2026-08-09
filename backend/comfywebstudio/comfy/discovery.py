@@ -4,11 +4,13 @@ Discovery reads the API-format prompt and looks for our node pack's classes. It 
 so a freshly imported workflow shows its ports and its editable fields immediately — nothing has to execute
 and no GPU is involved.
 
-Two sources feed the same :class:`ParamSpec` shape, so the UI renders them identically:
+Three sources feed the same :class:`ParamSpec` shape, so the UI renders them identically:
 
 * ``ws_node``   — a ``WS*Input`` node the user added. First-class, named, stable across graph edits.
 * ``raw_widget`` — any widget on any stock node, exposed by ``(node_id, input_name)``. The escape hatch for
   existing workflows the user would rather not modify.
+* ``subgraph``  — an input a subgraph promotes. Those are the knobs whoever built the subgraph chose to
+  expose, so they are worth surfacing without the user having to open it up.
 """
 
 from __future__ import annotations
@@ -19,8 +21,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..core.models import ParamSpec, PortKind, PortSpec
+from ..core.models import ParamSpec, ParamTarget, PortKind, PortSpec
 from .objectinfo import ObjectInfoCache, WidgetSpec
+from .subgraphs import collect_promoted_params
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +259,108 @@ def _unique_key(
 
 
 # -- raw widget binding --------------------------------------------------------------------------------
+
+
+# -- subgraph parameters ---------------------------------------------------------------------------------
+
+#: Prefix keeping promoted subgraph parameters from colliding with port names or raw widget bindings.
+SUBGRAPH_PREFIX = "$"
+
+#: ComfyUI socket types on a promoted slot -> our parameter kinds.
+_SLOT_TYPE_TO_KIND = {
+    "INT": "int",
+    "FLOAT": "float",
+    "STRING": "string",
+    "BOOLEAN": "boolean",
+    "COMBO": "choice",
+}
+
+
+def subgraph_param_key(instance_path: str, name: str) -> str:
+    """Stable key for a promoted input. Survives a re-sync as long as the instance and slot persist."""
+    return f"{SUBGRAPH_PREFIX}{instance_path}.{name}"
+
+
+async def subgraph_params(
+    ui_graph: dict[str, Any],
+    api_prompt: dict[str, Any],
+    object_info: ObjectInfoCache | None = None,
+) -> list[ParamSpec]:
+    """Editable parameters for every input a subgraph promotes.
+
+    A subgraph's promoted inputs are the knobs whoever built it chose to expose, so they are exactly what
+    should be editable from the framework. Each one is resolved to *all* the inner inputs it drives —
+    ``width`` typically sets both the latent size and the scheduler — and typed from the target node's
+    schema so a COMBO becomes a real dropdown rather than a text box.
+    """
+    promoted = collect_promoted_params(ui_graph)
+    if not promoted:
+        return []
+
+    specs: list[ParamSpec] = []
+    for order, param in enumerate(promoted):
+        targets = [
+            ParamTarget(node_id=t.node_id, input_name=t.input_name)
+            for t in param.targets
+            if t.node_id in api_prompt
+        ]
+        if not targets:
+            # Its inner node did not survive conversion (uninstalled type, muted, bypassed).
+            logger.debug("Promoted input %s has no live targets; skipping", param.key)
+            continue
+
+        spec = ParamSpec(
+            key=subgraph_param_key(param.instance_path, param.name),
+            kind=_SLOT_TYPE_TO_KIND.get(param.type.upper(), "string"),  # type: ignore[arg-type]
+            label=param.name,
+            default=param.default,
+            group=param.subgraph_name,
+            order=order,
+            node_id=targets[0].node_id,
+            input_name=targets[0].input_name,
+            targets=targets,
+            source="subgraph",
+            is_seed=param.name in {"seed", "noise_seed"},
+        )
+        await _type_from_schema(spec, api_prompt, object_info)
+        specs.append(spec)
+
+    return specs
+
+
+async def _type_from_schema(
+    spec: ParamSpec, api_prompt: dict[str, Any], object_info: ObjectInfoCache | None
+) -> None:
+    """Fill in choices and bounds from the target node's own definition.
+
+    The promoted slot only carries a coarse type (``COMBO``); the real option list lives on the node it
+    feeds, which is what makes a model picker usable rather than a free-text field.
+    """
+    if object_info is None:
+        return
+    node = api_prompt.get(spec.node_id)
+    if not isinstance(node, dict):
+        return
+
+    try:
+        widgets = await object_info.widgets(str(node.get("class_type", "")))
+    except Exception as exc:  # noqa: BLE001 - an unreachable backend must not block discovery
+        logger.debug("Could not type promoted input %s: %s", spec.key, exc)
+        return
+
+    widget = next((w for w in widgets if w.name == spec.input_name), None)
+    if widget is None:
+        return
+
+    spec.kind = widget.kind  # type: ignore[assignment]
+    spec.choices = widget.choices
+    spec.min = widget.min
+    spec.max = widget.max
+    spec.step = widget.step
+    spec.multiline = widget.multiline
+    spec.tooltip = widget.tooltip
+    if spec.default is None:
+        spec.default = widget.default
 
 
 def raw_param_key(node_id: str, input_name: str) -> str:

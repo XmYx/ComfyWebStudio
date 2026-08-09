@@ -65,20 +65,27 @@ def _apply_params(
     rng: random.Random,
 ) -> None:
     for param in workflow.params:
-        node = result.prompt.get(param.node_id)
-        if not isinstance(node, dict):
+        value = overrides.get(param.key, param.default)
+        if param.is_seed:
+            value = _resolve_seed(value, seed_mode, rng)
+        coerced = _coerce(value, param)
+
+        # A promoted subgraph input can drive several node inputs at once; all of them get the value.
+        written = 0
+        for target in param.all_targets:
+            node = result.prompt.get(target.node_id)
+            if not isinstance(node, dict):
+                continue
+            node.setdefault("inputs", {})[target.input_name] = coerced
+            written += 1
+
+        if not written:
             result.warnings.append(
                 f"Parameter {param.display_name!r} points at node {param.node_id} which is no longer in "
                 "the workflow; it was ignored."
             )
             continue
 
-        value = overrides.get(param.key, param.default)
-        if param.is_seed:
-            value = _resolve_seed(value, seed_mode, rng)
-
-        coerced = _coerce(value, param)
-        node.setdefault("inputs", {})[param.input_name] = coerced
         result.resolved_params[param.key] = coerced
 
 

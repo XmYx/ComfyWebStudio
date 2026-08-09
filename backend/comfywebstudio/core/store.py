@@ -29,10 +29,10 @@ from typing import Any
 
 from ..settings import AppSettings
 from .errors import Conflict, NotFound, ValidationFailed
-from .history import ProjectHistory
 from .ids import safe_component, slugify
 from .migrations import migrate
 from .models import Project, Run, WorkflowRef
+from .versioning import VersionStore
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +45,10 @@ EXPORT_FORMAT_VERSION = 1
 class ProjectStore:
     """Reads and writes projects under ``settings.projects_dir``."""
 
-    def __init__(self, settings: AppSettings, history: ProjectHistory | None = None):
+    def __init__(self, settings: AppSettings):
         self.settings = settings
         self._dir_cache: dict[str, Path] = {}
-        #: Every mutation funnels through save(), so snapshotting there covers all of them.
-        self.history = history or ProjectHistory()
+        self._versions: dict[str, VersionStore] = {}
 
     @property
     def root(self) -> Path:
@@ -118,7 +117,7 @@ class ProjectStore:
 
         directory = self._allocate_dir(project)
         self._dir_cache[project.id] = directory
-        for sub in ("workflows", "runs", "assets", "thumbs", "renders"):
+        for sub in ("workflows", "runs", "assets", "thumbs", "renders", "history"):
             (directory / sub).mkdir(parents=True, exist_ok=True)
         self.save(project)
         logger.info("Created project %s at %s", project.id, directory)
@@ -158,24 +157,41 @@ class ProjectStore:
                 directory = self._allocate_dir(project)
                 self._dir_cache[project.id] = directory
 
-        for sub in ("workflows", "runs", "assets", "thumbs", "renders"):
+        for sub in ("workflows", "runs", "assets", "thumbs", "renders", "history"):
             (directory / sub).mkdir(parents=True, exist_ok=True)
 
         path = directory / PROJECT_FILE
-        # Snapshot the state we are about to replace, so this edit becomes undoable.
+        payload = project.model_dump(mode="json")
+
+        # Read the state we are about to replace so the version log can describe the difference.
+        previous: dict[str, Any] | None = None
         if path.is_file():
             try:
-                self.history.record(project.id, json.loads(path.read_text(encoding="utf-8")))
+                previous = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                logger.debug("Could not snapshot %s for undo: %s", project.id, exc)
+                logger.debug("Could not read %s for history: %s", path, exc)
 
-        _atomic_write_json(path, project.model_dump(mode="json"))
+        _atomic_write_json(path, payload)
+
+        try:
+            self.versions(project.id).record(previous, payload)
+        except Exception as exc:  # noqa: BLE001 - history is valuable, but never worth failing a save over
+            logger.warning("Could not record a version for %s: %s", project.id, exc)
+
         return path
 
+    def versions(self, project_id: str) -> VersionStore:
+        """The change log for one project."""
+        store = self._versions.get(project_id)
+        if store is None:
+            store = VersionStore(self.project_dir(project_id) / "history")
+            self._versions[project_id] = store
+        return store
+
     def restore(self, snapshot: dict[str, Any]) -> Project:
-        """Write a snapshot back without recording it as a new undo step."""
+        """Write a snapshot back without recording it as a new version."""
         project = Project.model_validate(migrate(snapshot))
-        with self.history.suspend(project.id):
+        with self.versions(project.id).suspend():
             self.save(project)
         return project
 
@@ -318,6 +334,7 @@ class ProjectStore:
         include_assets: bool = True,
         include_renders: bool = False,
         include_runs: bool = True,
+        include_history: bool = False,
     ) -> Path:
         """Write a ``.cwsproj`` archive.
 
@@ -338,6 +355,10 @@ class ProjectStore:
             skip_dirs.add("renders")
         if not include_runs:
             skip_dirs.add("runs")
+        if not include_history:
+            # Version history is usually much larger than the project itself and rarely wanted by whoever
+            # receives the export, so it is opt-in.
+            skip_dirs.add("history")
 
         manifest = {
             "format": "comfywebstudio-project",
@@ -348,6 +369,7 @@ class ProjectStore:
                 "assets": include_assets,
                 "renders": include_renders,
                 "runs": include_runs,
+                "history": include_history,
             },
         }
 

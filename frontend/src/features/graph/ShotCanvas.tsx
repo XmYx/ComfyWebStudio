@@ -11,6 +11,8 @@ import { KIND_COLOR, canConnect } from '@/lib/kinds'
 import { useStudio } from '@/store/studio'
 import { useLayout } from '@/store/layout'
 import { Empty, useToast } from '@/components/ui'
+import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
+import { useCommandContext } from '@/features/menu/useCommandContext'
 import { StepNode, type StepNodeData } from './StepNode'
 
 const NODE_TYPES = { step: StepNode }
@@ -55,6 +57,9 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
           id: step.id,
           type: 'step',
           position: { x: step.ui_pos.x, y: step.ui_pos.y },
+          ...(step.ui_size?.w > 0 && step.ui_size?.h > 0
+            ? { width: step.ui_size.w, height: step.ui_size.h }
+            : {}),
           data: {
             step,
             workflow: project.workflows[step.workflow_id],
@@ -77,11 +82,18 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
   const [nodes, setNodes] = useNodesState<Node<StepNodeData>>(derived)
 
   // Fold server updates (progress, new previews, added or removed steps) into the canvas without
-  // disturbing a position the user is currently dragging.
+  // discarding canvas-owned state. Position and selection live here, not on the server between saves —
+  // rebuilding them from `derived` would cancel a drag in progress and clear the selection on every
+  // event tick, which also hides the resize handles.
   useEffect(() => {
     setNodes((current) => {
-      const positions = new Map(current.map((node) => [node.id, node.position]))
-      return derived.map((node) => ({ ...node, position: positions.get(node.id) ?? node.position }))
+      const existing = new Map(current.map((node) => [node.id, node]))
+      return derived.map((node) => {
+        const previous = existing.get(node.id)
+        return previous
+          ? { ...node, position: previous.position, selected: previous.selected }
+          : node
+      })
     })
   }, [derived, setNodes])
 
@@ -180,12 +192,20 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
             ui_pos: { x: change.position.x, y: change.position.y },
           })
         }
+        // React Flow reports resizing as dimension changes; `resizing === false` is the release.
+        if (change.type === 'dimensions' && change.resizing === false && change.dimensions) {
+          void api.steps
+            .update(project.id, change.id, {
+              ui_size: { w: change.dimensions.width, h: change.dimensions.height },
+            })
+            .then(onChanged)
+        }
         if (change.type === 'select' && change.selected) {
           selectStep(change.id)
         }
       }
     },
-    [project.id, selectStep, setNodes],
+    [project.id, selectStep, setNodes, onChanged],
   )
 
   const onNodesDelete = useCallback(
@@ -203,12 +223,156 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     [project.id, onChanged, selectStep, toast],
   )
 
+  const commandContext = useCommandContext()
+  const contextMenu = useContextMenu()
+
+  const addStepItems = useCallback(
+    (): MenuItem[] =>
+      Object.values(project.workflows).map((workflow) => ({
+        type: 'action' as const,
+        label: workflow.name,
+        onSelect: async () => {
+          try {
+            await api.steps.create(project.id, shot.id, workflow.id)
+            onChanged()
+          } catch (error) {
+            toast.push('bad', (error as ApiError).message)
+          }
+        },
+      })),
+    [project, shot.id, onChanged, toast],
+  )
+
+  const paneMenu = (event: React.MouseEvent): MenuItem[] => [
+    { type: 'header', label: shot.name },
+    {
+      type: 'submenu',
+      label: 'Add step',
+      items: addStepItems(),
+      disabled: !Object.keys(project.workflows).length,
+    },
+    { type: 'command', id: 'file.importWorkflowComfy' },
+    { type: 'separator' },
+    { type: 'command', id: 'edit.paste' },
+    { type: 'command', id: 'edit.selectAll' },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: 'Fit graph to window',
+      shortcut: 'Mod+0',
+      onSelect: () => flow.fitView({ padding: 0.25, duration: 200 }),
+    },
+    {
+      type: 'action',
+      label: 'Arrange steps in run order',
+      onSelect: () => void autoLayout(event),
+    },
+  ]
+
+  const nodeMenu = (step: (typeof shot.steps)[number]): MenuItem[] => [
+    { type: 'header', label: step.name },
+    { type: 'action', label: 'Run this step', shortcut: undefined, onSelect: () => onRunStep(step.id) },
+    { type: 'separator' },
+    { type: 'command', id: 'edit.copy' },
+    { type: 'command', id: 'edit.cut' },
+    { type: 'command', id: 'edit.duplicateStep' },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: step.enabled ? 'Disable step' : 'Enable step',
+      checked: step.enabled,
+      onSelect: async () => {
+        await api.steps.update(project.id, step.id, { enabled: !step.enabled })
+        onChanged()
+      },
+    },
+    {
+      type: 'action',
+      label: 'Rename…',
+      onSelect: async () => {
+        const name = prompt('Step name', step.name)
+        if (name && name !== step.name) {
+          await api.steps.update(project.id, step.id, { name })
+          onChanged()
+        }
+      },
+    },
+    {
+      type: 'action',
+      label: 'Reset size',
+      disabled: !(step.ui_size?.w > 0),
+      onSelect: async () => {
+        await api.steps.update(project.id, step.id, { ui_size: { w: 0, h: 0 } })
+        onChanged()
+      },
+    },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: 'Open workflow in ComfyUI',
+      onSelect: async () => {
+        try {
+          const result = await api.workflows.openInComfy(project.id, step.workflow_id)
+          if (result.hint) toast.push('bad', result.hint)
+          window.open(result.url, '_blank', 'noopener')
+        } catch (error) {
+          toast.push('bad', (error as ApiError).message)
+        }
+      },
+    },
+    { type: 'separator' },
+    { type: 'command', id: 'edit.delete' },
+  ]
+
+  const edgeMenu = (edgeId: string): MenuItem[] => {
+    const link = shot.links.find((l) => l.id === edgeId)
+    return [
+      { type: 'header', label: link ? `${link.from_port} → ${link.to_port}` : 'Link' },
+      {
+        type: 'action',
+        label: 'Disconnect',
+        danger: true,
+        onSelect: async () => {
+          try {
+            await api.links.remove(project.id, shot.id, edgeId)
+            onChanged()
+          } catch (error) {
+            toast.push('bad', (error as ApiError).message)
+          }
+        },
+      },
+    ]
+  }
+
+  /** Lay the steps out left to right in dependency order — the shape most shots want anyway. */
+  const autoLayout = async (_event: React.MouseEvent) => {
+    try {
+      const report = await api.shots.validate(project.id, shot.id)
+      const order = report.order.length ? report.order : shot.steps.map((s) => s.id)
+      await Promise.all(
+        order.map((stepId, index) =>
+          api.steps.update(project.id, stepId, { ui_pos: { x: 40 + index * 320, y: 80 } }),
+        ),
+      )
+      onChanged()
+      setTimeout(() => flow.fitView({ padding: 0.25, duration: 200 }), 100)
+    } catch (error) {
+      toast.push('bad', (error as ApiError).message)
+    }
+  }
+
   if (!shot.steps.length) {
     return (
-      <Empty title="This shot has no steps yet">
-        Add a workflow from the left panel. Each step runs one ComfyUI workflow; connect an output port to
-        an input port to chain them.
-      </Empty>
+      <div
+        className="h-full"
+        onContextMenu={(event) => contextMenu.open(event, paneMenu(event))}
+      >
+        <Empty title="This shot has no steps yet">
+          Add a workflow from the left panel, or right-click here. Each step runs one ComfyUI workflow;
+          connect an output port to an input port to chain them.
+        </Empty>
+        <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
+      </div>
     )
   }
 
@@ -224,6 +388,13 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       isValidConnection={isValidConnection}
       onPaneClick={() => selectStep(null)}
       onNodeClick={(_e, node) => selectStep(node.id)}
+      onPaneContextMenu={(event) => contextMenu.open(event as React.MouseEvent, paneMenu(event as React.MouseEvent))}
+      onNodeContextMenu={(event, node) => {
+        const step = shot.steps.find((s) => s.id === node.id)
+        selectStep(node.id)
+        if (step) contextMenu.open(event, nodeMenu(step))
+      }}
+      onEdgeContextMenu={(event, edge) => contextMenu.open(event, edgeMenu(edge.id))}
       fitView
       fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
       proOptions={{ hideAttribution: true }}
@@ -233,6 +404,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     >
       <Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#232a35" />
       <Controls showInteractive={false} />
+      <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
     </ReactFlow>
   )
 }

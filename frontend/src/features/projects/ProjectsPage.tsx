@@ -7,6 +7,8 @@ import { relativeTime } from '@/lib/format'
 import {
   Button, Callout, Empty, Field, Modal, Panel, Spinner, TextArea, TextInput, useToast,
 } from '@/components/ui'
+import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
+import { useCommandContext } from '@/features/menu/useCommandContext'
 
 export function ProjectsPage() {
   const navigate = useNavigate()
@@ -17,6 +19,8 @@ export function ProjectsPage() {
   const [creating, setCreating] = useState(false)
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
+  const commandContext = useCommandContext()
+  const contextMenu = useContextMenu()
 
   const { data: projects, isLoading, error } = useQuery({
     queryKey: ['projects'],
@@ -105,7 +109,47 @@ export function ProjectsPage() {
       ) : (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {projects.map((project) => (
-            <Panel key={project.id} className="group flex flex-col p-4 transition-colors hover:border-[var(--color-accent)]/60">
+            <div
+              key={project.id}
+              onContextMenu={(event) =>
+                contextMenu.open(event, [
+                  { type: 'header', label: project.name },
+                  { type: 'action', label: 'Open', onSelect: () => navigate(`/p/${project.id}/shots`) },
+                  {
+                    type: 'action',
+                    label: 'Duplicate',
+                    onSelect: async () => {
+                      const copy = await api.projects.duplicate(project.id)
+                      queryClient.invalidateQueries({ queryKey: ['projects'] })
+                      toast.push('ok', `Duplicated as “${copy.name}”.`)
+                    },
+                  },
+                  { type: 'separator' },
+                  {
+                    type: 'action',
+                    label: 'Export…',
+                    onSelect: () => {
+                      const anchor = document.createElement('a')
+                      anchor.href = api.projects.exportUrl(project.id)
+                      anchor.download = ''
+                      anchor.click()
+                    },
+                  },
+                  { type: 'separator' },
+                  {
+                    type: 'action',
+                    label: 'Delete',
+                    danger: true,
+                    onSelect: () => {
+                      if (confirm(`Delete “${project.name}”? This removes its files from disk.`)) {
+                        remove.mutate(project.id)
+                      }
+                    },
+                  },
+                ] satisfies MenuItem[])
+              }
+            >
+            <Panel className="group flex flex-col p-4 transition-colors hover:border-[var(--color-accent)]/60">
               <button
                 className="flex-1 text-left"
                 onClick={() => navigate(`/p/${project.id}/shots`)}
@@ -144,6 +188,7 @@ export function ProjectsPage() {
                 </div>
               </div>
             </Panel>
+            </div>
           ))}
         </div>
       )}
@@ -174,6 +219,7 @@ export function ProjectsPage() {
           </div>
         </div>
       </Modal>
+      <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
     </div>
   )
 }

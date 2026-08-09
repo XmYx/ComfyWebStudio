@@ -19,6 +19,7 @@ from ..comfy.discovery import (
     find_missing_nodes,
     prompt_hash,
     raw_param_key,
+    subgraph_params,
 )
 from ..comfy.graph_convert import ui_graph_to_prompt
 from ..comfy.objectinfo import WidgetSpec
@@ -97,21 +98,31 @@ async def _ingest(
     result = discover(api_prompt, kind_map=kind_map)
     warnings.extend(result.warnings)
 
+    object_info = None
     try:
         object_info = await state.backends.object_info(backend_id)
         missing = await find_missing_nodes(result.node_classes, object_info)
     except Exception:  # noqa: BLE001
         missing = []
 
+    # Inputs a subgraph promotes are editable too — typed from the node they feed, so a model slot becomes
+    # a real dropdown rather than a free-text field.
+    promoted = await subgraph_params(ui_graph or {}, api_prompt, object_info) if ui_graph else []
+
     workflow = WorkflowRef(
         name=name,
         ports=result.ports,
-        params=result.params,
+        params=[*result.params, *promoted],
         hash=prompt_hash(api_prompt),
         missing_nodes=missing,
         warnings=warnings,
         last_synced=utcnow(),
     )
+
+    if promoted:
+        workflow.warnings.append(
+            f"Found {len(promoted)} parameter(s) promoted by this workflow's subgraph(s)."
+        )
 
     if not workflow.ports:
         workflow.warnings.append(
@@ -220,15 +231,28 @@ async def rediscover(
         if p.source == "raw_widget" and p.node_id in api_prompt
     ]
 
+    object_info = None
+    try:
+        object_info = await state.backends.object_info(backend_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    ui_graph: dict = {}
+    try:
+        ui_graph = state.store.read_workflow(project.id, workflow_id, "ui")
+    except Exception:  # noqa: BLE001 - an API-format-only import has no UI graph to read
+        pass
+    promoted = await subgraph_params(ui_graph, api_prompt, object_info) if ui_graph else []
+
     workflow.ports = result.ports
-    workflow.params = [*result.params, *raw_params]
+    workflow.params = [*result.params, *promoted, *raw_params]
     workflow.hash = prompt_hash(api_prompt)
     workflow.warnings = result.warnings
     workflow.last_synced = utcnow()
 
     try:
-        object_info = await state.backends.object_info(backend_id)
-        workflow.missing_nodes = await find_missing_nodes(result.node_classes, object_info)
+        if object_info is not None:
+            workflow.missing_nodes = await find_missing_nodes(result.node_classes, object_info)
     except Exception:  # noqa: BLE001
         pass
 

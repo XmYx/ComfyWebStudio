@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Header
 from pydantic import BaseModel
 
-from ..comfy.discovery import NodeKindMap, discover, find_missing_nodes, prompt_hash
+from ..comfy.discovery import NodeKindMap, discover, find_missing_nodes, prompt_hash, subgraph_params
 from ..core.errors import NotFound, StudioError
 from ..core.models import utcnow
 from .deps import StateDep
@@ -123,16 +123,26 @@ async def save_workflow(
     result = discover(body.prompt, kind_map=kind_map)
     raw_params = [p for p in workflow.params if p.source == "raw_widget" and p.node_id in body.prompt]
 
+    object_info = None
+    try:
+        object_info = await state.backends.object_info()
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ComfyUI flattens subgraphs itself before handing us the prompt, but only the UI document knows which
+    # inputs were promoted — so the parameter map is read from there either way.
+    promoted = await subgraph_params(body.workflow or {}, body.prompt, object_info)
+
     previous_ports = {p.key for p in workflow.ports}
     workflow.ports = result.ports
-    workflow.params = [*result.params, *raw_params]
+    workflow.params = [*result.params, *promoted, *raw_params]
     workflow.hash = prompt_hash(body.prompt)
     workflow.warnings = result.warnings
     workflow.last_synced = utcnow()
 
     try:
-        object_info = await state.backends.object_info()
-        workflow.missing_nodes = await find_missing_nodes(result.node_classes, object_info)
+        if object_info is not None:
+            workflow.missing_nodes = await find_missing_nodes(result.node_classes, object_info)
     except Exception:  # noqa: BLE001
         pass
 

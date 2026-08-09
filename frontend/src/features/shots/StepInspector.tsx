@@ -6,6 +6,7 @@ import type { Project, SeedMode, Shot, Step } from '@/api/types'
 import { useStudio } from '@/store/studio'
 import { ParamForm } from '@/features/params/ParamForm'
 import { ArtifactPreview } from '@/features/preview/Preview'
+import { ElementHistory } from '@/features/history/HistoryDialog'
 import {
   Badge, Button, Callout, Field, Modal, Panel, PanelHeader, Select, TextInput, cx, useToast,
 } from '@/components/ui'
@@ -18,7 +19,7 @@ interface Props {
   onRunStep: (stepId: string, mode: 'step' | 'chain') => void
 }
 
-type Tab = 'params' | 'output' | 'settings'
+type Tab = 'params' | 'output' | 'history' | 'settings'
 
 export function StepInspector({ project, shot, step, onChanged, onRunStep }: Props) {
   const toast = useToast()
@@ -52,6 +53,7 @@ export function StepInspector({ project, shot, step, onChanged, onRunStep }: Pro
   const tabs: Array<[Tab, string]> = [
     ['params', 'Parameters'],
     ['output', `Output${live?.outputs?.length ? ` (${live.outputs.length})` : ''}`],
+    ['history', 'History'],
     ['settings', 'Step'],
   ]
 
@@ -131,6 +133,10 @@ export function StepInspector({ project, shot, step, onChanged, onRunStep }: Pro
 
         {tab === 'output' && (
           <ArtifactPreview projectId={project.id} artifacts={live?.outputs ?? []} />
+        )}
+
+        {tab === 'history' && (
+          <ElementHistory projectId={project.id} scope="step" targetId={step.id} name={step.name} />
         )}
 
         {tab === 'settings' && (

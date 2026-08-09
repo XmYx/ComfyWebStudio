@@ -10,12 +10,75 @@ edges between ports, the inspector shows parameters and previews, and the timeli
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
 FAILURES: list[str] = []
+
+
+def _api(url: str, path: str, payload=None, method="GET"):
+    data = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(
+        url + path, data=data, method=method, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(request) as response:
+        body = response.read()
+    return json.loads(body) if body else None
+
+
+def _scratch_project(url: str) -> str:
+    """Build and run a two-step chain of our own.
+
+    The smoke test needs a project that has actually produced artifacts, so it creates one and runs it
+    against the configured ComfyUI rather than depending on whatever happens to be in the project list.
+    """
+    generator = {
+        "1": {"class_type": "WSStringInput", "inputs": {"port_name": "caption", "value": "smoke"}},
+        "2": {"class_type": "EmptyImage",
+              "inputs": {"width": 32, "height": 32, "batch_size": 1, "color": 0x22AA55}},
+        "3": {"class_type": "WSImageOutput",
+              "inputs": {"image": ["2", 0], "port_name": "image", "format": "png",
+                         "run_key": "", "quality": 92, "lossless": False}},
+    }
+    consumer = {
+        "1": {"class_type": "WSImageInput", "inputs": {"port_name": "image", "source": ""}},
+        "2": {"class_type": "ImageScale",
+              "inputs": {"image": ["1", 0], "upscale_method": "nearest-exact",
+                         "width": 64, "height": 64, "crop": "disabled"}},
+        "3": {"class_type": "WSImageOutput",
+              "inputs": {"image": ["2", 0], "port_name": "final", "format": "png",
+                         "run_key": "", "quality": 92, "lossless": False}},
+    }
+
+    project = _api(url, "/api/projects", {"name": "Smoke Test"}, "POST")
+    pid = project["id"]
+    gen = _api(url, f"/api/projects/{pid}/workflows", {"name": "Generate", "prompt": generator}, "POST")
+    con = _api(url, f"/api/projects/{pid}/workflows", {"name": "Upscale", "prompt": consumer}, "POST")
+    shot = _api(url, f"/api/projects/{pid}/shots", {"name": "Shot 1"}, "POST")
+
+    a = _api(url, f"/api/projects/{pid}/shots/{shot['id']}/steps",
+             {"workflow_id": gen["id"], "ui_pos": {"x": 40, "y": 60}}, "POST")
+    b = _api(url, f"/api/projects/{pid}/shots/{shot['id']}/steps",
+             {"workflow_id": con["id"], "ui_pos": {"x": 460, "y": 60}}, "POST")
+    _api(url, f"/api/projects/{pid}/shots/{shot['id']}/links",
+         {"from_step": a["id"], "from_port": "image", "to_step": b["id"], "to_port": "image"}, "POST")
+
+    run = _api(url, f"/api/projects/{pid}/shots/{shot['id']}/run", {"mode": "shot"}, "POST")
+    for _ in range(300):
+        time.sleep(0.4)
+        run = _api(url, f"/api/projects/{pid}/runs/{run['id']}")
+        if run["status"] in {"success", "error", "cancelled"}:
+            break
+    if run["status"] != "success":
+        raise SystemExit(f"The scratch run did not succeed ({run['status']}): {run.get('error')}")
+
+    _api(url, f"/api/projects/{pid}/timeline/from-shots", None, "POST")
+    return pid
 
 
 def check(condition: bool, message: str) -> None:
@@ -35,6 +98,9 @@ def main() -> int:
     if shots:
         shots.mkdir(parents=True, exist_ok=True)
 
+    project_id = _scratch_project(args.url)
+    print(f"Using scratch project {project_id}")
+
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page = browser.new_page(viewport={"width": 1600, "height": 950})
@@ -48,11 +114,12 @@ def main() -> int:
         page.wait_for_selector("text=Projects")
         cards = page.locator("div.group")
         check(cards.count() > 0, f"{cards.count()} project card(s) listed")
+        check(page.locator("text=Smoke Test").count() > 0, "the scratch project is listed")
         if shots:
             page.screenshot(path=str(shots / "01-projects.png"))
 
         print("Shot editor")
-        cards.first.locator("button").first.click()
+        page.goto(f"{args.url}/p/{project_id}/shots", wait_until="networkidle")
         page.wait_for_selector(".react-flow__node", timeout=15000)
         # React Flow keeps a node hidden until it has measured it; edges only appear afterwards.
         page.wait_for_function(
@@ -116,6 +183,11 @@ def main() -> int:
             print(f"        {error[:160]}")
 
         browser.close()
+
+    try:
+        _api(args.url, f"/api/projects/{project_id}", method="DELETE")
+    except Exception as exc:  # noqa: BLE001 - cleanup failure must not mask a test result
+        print(f"  (could not clean up scratch project: {exc})")
 
     print()
     if FAILURES:

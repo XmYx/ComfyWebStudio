@@ -17,6 +17,13 @@ export interface LiveStep {
   cached?: boolean
 }
 
+/** What the History panel is scoped to. `null` means the whole project. */
+export interface HistoryTarget {
+  scope: 'project' | 'shot' | 'step' | 'workflow' | 'timeline' | 'track'
+  id: string
+  name: string
+}
+
 interface StudioState {
   projectId: string | null
   shotId: string | null
@@ -26,6 +33,7 @@ interface StudioState {
   activeRun: Run | null
   liveSteps: Record<string, LiveStep>
   renderProgress: { id: string; progress: number; message: string } | null
+  historyTarget: HistoryTarget | null
 
   setProject: (id: string | null) => void
   setShot: (id: string | null) => void
@@ -37,6 +45,7 @@ interface StudioState {
   patchStep: (stepId: string, patch: LiveStep) => void
   seedFromResults: (results: Record<string, { step_run: StepRun }>) => void
   setRenderProgress: (progress: StudioState['renderProgress']) => void
+  setHistoryTarget: (target: HistoryTarget | null) => void
   clearLive: () => void
 }
 
@@ -48,6 +57,7 @@ export const useStudio = create<StudioState>((set) => ({
   activeRun: null,
   liveSteps: {},
   renderProgress: null,
+  historyTarget: null,
 
   setProject: (id) =>
     set({ projectId: id, shotId: null, selectedStepId: null, liveSteps: {}, activeRun: null }),
@@ -95,5 +105,6 @@ export const useStudio = create<StudioState>((set) => ({
     })),
 
   setRenderProgress: (progress) => set({ renderProgress: progress }),
+  setHistoryTarget: (historyTarget) => set({ historyTarget }),
   clearLive: () => set({ liveSteps: {}, activeRun: null }),
 }))

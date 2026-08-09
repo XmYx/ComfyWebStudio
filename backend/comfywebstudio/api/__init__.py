@@ -19,6 +19,7 @@ from . import (
     settings_api,
     shots,
     timeline,
+    versions,
     workflows,
 )
 
@@ -33,6 +34,7 @@ ROUTERS: list[APIRouter] = [
     timeline.router,
     settings_api.router,
     plugins.router,
+    versions.router,
     bridge.router,
     events.router,
 ]

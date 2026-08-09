@@ -11,6 +11,8 @@ import {
   Button, Callout, Empty, Field, Modal, Panel, PanelHeader, ProgressBar,
   Select, TextInput, cx, useToast,
 } from '@/components/ui'
+import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
+import { useCommandContext } from '@/features/menu/useCommandContext'
 
 const MIN_PX_PER_SECOND = 8
 const MAX_PX_PER_SECOND = 400
@@ -28,6 +30,8 @@ export function TimelinePage() {
   const renderProgress = useStudio((s) => s.renderProgress)
   const selectedClip = useStudio((s) => s.selectedClip)
   const selectClip = useStudio((s) => s.selectClip)
+  const commandContext = useCommandContext()
+  const contextMenu = useContextMenu()
 
   const { data: project } = useQuery({
     queryKey: ['project', projectId],
@@ -157,6 +161,7 @@ export function TimelinePage() {
             onChanged={invalidate}
             selectedClip={selectedClip}
             onSelectClip={selectClip}
+            onContextMenu={contextMenu.open}
           />
         )}
       </Panel>
@@ -193,6 +198,7 @@ export function TimelinePage() {
         project={project}
         onChanged={invalidate}
       />
+      <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
     </div>
   )
 }
@@ -201,6 +207,7 @@ export function TimelinePage() {
 
 function TrackArea({
   project, resolved, zoom, duration, playhead, onScrub, onChanged, selectedClip, onSelectClip,
+  onContextMenu,
 }: {
   project: Project
   resolved: ResolvedTimeline | undefined
@@ -211,7 +218,107 @@ function TrackArea({
   onChanged: () => void
   selectedClip: { trackId: string; clipId: string } | null
   onSelectClip: (selection: { trackId: string; clipId: string } | null) => void
+  onContextMenu: (event: React.MouseEvent, items: MenuItem[]) => void
 }) {
+  const clipMenu = (track: Track, clip: Clip): MenuItem[] => [
+    { type: 'header', label: clip.name || 'Clip' },
+    { type: 'command', id: 'edit.copy' },
+    { type: 'command', id: 'edit.cut' },
+    { type: 'command', id: 'edit.paste' },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: clip.enabled ? 'Disable clip' : 'Enable clip',
+      checked: clip.enabled,
+      onSelect: async () => {
+        await api.timeline.updateClip(project.id, track.id, clip.id, { enabled: !clip.enabled })
+        onChanged()
+      },
+    },
+    {
+      type: 'action',
+      label: 'Duplicate clip',
+      onSelect: async () => {
+        await api.timeline.createClip(project.id, track.id, {
+          source: clip.source, duration: clip.duration, name: clip.name, text: clip.text,
+          start: clip.start + clip.duration,
+        })
+        onChanged()
+      },
+    },
+    {
+      type: 'action',
+      label: 'Snap to the previous clip',
+      onSelect: async () => {
+        const before = track.clips.filter((c) => c.id !== clip.id && c.start < clip.start)
+        const end = before.length ? Math.max(...before.map((c) => c.start + c.duration)) : 0
+        await api.timeline.updateClip(project.id, track.id, clip.id, { start: end })
+        onChanged()
+      },
+    },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: 'Delete clip',
+      danger: true,
+      onSelect: async () => {
+        await api.timeline.removeClip(project.id, track.id, clip.id)
+        onSelectClip(null)
+        onChanged()
+      },
+    },
+  ]
+
+  const trackMenu = (track: Track): MenuItem[] => [
+    { type: 'header', label: track.name },
+    {
+      type: 'action',
+      label: 'Rename…',
+      onSelect: async () => {
+        const name = prompt('Track name', track.name)
+        if (name && name !== track.name) {
+          await api.timeline.updateTrack(project.id, track.id, { name })
+          onChanged()
+        }
+      },
+    },
+    {
+      type: 'action',
+      label: track.muted ? 'Unmute' : 'Mute',
+      checked: !track.muted,
+      onSelect: async () => {
+        await api.timeline.updateTrack(project.id, track.id, { muted: !track.muted })
+        onChanged()
+      },
+    },
+    {
+      type: 'action',
+      label: track.locked ? 'Unlock' : 'Lock',
+      checked: track.locked,
+      onSelect: async () => {
+        await api.timeline.updateTrack(project.id, track.id, { locked: !track.locked })
+        onChanged()
+      },
+    },
+    { type: 'command', id: 'edit.paste' },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: 'Delete track',
+      danger: true,
+      onSelect: async () => {
+        if (!confirm(`Delete track “${track.name}” and its clips?`)) return
+        await api.timeline.removeTrack(project.id, track.id)
+        onChanged()
+      },
+    },
+  ]
+
+  const laneMenu = (track: Track): MenuItem[] => [
+    { type: 'header', label: track.name },
+    { type: 'command', id: 'edit.paste' },
+    ...trackMenu(track).slice(1),
+  ]
   const scrollRef = useRef<HTMLDivElement>(null)
   const width = duration * zoom
 
@@ -238,7 +345,9 @@ function TrackArea({
       <div className="shrink-0 border-r border-[var(--color-edge)]" style={{ width: HEADER_WIDTH }}>
         <div className="h-7 border-b border-[var(--color-edge)]" />
         {project.timeline.tracks.map((track) => (
-          <TrackHeader key={track.id} project={project} track={track} onChanged={onChanged} />
+          <div key={track.id} onContextMenu={(event) => onContextMenu(event, trackMenu(track))}>
+            <TrackHeader project={project} track={track} onChanged={onChanged} />
+          </div>
         ))}
       </div>
 
@@ -252,6 +361,7 @@ function TrackArea({
                 key={track.id}
                 className="relative border-b border-[var(--color-edge)]"
                 style={{ height: TRACK_HEIGHT }}
+                onContextMenu={(event) => onContextMenu(event, laneMenu(track))}
               >
                 {track.clips.map((clip) => (
                   <ClipBlock
@@ -264,6 +374,10 @@ function TrackArea({
                     selected={selectedClip?.clipId === clip.id}
                     onSelect={() => onSelectClip({ trackId: track.id, clipId: clip.id })}
                     onChanged={onChanged}
+                    onContextMenu={(event) => {
+                      onSelectClip({ trackId: track.id, clipId: clip.id })
+                      onContextMenu(event, clipMenu(track, clip))
+                    }}
                   />
                 ))}
               </div>
@@ -343,7 +457,7 @@ function TrackHeader({
 }
 
 function ClipBlock({
-  project, track, clip, zoom, status, selected, onSelect, onChanged,
+  project, track, clip, zoom, status, selected, onSelect, onChanged, onContextMenu,
 }: {
   project: Project
   track: Track
@@ -353,6 +467,7 @@ function ClipBlock({
   selected: boolean
   onSelect: () => void
   onChanged: () => void
+  onContextMenu: (event: React.MouseEvent) => void
 }) {
   const dragState = useRef<{ mode: 'move' | 'trim'; x: number; start: number; duration: number } | null>(null)
 
@@ -401,8 +516,9 @@ function ClipBlock({
   return (
     <div
       id={`clip-${clip.id}`}
-      onMouseDown={(e) => beginDrag(e, 'move')}
+      onMouseDown={(e) => e.button === 0 && beginDrag(e, 'move')}
       onClick={onSelect}
+      onContextMenu={onContextMenu}
       className={cx(
         'absolute top-1 flex h-[calc(100%-8px)] cursor-grab items-center overflow-hidden rounded border',
         selected ? 'border-[var(--color-accent)] ring-1 ring-[var(--color-accent)]' : 'border-[var(--color-edge)]',

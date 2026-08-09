@@ -12,6 +12,8 @@ import { StepInspector } from './StepInspector'
 import {
   Badge, Button, Callout, Empty, Panel, PanelHeader, Spinner, cx, useToast,
 } from '@/components/ui'
+import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
+import { useCommandContext } from '@/features/menu/useCommandContext'
 
 export function ShotsPage() {
   const { projectId } = useParams<{ projectId: string }>()
@@ -25,6 +27,8 @@ export function ShotsPage() {
   const seedFromResults = useStudio((s) => s.seedFromResults)
   const showLeftPanel = useLayout((s) => s.showLeftPanel)
   const showInspector = useLayout((s) => s.showInspector)
+  const commandContext = useCommandContext()
+  const contextMenu = useContextMenu()
 
   const { data: project, isLoading, error } = useQuery({
     queryKey: ['project', projectId],
@@ -92,6 +96,68 @@ export function ShotsPage() {
   const selectedStep = shot?.steps.find((s) => s.id === selectedStepId) ?? null
   const running = activeRun?.status === 'running' || startRun.isPending
 
+  const shotMenu = (candidate: (typeof project.shots)[number]): MenuItem[] => [
+    { type: 'header', label: candidate.name },
+    { type: 'action', label: 'Run shot', onSelect: () => startRun.mutate({ mode: 'shot' }) },
+    {
+      type: 'action',
+      label: 'Run, ignoring cached results',
+      onSelect: () => startRun.mutate({ mode: 'shot', force: true }),
+    },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: 'Rename…',
+      onSelect: async () => {
+        const name = prompt('Shot name', candidate.name)
+        if (name && name !== candidate.name) {
+          await api.shots.update(project.id, candidate.id, { name })
+          invalidate()
+        }
+      },
+    },
+    {
+      type: 'action',
+      label: 'Duplicate shot',
+      onSelect: async () => {
+        const copy = await api.shots.duplicate(project.id, candidate.id)
+        setShot(copy.id)
+        invalidate()
+      },
+    },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: 'Save a named version…',
+      onSelect: async () => {
+        const label = prompt(`Name this version of “${candidate.name}”`, '')
+        if (!label) return
+        await api.versions.tagShot(project.id, candidate.id, label)
+        toast.push('ok', `Saved version “${label}”.`)
+      },
+    },
+    {
+      type: 'action',
+      label: 'Show history…',
+      onSelect: () => {
+        useStudio.getState().setHistoryTarget({ scope: 'shot', id: candidate.id, name: candidate.name })
+        useLayout.getState().openDialog('history')
+      },
+    },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: 'Delete shot',
+      danger: true,
+      onSelect: async () => {
+        if (!confirm(`Delete “${candidate.name}” and its steps?`)) return
+        await api.shots.remove(project.id, candidate.id)
+        setShot(null)
+        invalidate()
+      },
+    },
+  ]
+
   return (
     <div
       className="grid h-full gap-2 p-2"
@@ -123,6 +189,10 @@ export function ShotsPage() {
                 <button
                   key={candidate.id}
                   onClick={() => setShot(candidate.id)}
+                  onContextMenu={(event) => {
+                    setShot(candidate.id)
+                    contextMenu.open(event, shotMenu(candidate))
+                  }}
                   className={cx(
                     'flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-xs transition-colors',
                     candidate.id === shot?.id
@@ -233,6 +303,7 @@ export function ShotsPage() {
         )}
       </div>
       )}
+      <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
     </div>
   )
 }

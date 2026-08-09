@@ -13,6 +13,7 @@ import { api, ApiError } from '@/api/client'
 import type { Project } from '@/api/types'
 import { useLayout } from '@/store/layout'
 import { COMMANDS, MENUS, formatShortcut } from './commands'
+import { HistoryDialog } from '@/features/history/HistoryDialog'
 import {
   Badge, Button, Callout, Checkbox, Field, Modal, Spinner, TextArea, TextInput, cx, useToast,
 } from '@/components/ui'
@@ -37,6 +38,7 @@ export function AppDialogs() {
       <PluginsDialog open={dialog === 'plugins'} onClose={close} project={project ?? null} />
       <BuildPluginDialog open={dialog === 'buildPlugin'} onClose={close} project={project ?? null} />
       <ExportProjectDialog open={dialog === 'exportProject'} onClose={close} project={project ?? null} />
+      <HistoryDialog />
     </>
   )
 }

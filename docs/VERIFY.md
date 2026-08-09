@@ -16,9 +16,11 @@ cd frontend && npm run typecheck && npx vitest run
 | `tests/test_api.py` | the whole API surface, bridge, timeline, render | fake ComfyUI |
 | `tests/nodepack/` | node registration, tensor round-trips, path safety | ComfyUI's own venv |
 | `frontend/src/lib/*.test.ts` | kind compatibility, formatting | nothing |
-| `tests/test_menu_features.py` | undo/redo history, plugin build/install/apply | fake ComfyUI |
+| `tests/test_menu_features.py` | version log, diffing, element restore, plugins, node size | fake ComfyUI |
 | `scripts/ui_smoke.py` | the browser: canvas edges, previews, timeline, settings | a running app |
 | `scripts/ui_menus.py` | the menus: shortcuts, undo/redo, panel toggles, dialogs | a running app |
+| `scripts/ui_features.py` | node resize, context menus, history panel and element restore | a running app |
+| `scripts/ui_dismiss.py` | menus close on a click elsewhere, including surfaces that swallow mousedown | a running app |
 
 The fake ComfyUI (`tests/fixtures/fake_comfy.py`) replays ComfyUI 0.24.1's real event ordering, including
 the detail the runner depends on: `execution_success` arrives *before* history is written, and the
@@ -38,8 +40,8 @@ make backend
 .venv/bin/python scripts/ui_smoke.py
 ```
 
-`scripts/ui_smoke.py` needs a project that already has a run; create one through the UI first, or use the
-API walkthrough below.
+Each browser script creates its own scratch project (running it against ComfyUI where needed) and deletes it
+afterwards, so they are repeatable and never touch your real work.
 
 ## Manual checklist
 
@@ -97,6 +99,46 @@ API walkthrough below.
 - [ ] Applying twice does not produce two workflows with the same name.
 - [ ] Uninstalling a plugin leaves projects that used it untouched.
 
+### Node resize
+- [ ] Selecting a step shows resize handles at its corners and edges.
+- [ ] Dragging a corner resizes it; the size persists and survives a reload.
+- [ ] A resized node's preview grows with it; its ports scroll rather than overflowing.
+- [ ] **Reset size** in the node's right-click menu returns it to sizing by content.
+
+### Right-click menus
+- [ ] Right-clicking a **step** offers run, copy/cut/duplicate, enable/disable, rename, reset size, open in
+      ComfyUI and delete.
+- [ ] Right-clicking **empty canvas** offers Add step (listing the project's workflows), paste, select all,
+      fit and arrange.
+- [ ] Right-clicking a **link** offers Disconnect.
+- [ ] Right-clicking a **shot**, **workflow**, **clip**, **track** or **project card** each offers actions
+      relevant to that thing.
+- [ ] A menu opened near the bottom or right edge flips to stay fully on screen.
+- [ ] Escape, a left-click elsewhere, or a second right-click closes it — including a click on the
+      canvas background, another node, or a timeline clip, all of which stop mousedown propagating.
+- [ ] Right-clicking somewhere else while a menu is open shows the *new* menu, not nothing.
+
+### Subgraphs
+- [ ] Import a workflow containing a subgraph (`From ComfyUI` → pick one). It reports how many nodes it
+      expanded into and how many parameters it found.
+- [ ] Its promoted inputs appear in the inspector grouped under the subgraph's name, with sliders for
+      bounded numbers and real dropdowns for model pickers.
+- [ ] Changing a promoted value that drives more than one input (typically `width`) updates every one of
+      them — check the submitted graph, or that the render actually changes size.
+- [ ] A promoted input the parent workflow wired something into does *not* appear as a parameter.
+- [ ] Nested subgraphs work: ids read `outer:inner:node`.
+
+### Versioning
+- [ ] Every edit appears in **Edit → History…** described in plain language.
+- [ ] Moving or resizing a node is hidden until **Include moves and resizes** is ticked.
+- [ ] Expanding a version lists its individual changes.
+- [ ] **Restore** on a version rolls the project back, and <kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes the rollback.
+- [ ] A step's **History** tab lists only that step's changes; **Restore** there reverts only that step and
+      leaves the rest of the project untouched.
+- [ ] **Save a version…** names a checkpoint; it stays visible under **Named versions only**.
+- [ ] Right-clicking a shot offers its own version history, including edits to the steps inside it.
+- [ ] History survives restarting the server.
+
 ### Settings
 - [ ] **Test** reports ComfyUI version, GPU and node-pack status.
 - [ ] For a local backend without the pack, **Install** creates the symlink and says a restart is needed.
@@ -104,13 +146,14 @@ API walkthrough below.
 
 ## Known limitations
 
-- **Subgraphs** cannot be converted by `graph_convert.py`. Import such a workflow through
-  "Open in ComfyUI" → "Save to ComfyWebStudio" so ComfyUI performs the conversion. The UI warns when this
-  applies.
+- **Subgraphs** are flattened and their promoted inputs become parameters. What is *not* exposed is any
+  inner widget the subgraph's author chose not to promote — open it in ComfyUI and promote it there, or use
+  "Expose a node parameter" on the flattened node.
 - **Remote backends** need the node pack installed there to chain anything other than images —
   `POST /upload/image` only accepts images.
 - ComfyUI must be **restarted** after installing the node pack; packs are imported once at startup.
-- **Undo history is in memory**, bounded to 50 steps per project, and is cleared when the server restarts.
-  Run results are never undone — they live in `runs/` and are append-only.
+- **Version history is bounded** to 500 versions per project; the oldest unnamed ones are pruned, and named
+  checkpoints are always kept. It lives in `<project>/history/` and is excluded from exports unless you ask
+  for it. Run results are never affected by a restore — they live in `runs/` and are append-only.
 - **Plugins contain content, not code.** A plugin can carry workflows and shot templates; it deliberately
   cannot execute anything, so installing one someone sent you is safe.

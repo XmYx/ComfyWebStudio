@@ -44,6 +44,20 @@ _TYPE_TO_KIND = {
     "BOOLEAN": "boolean",
 }
 
+#: ComfyUI 0.24 emits combos two ways: the legacy ``[[...options...], {}]`` and the newer
+#: ``["COMBO", {"options": [...]}]``. Both appear in the same ``/object_info`` response — model pickers use
+#: the first, sampler and scheduler pickers the second — so both have to be understood.
+COMBO_TYPE = "COMBO"
+
+
+def combo_options(raw_type: Any, options: dict[str, Any]) -> list[str] | None:
+    """Option list for a combo input, whichever encoding it uses."""
+    if isinstance(raw_type, list):
+        return [str(c) for c in raw_type]
+    if str(raw_type).upper() == COMBO_TYPE:
+        return [str(c) for c in options.get("options") or []]
+    return None
+
 
 class ObjectInfoCache:
     """Per-backend cache of node schemas."""
@@ -114,8 +128,8 @@ def _widget_from_definition(name: str, definition: Any, *, required: bool) -> Wi
     if options.get("forceInput"):
         return None
 
-    if isinstance(raw_type, list):
-        choices = [str(c) for c in raw_type]
+    choices = combo_options(raw_type, options)
+    if choices is not None:
         return WidgetSpec(
             name=name,
             kind="choice",

@@ -303,6 +303,37 @@ export const COMMANDS: Command[] = [
     run: () => useLayout.getState().canvas?.selectAll(),
   },
   {
+    id: 'edit.history',
+    label: 'History…',
+    shortcut: 'Mod+H',
+    enabled: hasProject,
+    run: () => {
+      useStudio.getState().setHistoryTarget(null)
+      useLayout.getState().openDialog('history')
+    },
+  },
+  {
+    id: 'edit.saveVersion',
+    label: 'Save a Named Version…',
+    enabled: hasProject,
+    run: async (ctx) => {
+      const label = prompt('Name this version', '')
+      if (!label) return
+      await guard(ctx, () => api.versions.tag(ctx.project!.id, label), `Saved version “${label}”.`)
+    },
+  },
+  {
+    id: 'edit.stepHistory',
+    label: 'Show This Step’s History…',
+    enabled: hasStep,
+    run: (ctx) => {
+      useStudio.getState().setHistoryTarget({
+        scope: 'step', id: ctx.step!.id, name: ctx.step!.name,
+      })
+      useLayout.getState().openDialog('history')
+    },
+  },
+  {
     id: 'edit.settings',
     label: 'Preferences…',
     shortcut: 'Mod+,',
@@ -496,6 +527,10 @@ export const MENUS: Menu[] = [
       sep(),
       cmd('edit.delete'),
       cmd('edit.selectAll'),
+      sep(),
+      cmd('edit.history'),
+      cmd('edit.stepHistory'),
+      cmd('edit.saveVersion'),
       sep(),
       cmd('edit.settings'),
     ],

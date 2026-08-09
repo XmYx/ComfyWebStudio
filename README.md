@@ -47,6 +47,9 @@ port, or `--setup` to install dependencies and stop.
 Then, in **Settings → ComfyUI backends**, point it at your ComfyUI and press **Install** to add the node
 pack (ComfyUI needs a restart afterwards).
 
+Workflows built from **subgraphs** work as they are: the inputs a subgraph promotes become editable
+parameters automatically, so you get the author's intended knobs without opening it up.
+
 <details>
 <summary>Using make instead</summary>
 
@@ -63,11 +66,16 @@ make test           # every test suite
 | Menu | What it covers |
 |---|---|
 | **File** | New / open / save / duplicate a project, import workflows from ComfyUI or a file, import media, import and export projects, export a plugin |
-| **Edit** | Undo and redo, cut / copy / paste steps and clips, duplicate, delete, select all, preferences |
+| **Edit** | Undo and redo, cut / copy / paste steps and clips, duplicate, delete, select all, history, named versions, preferences |
 | **Window** | Show or hide the side panels, zoom and fit the graph, jump between Shots, Timeline and Settings |
 | **Plugins** | Install, enable, apply and export reusable workflow + shot packs |
 | **Help** | Keyboard shortcuts, documentation, open ComfyUI, about |
 
-Press <kbd>Ctrl</kbd>+<kbd>/</kbd> for the full shortcut list.
+Press <kbd>Ctrl</kbd>+<kbd>/</kbd> for the full shortcut list, and **right-click almost anything** — steps,
+the canvas, links, shots, workflows, clips, tracks and project cards all have their own menus.
+
+Every edit is recorded. <kbd>Ctrl</kbd>+<kbd>H</kbd> opens the history: browse what changed, name a version
+to come back to, roll the whole project back, or restore just one step from an earlier point without
+touching anything else.
 
 See `docs/ARCHITECTURE.md` for how it works and `docs/VERIFY.md` for the verification checklist.

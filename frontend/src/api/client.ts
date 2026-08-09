@@ -8,7 +8,7 @@
 import type {
   AppSettings, Asset, BackendConfig, BackendStatus, BindableWidget, Clip, GraphReport,
   Link, PluginInfo, Project, ProjectSummary, ResolvedTimeline, Run, RunMode, Shot, Step, StepRun,
-  Timeline, Track, TrackKind, WorkflowRef,
+  Timeline, Track, TrackKind, Version, WorkflowRef,
 } from './types'
 
 export class ApiError extends Error {
@@ -180,6 +180,7 @@ export const api = {
       workflowId: string,
       extra?: {
         ui_pos?: { x: number; y: number }
+        ui_size?: { w: number; h: number }
         name?: string
         param_overrides?: Record<string, unknown>
         seed_mode?: string | null
@@ -296,6 +297,47 @@ export const api = {
       request<Array<{ name: string; path: string; size: number; modified: number }>>(
         `/api/projects/${projectId}/timeline/renders`,
       ),
+  },
+
+  // -- versions ------------------------------------------------------------------------------------
+  versions: {
+    list: (
+      projectId: string,
+      opts: { scope?: string; targetId?: string; includeLayout?: boolean; namedOnly?: boolean; limit?: number } = {},
+    ) => {
+      const params = new URLSearchParams()
+      if (opts.scope) params.set('scope', opts.scope)
+      if (opts.targetId) params.set('target_id', opts.targetId)
+      if (opts.includeLayout) params.set('include_layout', 'true')
+      if (opts.namedOnly) params.set('named_only', 'true')
+      params.set('limit', String(opts.limit ?? 100))
+      return request<Version[]>(`/api/projects/${projectId}/versions?${params}`)
+    },
+    get: (projectId: string, versionId: string) =>
+      request<Version>(`/api/projects/${projectId}/versions/${versionId}`),
+    tag: (projectId: string, label: string) =>
+      request<Version>(`/api/projects/${projectId}/versions`, { method: 'POST', body: json({ label }) }),
+    relabel: (projectId: string, versionId: string, label: string | null) =>
+      request<Version>(`/api/projects/${projectId}/versions/${versionId}`, {
+        method: 'PATCH',
+        body: json({ label }),
+      }),
+    restore: (projectId: string, versionId: string) =>
+      request<Project>(`/api/projects/${projectId}/versions/${versionId}/restore`, { method: 'POST' }),
+    restoreElement: (projectId: string, versionId: string, scope: string, targetId: string) =>
+      request<Project>(`/api/projects/${projectId}/versions/${versionId}/restore-element`, {
+        method: 'POST',
+        body: json({ scope, target_id: targetId }),
+      }),
+    clear: (projectId: string) =>
+      request<void>(`/api/projects/${projectId}/versions`, { method: 'DELETE' }),
+    forShot: (projectId: string, shotId: string) =>
+      request<Version[]>(`/api/projects/${projectId}/shots/${shotId}/versions`),
+    tagShot: (projectId: string, shotId: string, label: string) =>
+      request<Version>(`/api/projects/${projectId}/shots/${shotId}/versions`, {
+        method: 'POST',
+        body: json({ label }),
+      }),
   },
 
   // -- plugins -------------------------------------------------------------------------------------

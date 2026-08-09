@@ -56,6 +56,8 @@ export interface WorkflowRef {
 }
 
 export interface Vec2 { x: number; y: number }
+/** Canvas size of a node. Zero means "size to content". */
+export interface Size { w: number; h: number }
 
 export interface Step {
   id: string
@@ -67,6 +69,7 @@ export interface Step {
   backend_id: string | null
   notes: string
   ui_pos: Vec2
+  ui_size: Size
 }
 
 export interface Link {
@@ -320,4 +323,24 @@ export interface PluginInfo {
   enabled: boolean
   workflows: Array<{ id: string; name: string; has_ui_graph: boolean; ports: PortSpec[] }>
   shot_templates: Array<{ name: string; steps: unknown[]; links: unknown[] }>
+}
+
+export interface VersionChange {
+  scope: string
+  target_id: string
+  target_name: string
+  action: string
+  summary: string
+  detail: Record<string, any>
+}
+
+export interface Version {
+  id: string
+  ts: string
+  snapshot: string
+  label: string | null
+  summary: string
+  scopes: string[]
+  targets: string[]
+  changes: VersionChange[]
 }

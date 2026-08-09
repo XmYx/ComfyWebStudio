@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useStudio as useStudioStore } from '@/store/studio'
 
 import { api, ApiError } from '@/api/client'
 import type { Project, Shot, WorkflowRef } from '@/api/types'
@@ -8,6 +9,8 @@ import { relativeTime } from '@/lib/format'
 import { Badge, Button, Panel, PanelHeader, Spinner, useToast } from '@/components/ui'
 import { ComfyWorkflowBrowser } from './ComfyWorkflowBrowser'
 import { useLayout } from '@/store/layout'
+import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
+import { useCommandContext } from '@/features/menu/useCommandContext'
 
 interface Props {
   project: Project
@@ -26,6 +29,53 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
   const openDialog = useLayout((s) => s.openDialog)
   const closeDialog = useLayout((s) => s.closeDialog)
   const browsing = dialog === 'comfyBrowser'
+  const commandContext = useCommandContext()
+  const contextMenu = useContextMenu()
+
+  const workflowMenu = (workflow: WorkflowRef): MenuItem[] => [
+    { type: 'header', label: workflow.name },
+    { type: 'action', label: 'Add as a step', disabled: !shot, onSelect: () => void addStep(workflow) },
+    { type: 'separator' },
+    { type: 'action', label: 'Open in ComfyUI', onSelect: () => void openInComfy(workflow) },
+    {
+      type: 'action',
+      label: 'Re-scan for ports',
+      onSelect: async () => {
+        try {
+          await api.workflows.rediscover(project.id, workflow.id)
+          queryClient.invalidateQueries({ queryKey: ['project', project.id] })
+          toast.push('ok', 'Re-scanned.')
+        } catch (error) {
+          toast.push('bad', (error as ApiError).message)
+        }
+      },
+    },
+    {
+      type: 'action',
+      label: 'Show history…',
+      onSelect: () => {
+        useStudioStore.getState().setHistoryTarget({
+          scope: 'workflow', id: workflow.id, name: workflow.name,
+        })
+        openDialog('history')
+      },
+    },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: 'Remove from project',
+      danger: true,
+      onSelect: async () => {
+        if (!confirm(`Remove “${workflow.name}” from this project?`)) return
+        try {
+          await api.workflows.remove(project.id, workflow.id)
+          queryClient.invalidateQueries({ queryKey: ['project', project.id] })
+        } catch (error) {
+          toast.push('bad', (error as ApiError).message)
+        }
+      },
+    },
+  ]
 
   const upload = useMutation({
     mutationFn: (file: File) => api.workflows.upload(project.id, file),
@@ -119,6 +169,7 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
             {workflows.map((workflow) => (
               <div
                 key={workflow.id}
+                onContextMenu={(event) => contextMenu.open(event, workflowMenu(workflow))}
                 className="rounded-md border border-[var(--color-edge)] bg-[var(--color-surface)] p-2"
               >
                 <div className="flex items-start justify-between gap-2">
@@ -213,6 +264,7 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
         onClose={closeDialog}
         projectId={project.id}
       />
+      <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
     </Panel>
   )
 }

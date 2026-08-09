@@ -1,4 +1,4 @@
-"""Plugin management, and undo/redo — the endpoints behind the File, Edit and Plugins menus."""
+"""Plugin management — the endpoints behind the Plugins menu."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from pydantic import BaseModel
 
 from ..core.errors import NotFound, ValidationFailed
 from ..core.ids import slugify
-from ..core.models import Project
 from .deps import ProjectDep, StateDep
 
 router = APIRouter(prefix="/api", tags=["plugins"])
@@ -30,35 +29,6 @@ class BuildPluginRequest(BaseModel):
 class ApplyPluginRequest(BaseModel):
     project_id: str
     include_shots: bool = True
-
-
-# -- undo / redo ---------------------------------------------------------------------------------------
-
-
-@router.get("/projects/{project_id}/history")
-def history_state(state: StateDep, project: ProjectDep) -> dict:
-    """Whether Undo and Redo should be enabled in the Edit menu."""
-    return state.store.history.depths(project.id)
-
-
-@router.post("/projects/{project_id}/undo")
-def undo(state: StateDep, project: ProjectDep) -> Project:
-    snapshot = state.store.history.undo(project.id, project.model_dump(mode="json"))
-    if snapshot is None:
-        raise ValidationFailed("There is nothing to undo.")
-    restored = state.store.restore(snapshot)
-    state.events.emit("project.changed", project_id=project.id, data={"action": "undo"})
-    return restored
-
-
-@router.post("/projects/{project_id}/redo")
-def redo(state: StateDep, project: ProjectDep) -> Project:
-    snapshot = state.store.history.redo(project.id, project.model_dump(mode="json"))
-    if snapshot is None:
-        raise ValidationFailed("There is nothing to redo.")
-    restored = state.store.restore(snapshot)
-    state.events.emit("project.changed", project_id=project.id, data={"action": "redo"})
-    return restored
 
 
 # -- plugins -------------------------------------------------------------------------------------------

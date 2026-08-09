@@ -1,14 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useMatch } from 'react-router-dom'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
-import { api } from '@/api/client'
-import { useStudio } from '@/store/studio'
-import { cx, useToast } from '@/components/ui'
+import { cx } from '@/components/ui'
 import {
   COMMANDS, COMMANDS_BY_ID, MENUS, formatShortcut, matchesShortcut,
   type CommandContext, type MenuEntry,
 } from './commands'
+import { useCommandContext } from './useCommandContext'
 
 /**
  * The application menu bar.
@@ -17,48 +14,9 @@ import {
  * disagree about whether they are available. Shortcuts are bound here too, from the same list.
  */
 export function MenuBar() {
-  const navigate = useNavigate()
-  const queryClient = useQueryClient()
-  const toast = useToast()
-  const match = useMatch('/p/:projectId/*')
-  const projectId = match?.params.projectId
-
   const [openMenu, setOpenMenu] = useState<string | null>(null)
   const barRef = useRef<HTMLDivElement>(null)
-
-  const shotId = useStudio((s) => s.shotId)
-  const selectedStepId = useStudio((s) => s.selectedStepId)
-
-  const { data: project } = useQuery({
-    queryKey: ['project', projectId],
-    queryFn: () => api.projects.get(projectId!),
-    enabled: Boolean(projectId),
-  })
-
-  const { data: history } = useQuery({
-    queryKey: ['history', projectId, project?.modified],
-    queryFn: () => api.projects.history(projectId!),
-    enabled: Boolean(projectId),
-  })
-
-  const context = useMemo<CommandContext>(() => {
-    const shot = project?.shots.find((s) => s.id === shotId) ?? project?.shots[0] ?? null
-    return {
-      project: project ?? null,
-      shot,
-      step: shot?.steps.find((s) => s.id === selectedStepId) ?? null,
-      navigate,
-      queryClient,
-      toast: toast.push,
-      history: history ?? { undo: 0, redo: 0 },
-      refresh: () => {
-        queryClient.invalidateQueries({ queryKey: ['project', projectId] })
-        queryClient.invalidateQueries({ queryKey: ['history', projectId] })
-        queryClient.invalidateQueries({ queryKey: ['projects'] })
-      },
-    }
-  }, [project, shotId, selectedStepId, navigate, queryClient, toast, history, projectId])
-
+  const context = useCommandContext()
   const contextRef = useRef(context)
   contextRef.current = context
 
@@ -104,14 +62,16 @@ export function MenuBar() {
 
   useEffect(() => {
     if (!openMenu) return
-    const onClick = (event: MouseEvent) => {
+    // Capture phase: the canvas and the timeline stop mousedown from propagating, so a bubble-phase
+    // listener here would never see a click on them and the dropdown would stay open.
+    const onMouseDown = (event: MouseEvent) => {
       if (!barRef.current?.contains(event.target as Node)) setOpenMenu(null)
     }
     const onKey = (event: KeyboardEvent) => event.key === 'Escape' && setOpenMenu(null)
-    window.addEventListener('mousedown', onClick)
+    window.addEventListener('mousedown', onMouseDown, true)
     window.addEventListener('keydown', onKey)
     return () => {
-      window.removeEventListener('mousedown', onClick)
+      window.removeEventListener('mousedown', onMouseDown, true)
       window.removeEventListener('keydown', onKey)
     }
   }, [openMenu])

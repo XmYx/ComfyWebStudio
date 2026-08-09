@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from ..core.errors import NotFound
 from ..core.graph import validate_new_link, validate_shot
-from ..core.models import Link, Shot, Step, Vec2
+from ..core.models import Link, Shot, Size, Step, Vec2
 from .deps import ProjectDep, ShotDep, StateDep, find_step
 
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["shots"])
@@ -30,6 +30,7 @@ class CreateStepRequest(BaseModel):
     workflow_id: str
     name: str | None = None
     ui_pos: Vec2 | None = None
+    ui_size: Size | None = None
     # Supplied when duplicating or pasting, so the whole operation is one save and therefore one
     # undo step — a user pressing Ctrl+Z after a paste expects the paste to disappear, not half of it.
     param_overrides: dict | None = None
@@ -44,6 +45,7 @@ class UpdateStepRequest(BaseModel):
     backend_id: str | None = None
     notes: str | None = None
     ui_pos: Vec2 | None = None
+    ui_size: Size | None = None
 
 
 class CreateLinkRequest(BaseModel):
@@ -145,6 +147,7 @@ def create_step(
         name=body.name or workflow.name,
         workflow_id=workflow.id,
         ui_pos=body.ui_pos or Vec2(x=40 + 260 * len(shot.steps), y=80),
+        ui_size=body.ui_size or Size(),
         param_overrides=dict(body.param_overrides or {}),
         seed_mode=body.seed_mode,  # type: ignore[arg-type]
     )
@@ -159,14 +162,16 @@ def update_step(
     state: StateDep, project: ProjectDep, step_id: str, body: UpdateStepRequest
 ) -> Step:
     _, step = find_step(project, step_id)
-    updates = body.model_dump(exclude_none=True)
 
     # Merge parameter overrides rather than replacing: the UI sends only what changed.
-    overrides = updates.pop("param_overrides", None)
-    if overrides is not None:
-        step.param_overrides.update(overrides)
-    for field, value in updates.items():
-        setattr(step, field, value)
+    if body.param_overrides is not None:
+        step.param_overrides.update(body.param_overrides)
+
+    # Assign the validated models themselves, not their dumped dicts, so the step keeps its types.
+    for field in ("name", "enabled", "seed_mode", "backend_id", "notes", "ui_pos", "ui_size"):
+        value = getattr(body, field)
+        if value is not None:
+            setattr(step, field, value)
 
     state.store.save(project)
     return step

@@ -115,8 +115,26 @@ that in the browser. Both gaps are filled by `comfy_nodes/web/js/webstudio.js`:
   `/api/bridge/workflow`. Because ComfyUI's own converter produced the API prompt, the conversion is exact.
 
 `comfy/graph_convert.py` is the fallback for a ComfyUI without our pack. It handles widget ordering,
-`control_after_generate`, links, reroutes, bypass and mute — and **refuses subgraphs** with a warning rather
-than silently mis-converting them.
+`control_after_generate`, links, reroutes, bypass, mute and subgraphs.
+
+## Subgraphs
+
+A ComfyUI subgraph is a reusable group stored once in `definitions.subgraphs` and instantiated by nodes
+whose `type` is its UUID. `comfy/subgraphs.py` does two things with them.
+
+**Flattening.** Instances expand recursively into plain nodes, with links resolved across every boundary —
+downwards into an instance's output, upwards out of a promoted input. Node ids follow ComfyUI's own
+execution-id convention, `<instance>:<inner>`, nesting as `98:50:22`. Matching it is what lets a workflow
+converted here and the same workflow flattened by ComfyUI address their nodes identically, so the parameter
+map is valid either way.
+
+**Promotion mapping.** A subgraph's `inputs` are the knobs whoever built it chose to expose, so they become
+editable parameters (`source: "subgraph"`), grouped under the subgraph's name and typed from the node they
+feed — a `COMBO` slot becomes a real dropdown with the live option list rather than a text box.
+
+One promoted input often drives *several* inner inputs: `width` typically sets both the latent size and the
+scheduler. `ParamSpec.targets` therefore holds a list, and injection writes the value to all of them. A
+promoted slot the parent has wired something into is a connection, not a knob, and is skipped.
 
 ## Events
 
@@ -137,16 +155,42 @@ shortcut, when it is `enabled`, and (for toggles) whether it is `checked`. The m
 handler and any future command palette all render from that list, so a menu item and its shortcut cannot
 drift apart.
 
-Two supporting pieces on the backend:
+Right-click menus (`components/ContextMenu.tsx`) read the same registry, mixing registry commands with
+actions specific to whatever was clicked. That is why Copy behaves identically whether it came from the Edit
+menu, Ctrl+C, or right-clicking a node.
 
-* **Undo/redo** (`core/history.py`) snapshots the project inside `ProjectStore.save`, so every mutation is
-  undoable without each endpoint opting in. History is in memory and bounded — undo that survived a restart
-  would be surprising, and could resurrect a state the user deliberately moved past. Operations that should
-  be one undo step are made one *save*: creating a step accepts its name and parameters, so pasting is a
-  single request and therefore a single Ctrl+Z.
-* **Plugins** (`core/plugins.py`) package workflows and shot templates into a `.cwsplugin` zip. Applying one
-  copies its content into a project with fresh ids, so the plugin stays a template. Plugins are content
-  only, never executable code — otherwise "load a plugin someone sent you" would be a dangerous action.
+**Plugins** (`core/plugins.py`) package workflows and shot templates into a `.cwsplugin` zip. Applying one
+copies its content into a project with fresh ids, so the plugin stays a template. Plugins are content only,
+never executable code — otherwise "load a plugin someone sent you" would be a dangerous action.
+
+## Versioning
+
+Every call to `ProjectStore.save` appends a **version**: a gzipped, content-addressed snapshot plus a
+description of what changed. Snapshotting there rather than per-endpoint means no mutation can be missed.
+
+    <project>/history/
+        log.jsonl                 one version per line
+        snapshots/<sha>.json.gz   deduplicated by content
+
+`core/diffing.py` turns each pair of snapshots into readable changes — "Set steps on Sampler to 30",
+"Connected Generate.image → Upscale.image" — each tagged with a **scope** and a **target id**. Those two
+fields are what make the whole feature work:
+
+* **Global history** is the log.
+* **Element history** is the log filtered by `target_id`, which is what the step inspector's History tab and
+  the shot's own history show.
+* **Undo/redo** is a pointer walking the log, so it now survives a restart.
+
+Restoring comes in two forms. A full restore rewrites the project; **element restore** merges just one shot,
+step, track or workflow out of an old snapshot into the current project, leaving everything else alone —
+"put this step's parameters back to how they were" without reverting anyone else's work. Restoring is itself
+a recorded edit, so it can be undone.
+
+Layout-only changes (moves, resizes) are recorded but flagged, and hidden from the history list by default
+so real edits are not buried under drag noise. Named versions are user checkpoints and are never pruned.
+
+Operations that ought to be one undo step are made one *save*: creating a step accepts its name, size and
+parameters, so pasting is a single request and a single Ctrl+Z.
 
 ## Extension points
 
@@ -156,4 +200,6 @@ Two supporting pieces on the backend:
 | A ComfyUI transport | subclass `ComfyBackend`, call `register_backend` |
 | An API surface | a module in `api/`, listed in `api/__init__.py` |
 | A preview or widget | one entry in the frontend's `RENDERERS` / `WIDGETS` maps |
-| A menu item or shortcut | one entry in `COMMANDS`, referenced from `MENUS` |
+| A menu item or shortcut | one entry in `COMMANDS`, referenced from `MENUS` or any context menu |
+| A tracked change | one branch in `core/diffing.py` |
+| A parameter source | emit `ParamSpec`s from a new function; the form renders them unchanged |
