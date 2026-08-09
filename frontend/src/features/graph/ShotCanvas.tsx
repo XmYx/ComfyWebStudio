@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   applyNodeChanges,
   Background, BackgroundVariant, Controls, ReactFlow, ReactFlowProvider, useNodesState, useReactFlow,
@@ -6,7 +7,7 @@ import {
 } from '@xyflow/react'
 
 import { api, ApiError } from '@/api/client'
-import type { PortKind, Project, Shot, ValueNodeKind } from '@/api/types'
+import type { PlacedTemplate, PortKind, Project, Shot, ValueNodeKind } from '@/api/types'
 import { VALUE_PORT } from '@/api/types'
 import { KIND_COLOR, canConnect } from '@/lib/kinds'
 import { useStudio } from '@/store/studio'
@@ -16,16 +17,19 @@ import { ContextMenu, useContextMenu, type MenuItem } from '@/components/Context
 import { useCommandContext } from '@/features/menu/useCommandContext'
 import { StepNode, type StepNodeData } from './StepNode'
 import { ValueNodeCard, VALUE_NODE_LABELS, type ValueNodeData } from './ValueNodeCard'
+import { TemplateNode, type TemplateNodeData } from './TemplateNode'
+import { belongsToInstance, outputsForInstance } from '@/lib/instances'
 
-const NODE_TYPES = { step: StepNode, value: ValueNodeCard }
+const NODE_TYPES = { step: StepNode, value: ValueNodeCard, template: TemplateNode }
 
 /** Offered by the "Add value node" menu, in the order they appear there. */
 const VALUE_NODE_KINDS: ValueNodeKind[] = ['string', 'int', 'float', 'boolean', 'media']
 
 /** Shared so a step with no links does not get a fresh Set on every render, remounting its node. */
 const EMPTY_KEYS: Set<string> = new Set()
+const EMPTY_PREVIEWS: Record<string, string> = {}
 
-type CanvasNodeData = StepNodeData | ValueNodeData
+type CanvasNodeData = StepNodeData | ValueNodeData | TemplateNodeData
 
 /** What a media value node offers. Mirrors `ValueNode.output_kind` in core/models.py. */
 function valueNodeKind(
@@ -43,6 +47,7 @@ function valueNodeKind(
  */
 function sourceKind(
   project: Project, shot: Shot, nodeId: string | null, portKey: string | null | undefined,
+  placed?: Map<string, PlacedTemplate>,
 ): PortKind | undefined {
   const step = shot.steps.find((s) => s.id === nodeId)
   if (step) {
@@ -53,7 +58,9 @@ function sourceKind(
   if (node && portKey === VALUE_PORT) {
     return valueNodeKind(project, node.kind, node.asset_id, node.media_kind)
   }
-  return undefined
+  return placed?.get(nodeId ?? '')?.ports?.find(
+    (p) => p.key === portKey && p.direction === 'out',
+  )?.kind
 }
 
 interface Props {
@@ -84,8 +91,60 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
   const liveSteps = useStudio((s) => s.liveSteps)
   const selectedStepId = useStudio((s) => s.selectedStepId)
   const selectStep = useStudio((s) => s.selectStep)
+  const selectInstance = useStudio((s) => s.selectInstance)
+  const openInstance = useStudio((s) => s.openInstance)
 
   const assets = useMemo(() => Object.values(project.assets), [project.assets])
+
+  // Every placed template's surface in one request. Keyed on the shot's own modified stamp so placing,
+  // syncing or editing a template refetches, but panning the canvas does not.
+  const { data: placedList } = useQuery({
+    queryKey: ['placed', project.id, shot.id, project.modified],
+    queryFn: () => api.instances.placed(project.id, shot.id),
+    enabled: shot.instances.length > 0,
+  })
+  const placed = useMemo(
+    () => new Map((placedList ?? []).map((entry) => [entry.instance_id, entry])),
+    [placedList],
+  )
+
+  // The library, for the "Place template" menu. Shared across projects, so it is not keyed on this one.
+  const { data: templates } = useQuery({ queryKey: ['templates'], queryFn: api.templates.list })
+
+  const syncInstance = useCallback(
+    async (instanceId: string) => {
+      try {
+        const result = await api.instances.sync(project.id, instanceId)
+        toast.push('ok', result.changes.length ? result.changes.join('; ') : 'Already up to date.')
+        onChanged()
+      } catch (error) {
+        toast.push('bad', (error as ApiError).message)
+      }
+    },
+    [project.id, onChanged, toast],
+  )
+
+  // A run reports against the expanded steps, which carry the instance id as their prefix. Folding them
+  // back up is what lets the container node show progress for what is happening inside it.
+  const instanceLive = useMemo(() => {
+    const totals = new Map<string, { running: number; done: number; failed: number; progress: number }>()
+    for (const instance of shot.instances) {
+      const inner = Object.entries(liveSteps).filter(
+        ([stepId]) => belongsToInstance(stepId, instance.id),
+      )
+      if (!inner.length) continue
+      const running = inner.filter(([, s]) => s.status === 'running').length
+      const failed = inner.filter(([, s]) => s.status === 'error').length
+      const done = inner.filter(([, s]) => s.status === 'success' || s.status === 'cached').length
+      totals.set(instance.id, {
+        running,
+        done,
+        failed,
+        progress: inner.reduce((sum, [, s]) => sum + (s.progress ?? 0), 0) / inner.length,
+      })
+    }
+    return totals
+  }, [shot.instances, liveSteps])
 
   // Value nodes share the canvas with steps but are a different shape: they carry a constant and never
   // run, so they have their own node type and their own endpoints.
@@ -160,9 +219,51 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     [shot.steps, project, liveSteps, selectedStepId, linkedByStep, onRunStep, onChanged],
   )
 
+  // A run reports its artifacts against the expanded inner steps; the node shows promoted port names.
+  // Joining the two is what makes a template's result visible on the node that produced it.
+  const instancePreviews = useMemo(() => {
+    const byInstance = new Map<string, Record<string, string>>()
+    for (const instance of shot.instances) {
+      const thumbs: Record<string, string> = {}
+      for (const entry of outputsForInstance(instance, placed.get(instance.id)?.ports, liveSteps)) {
+        if (entry.artifact?.thumb) {
+          thumbs[entry.port.key] = api.media.url(project.id, entry.artifact.thumb)
+        }
+      }
+      if (Object.keys(thumbs).length) byInstance.set(instance.id, thumbs)
+    }
+    return byInstance
+  }, [shot.instances, placed, liveSteps, project.id])
+
+  const derivedInstances = useMemo<Node<TemplateNodeData>[]>(
+    () =>
+      shot.instances.map((instance) => ({
+        id: instance.id,
+        type: 'template',
+        position: { x: instance.ui_pos.x, y: instance.ui_pos.y },
+        ...(instance.ui_size?.w > 0 && instance.ui_size?.h > 0
+          ? { width: instance.ui_size.w, height: instance.ui_size.h }
+          : {}),
+        data: {
+          instance,
+          placed: placed.get(instance.id),
+          live: instanceLive.get(instance.id),
+          previews: instancePreviews.get(instance.id) ?? EMPTY_PREVIEWS,
+          linkedKeys: linkedByStep.get(instance.id) ?? EMPTY_KEYS,
+          onControlChange: async (instanceId: string, values: Record<string, unknown>) => {
+            await api.instances.update(project.id, instanceId, { param_overrides: values })
+            onChanged()
+          },
+          onSync: syncInstance,
+        },
+      })),
+    [shot.instances, placed, instanceLive, instancePreviews, linkedByStep, project.id, onChanged,
+     syncInstance],
+  )
+
   const derived = useMemo<Node<CanvasNodeData>[]>(
-    () => [...derivedSteps, ...derivedValueNodes],
-    [derivedSteps, derivedValueNodes],
+    () => [...derivedSteps, ...derivedValueNodes, ...derivedInstances],
+    [derivedSteps, derivedValueNodes, derivedInstances],
   )
 
   const [nodes, setNodes] = useNodesState<Node<CanvasNodeData>>(derived)
@@ -186,7 +287,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
   const edges = useMemo<Edge[]>(
     () =>
       shot.links.map((link) => {
-        const kind = sourceKind(project, shot, link.from_step, link.from_port)
+        const kind = sourceKind(project, shot, link.from_step, link.from_port, placed)
         return {
           id: link.id,
           source: link.from_step,
@@ -197,7 +298,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
           style: { stroke: kind ? KIND_COLOR[kind] : undefined, strokeWidth: 2 },
         }
       }),
-    [shot, project, liveSteps],
+    [shot, project, liveSteps, placed],
   )
 
   // Hand the Window menu a handle on this canvas, and take it back on unmount so a stale one cannot
@@ -215,21 +316,26 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
   const inputKindOf = useCallback(
     (stepId: string | null, portKey: string | null | undefined) => {
       const step = shot.steps.find((s) => s.id === stepId)
-      const workflow = step ? project.workflows[step.workflow_id] : undefined
-      return workflow?.ports.find((p) => p.key === portKey && p.direction === 'in')?.kind
+      if (step) {
+        const workflow = project.workflows[step.workflow_id]
+        return workflow?.ports.find((p) => p.key === portKey && p.direction === 'in')?.kind
+      }
+      return placed.get(stepId ?? '')?.ports?.find(
+        (p) => p.key === portKey && p.direction === 'in',
+      )?.kind
     },
-    [shot.steps, project.workflows],
+    [shot.steps, project.workflows, placed],
   )
 
   const isValidConnection = useCallback(
     (connection: Connection | Edge) => {
       if (connection.source === connection.target) return false
-      const from = sourceKind(project, shot, connection.source, connection.sourceHandle)
+      const from = sourceKind(project, shot, connection.source, connection.sourceHandle, placed)
       const to = inputKindOf(connection.target, connection.targetHandle)
       if (!from || !to) return false
       return canConnect(from, to)
     },
-    [project, shot, inputKindOf],
+    [project, shot, inputKindOf, placed],
   )
 
   const onConnect = useCallback(
@@ -264,11 +370,19 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     [project.id, shot.id, onChanged, toast],
   )
 
-  // Steps and value nodes live at different endpoints, so every canvas gesture has to know which it just
-  // moved, resized or deleted.
+  // Steps, value nodes and placed templates live at different endpoints, so every canvas gesture has to
+  // know which of the three it just moved, resized or deleted.
   const isValueNode = useCallback(
     (nodeId: string) => shot.nodes.some((n) => n.id === nodeId),
     [shot.nodes],
+  )
+  const isInstance = useCallback(
+    (nodeId: string) => shot.instances.some((i) => i.id === nodeId),
+    [shot.instances],
+  )
+  const endpointFor = useCallback(
+    (nodeId: string) => (isInstance(nodeId) ? api.instances : isValueNode(nodeId) ? api.nodes : api.steps),
+    [isInstance, isValueNode],
   )
 
   const onNodesChange = useCallback(
@@ -277,7 +391,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       setNodes((current) => applyNodeChanges(changes, current))
 
       for (const change of changes) {
-        const endpoint = 'id' in change && isValueNode(change.id) ? api.nodes : api.steps
+        const endpoint = 'id' in change ? endpointFor(change.id) : api.steps
 
         if (change.type === 'position' && change.dragging === false && change.position) {
           // Persist only on drag end: saving every intermediate position would hammer the API.
@@ -294,21 +408,22 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
             .then(onChanged)
         }
         if (change.type === 'select' && change.selected) {
-          // Only steps have an inspector; selecting a value node clears it rather than leaving the
+          // Only steps have an inspector; selecting anything else clears it rather than leaving the
           // previous step's parameters on screen next to a node they have nothing to do with.
-          selectStep(isValueNode(change.id) ? null : change.id)
+          if (isInstance(change.id)) selectInstance(change.id)
+          else if (isValueNode(change.id)) selectStep(null)
+          else selectStep(change.id)
         }
       }
     },
-    [project.id, selectStep, setNodes, onChanged, isValueNode],
+    [project.id, selectStep, selectInstance, setNodes, onChanged, isValueNode, isInstance, endpointFor],
   )
 
   const onNodesDelete = useCallback(
     async (deleted: Node[]) => {
       for (const node of deleted) {
         try {
-          if (isValueNode(node.id)) await api.nodes.remove(project.id, node.id)
-          else await api.steps.remove(project.id, node.id)
+          await endpointFor(node.id).remove(project.id, node.id)
         } catch (error) {
           toast.push('bad', (error as ApiError).message)
         }
@@ -316,7 +431,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       selectStep(null)
       onChanged()
     },
-    [project.id, onChanged, selectStep, toast, isValueNode],
+    [project.id, onChanged, selectStep, toast, endpointFor],
   )
 
   const commandContext = useCommandContext()
@@ -358,6 +473,26 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     [project.id, shot.id, flow, onChanged, toast],
   )
 
+  const placeTemplateItems = useCallback(
+    (event: React.MouseEvent): MenuItem[] =>
+      (templates ?? []).map((template) => ({
+        type: 'action' as const,
+        label: template.name,
+        onSelect: async () => {
+          try {
+            const at = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY })
+            await api.instances.place(project.id, shot.id, {
+              template_id: template.id, ui_pos: at,
+            })
+            onChanged()
+          } catch (error) {
+            toast.push('bad', (error as ApiError).message)
+          }
+        },
+      })),
+    [templates, project.id, shot.id, flow, onChanged, toast],
+  )
+
   const paneMenu = (event: React.MouseEvent): MenuItem[] => [
     { type: 'header', label: shot.name },
     {
@@ -367,6 +502,13 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       disabled: !Object.keys(project.workflows).length,
     },
     { type: 'submenu', label: 'Add value node', items: addValueNodeItems(event) },
+    {
+      type: 'submenu',
+      label: 'Place template',
+      items: placeTemplateItems(event),
+      disabled: !templates?.length,
+    },
+    { type: 'command', id: 'shot.saveAsTemplate' },
     { type: 'command', id: 'file.importWorkflowComfy' },
     { type: 'separator' },
     { type: 'command', id: 'edit.paste' },
@@ -478,6 +620,62 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     },
   ]
 
+  const instanceMenu = (instance: (typeof shot.instances)[number]): MenuItem[] => {
+    const surface = placed.get(instance.id)
+    return [
+      { type: 'header', label: instance.name || surface?.summary?.name || 'Template' },
+      {
+        type: 'action',
+        label: 'Update from template',
+        disabled: !surface?.stale,
+        onSelect: () => void syncInstance(instance.id),
+      },
+      {
+        type: 'action',
+        label: instance.enabled ? 'Disable' : 'Enable',
+        checked: instance.enabled,
+        onSelect: async () => {
+          await api.instances.update(project.id, instance.id, { enabled: !instance.enabled })
+          onChanged()
+        },
+      },
+      {
+        type: 'action',
+        label: 'Rename…',
+        onSelect: async () => {
+          const name = prompt('Name on this canvas', instance.name)
+          if (name !== null && name !== instance.name) {
+            await api.instances.update(project.id, instance.id, { name })
+            onChanged()
+          }
+        },
+      },
+      {
+        type: 'action',
+        label: 'Reset size',
+        disabled: !(instance.ui_size?.w > 0),
+        onSelect: async () => {
+          await api.instances.update(project.id, instance.id, { ui_size: { w: 0, h: 0 } })
+          onChanged()
+        },
+      },
+      { type: 'separator' },
+      {
+        type: 'action',
+        label: 'Remove from shot',
+        danger: true,
+        onSelect: async () => {
+          try {
+            await api.instances.remove(project.id, instance.id)
+            onChanged()
+          } catch (error) {
+            toast.push('bad', (error as ApiError).message)
+          }
+        },
+      },
+    ]
+  }
+
   const edgeMenu = (edgeId: string): MenuItem[] => {
     const link = shot.links.find((l) => l.id === edgeId)
     return [
@@ -515,7 +713,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     }
   }
 
-  if (!shot.steps.length && !shot.nodes.length) {
+  if (!shot.steps.length && !shot.nodes.length && !shot.instances.length) {
     return (
       <div
         className="h-full"
@@ -542,13 +740,27 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       onNodesDelete={onNodesDelete}
       isValidConnection={isValidConnection}
       onPaneClick={() => selectStep(null)}
-      onNodeClick={(_e, node) => selectStep(isValueNode(node.id) ? null : node.id)}
+      onNodeClick={(_e, node) => {
+        if (isInstance(node.id)) selectInstance(node.id)
+        else selectStep(isValueNode(node.id) ? null : node.id)
+      }}
+      // Double-clicking a placed template looks inside it, the way double-clicking a subgraph does in
+      // ComfyUI. Anything else keeps React Flow's own default.
+      onNodeDoubleClick={(_e, node) => {
+        if (isInstance(node.id)) openInstance(node.id)
+      }}
       onPaneContextMenu={(event) => contextMenu.open(event as React.MouseEvent, paneMenu(event as React.MouseEvent))}
       onNodeContextMenu={(event, node) => {
         const value = shot.nodes.find((n) => n.id === node.id)
         if (value) {
           selectStep(null)
           contextMenu.open(event, valueNodeMenu(value))
+          return
+        }
+        const instance = shot.instances.find((i) => i.id === node.id)
+        if (instance) {
+          selectStep(null)
+          contextMenu.open(event, instanceMenu(instance))
           return
         }
         const step = shot.steps.find((s) => s.id === node.id)

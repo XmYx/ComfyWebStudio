@@ -7,8 +7,10 @@
 
 import type {
   AppSettings, Asset, BackendConfig, BackendStatus, BindableWidget, Clip, GraphReport,
-  Link, PluginInfo, Project, ProjectSummary, ResolvedTimeline, Run, RunMode, Shot, Step, StepRun,
-  Timeline, Track, TrackKind, ValueNode, ValueNodeKind, Version, WorkflowRef,
+  Link, PlacedTemplate, PluginInfo, Project, ProjectSummary, RenderRequest, ResolvedTimeline,
+  Run, RunMode, Shot, ShotTemplate, Step, StepRun,
+  TemplateInstance, TemplateSummary, Timeline, Track, TrackKind, ValueNode, ValueNodeKind,
+  Vec2, Version, WorkflowRef,
 } from './types'
 
 export class ApiError extends Error {
@@ -231,6 +233,69 @@ export const api = {
       request<void>(`/api/projects/${projectId}/nodes/${nodeId}`, { method: 'DELETE' }),
   },
 
+  /** The shared template library, and the instances placed from it. */
+  templates: {
+    list: () => request<TemplateSummary[]>('/api/templates'),
+    get: (templateId: string) => request<ShotTemplate>(`/api/templates/${templateId}`),
+    update: (templateId: string, patch: { name?: string; description?: string }) =>
+      request<ShotTemplate>(`/api/templates/${templateId}`, {
+        method: 'PATCH',
+        body: json(patch),
+      }),
+    remove: (templateId: string) =>
+      request<void>(`/api/templates/${templateId}`, { method: 'DELETE' }),
+    /** Rename or hide one port on the container node. */
+    setPort: (templateId: string, portKey: string, patch: { label?: string; shown?: boolean }) =>
+      request<ShotTemplate>(`/api/templates/${templateId}/ports/${encodeURIComponent(portKey)}`, {
+        method: 'PATCH',
+        body: json(patch),
+      }),
+    setControl: (
+      templateId: string, controlKey: string, patch: { label?: string; shown?: boolean },
+    ) =>
+      request<ShotTemplate>(
+        `/api/templates/${templateId}/controls/${encodeURIComponent(controlKey)}`,
+        { method: 'PATCH', body: json(patch) },
+      ),
+    /** Lift a shot into the library. Pass template_id to overwrite, which updates placed instances. */
+    saveShot: (
+      projectId: string,
+      shotId: string,
+      body: { name?: string; description?: string; template_id?: string },
+    ) =>
+      request<ShotTemplate>(`/api/projects/${projectId}/shots/${shotId}/save-as-template`, {
+        method: 'POST',
+        body: json(body),
+      }),
+  },
+
+  instances: {
+    place: (
+      projectId: string,
+      shotId: string,
+      body: { template_id: string; name?: string; ui_pos?: Vec2 },
+    ) =>
+      request<TemplateInstance>(`/api/projects/${projectId}/shots/${shotId}/instances`, {
+        method: 'POST',
+        body: json(body),
+      }),
+    update: (projectId: string, instanceId: string, patch: Partial<TemplateInstance>) =>
+      request<TemplateInstance>(`/api/projects/${projectId}/instances/${instanceId}`, {
+        method: 'PATCH',
+        body: json(patch),
+      }),
+    sync: (projectId: string, instanceId: string) =>
+      request<{ instance: TemplateInstance; changes: string[] }>(
+        `/api/projects/${projectId}/instances/${instanceId}/sync`,
+        { method: 'POST' },
+      ),
+    remove: (projectId: string, instanceId: string) =>
+      request<void>(`/api/projects/${projectId}/instances/${instanceId}`, { method: 'DELETE' }),
+    /** Every placed instance in a shot, with its surface — one request, not one per node. */
+    placed: (projectId: string, shotId: string) =>
+      request<PlacedTemplate[]>(`/api/projects/${projectId}/shots/${shotId}/placed`),
+  },
+
   links: {
     create: (projectId: string, shotId: string, link: Omit<Link, 'id'>) =>
       request<Link>(`/api/projects/${projectId}/shots/${shotId}/links`, {
@@ -315,11 +380,11 @@ export const api = {
         method: 'POST',
         body: json(shotIds ?? null),
       }),
-    render: (projectId: string, body: { name?: string; still?: boolean; time_s?: number }) =>
-      request<{ render_id: string; status: string }>(`/api/projects/${projectId}/timeline/render`, {
-        method: 'POST',
-        body: json(body),
-      }),
+    render: (projectId: string, body: RenderRequest) =>
+      request<{ render_id: string; status: string; outputs: number }>(
+        `/api/projects/${projectId}/timeline/render`,
+        { method: 'POST', body: json(body) },
+      ),
     renders: (projectId: string) =>
       request<Array<{ name: string; path: string; size: number; modified: number }>>(
         `/api/projects/${projectId}/timeline/renders`,

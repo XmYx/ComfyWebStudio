@@ -10,7 +10,7 @@ import type { NavigateFunction } from 'react-router-dom'
 import type { QueryClient } from '@tanstack/react-query'
 
 import { api, ApiError } from '@/api/client'
-import type { Clip, Project, Shot, Step } from '@/api/types'
+import type { Clip, Project, RenderRequest, Shot, Step } from '@/api/types'
 import { useLayout } from '@/store/layout'
 import { useStudio } from '@/store/studio'
 
@@ -53,6 +53,29 @@ async function guard(ctx: CommandContext, action: () => Promise<unknown>, succes
     await action()
     if (success) ctx.toast('ok', success)
     ctx.refresh()
+  } catch (error) {
+    ctx.toast('bad', error instanceof ApiError ? error.message : String(error))
+  }
+}
+
+/** A timeline with something in it — nothing here can render an empty one. */
+const hasTimeline = (ctx: CommandContext) =>
+  ctx.project !== null && ctx.project.timeline.duration > 0
+
+/**
+ * Start a render and go to the timeline, where the progress bar and the finished file are.
+ *
+ * The result arrives as a `render.finished` event, so there is nothing to await here beyond the request
+ * being accepted — which is also the only part that can fail synchronously.
+ */
+async function startRender(
+  ctx: CommandContext, body: RenderRequest, message: string,
+): Promise<void> {
+  if (!ctx.project) return
+  ctx.navigate(`/p/${ctx.project.id}/timeline`)
+  try {
+    const result = await api.timeline.render(ctx.project.id, { ...body, time_s: 0 })
+    ctx.toast('info', result.outputs > 1 ? `Rendering ${result.outputs} files…` : message)
   } catch (error) {
     ctx.toast('bad', error instanceof ApiError ? error.message : String(error))
   }
@@ -156,6 +179,75 @@ export const COMMANDS: Command[] = [
     label: 'Export as Plugin…',
     enabled: hasProject,
     run: () => useLayout.getState().openDialog('buildPlugin'),
+  },
+  // -- Render ----------------------------------------------------------------------------------------
+  // Every entry but the dialog renders immediately with the project's own settings; the dialog is where
+  // scope and output options live. Each one navigates to the timeline first, because that is where the
+  // progress bar and the finished file appear.
+  {
+    id: 'render.dialog',
+    label: 'Render…',
+    // Not Mod+R: the menu bar preventDefaults every match, and taking reload away from a web app is
+    // hostile. Mod+M is what editors use for "export media" anyway.
+    shortcut: 'Mod+M',
+    enabled: hasTimeline,
+    run: (ctx) => {
+      ctx.navigate(`/p/${ctx.project!.id}/timeline`)
+      useLayout.getState().openDialog('render')
+    },
+  },
+  {
+    id: 'render.timeline',
+    label: 'Render Whole Timeline',
+    enabled: hasTimeline,
+    run: (ctx) => startRender(ctx, { scope: 'timeline' }, 'Rendering the timeline…'),
+  },
+  {
+    id: 'render.clip',
+    label: 'Render Selected Clip',
+    enabled: (ctx) => hasProject(ctx) && selectedClip(ctx.project) !== null,
+    run: (ctx) => {
+      const selection = selectedClip(ctx.project)
+      if (!selection) return ctx.toast('bad', 'Select a clip on the timeline first.')
+      return startRender(
+        ctx,
+        { scope: 'clip', clip_id: selection.clip.id },
+        `Rendering “${selection.clip.name || 'clip'}”…`,
+      )
+    },
+  },
+  {
+    id: 'render.eachClip',
+    label: 'Render Each Clip Separately',
+    enabled: hasTimeline,
+    run: (ctx) => startRender(ctx, { scope: 'clips' }, 'Rendering one file per clip…'),
+  },
+  {
+    id: 'render.still',
+    label: 'Render Still at Playhead',
+    enabled: hasTimeline,
+    run: (ctx) => startRender(ctx, { still: true }, 'Rendering a still…'),
+  },
+  // -- Templates -------------------------------------------------------------------------------------
+  {
+    id: 'shot.saveAsTemplate',
+    label: 'Save Shot as Template…',
+    enabled: (ctx) => ctx.shot !== null && ctx.shot.steps.length > 0,
+    run: (ctx) => {
+      const name = prompt('Template name', ctx.shot!.name)
+      if (!name) return
+      return guard(
+        ctx,
+        () => api.templates.saveShot(ctx.project!.id, ctx.shot!.id, { name }),
+        `Saved “${name}” to the template library.`,
+      ).then(() => ctx.queryClient.invalidateQueries({ queryKey: ['templates'] }))
+    },
+  },
+  {
+    id: 'shot.templateLibrary',
+    label: 'Template Library…',
+    enabled: hasProject,
+    run: () => useLayout.getState().openDialog('templates'),
   },
   {
     id: 'file.close',
@@ -509,6 +601,22 @@ export const MENUS: Menu[] = [
         type: 'submenu',
         label: 'Export',
         items: [cmd('file.exportProject'), cmd('file.exportPlugin')],
+      },
+      sep(),
+      cmd('shot.saveAsTemplate'),
+      cmd('shot.templateLibrary'),
+      sep(),
+      cmd('render.dialog'),
+      {
+        type: 'submenu',
+        label: 'Render',
+        items: [
+          cmd('render.timeline'),
+          cmd('render.clip'),
+          cmd('render.eachClip'),
+          sep(),
+          cmd('render.still'),
+        ],
       },
       sep(),
       cmd('file.close'),

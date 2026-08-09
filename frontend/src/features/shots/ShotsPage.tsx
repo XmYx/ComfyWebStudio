@@ -9,6 +9,8 @@ import { useLayout } from '@/store/layout'
 import { ShotCanvas } from '@/features/graph/ShotCanvas'
 import { WorkflowLibrary } from './WorkflowLibrary'
 import { StepInspector } from './StepInspector'
+import { InstanceInspector } from './InstanceInspector'
+import { TemplateContents } from '@/features/graph/TemplateContents'
 import {
   Badge, Button, Callout, Empty, Panel, PanelHeader, Spinner, cx, useToast,
 } from '@/components/ui'
@@ -23,6 +25,8 @@ export function ShotsPage() {
   const shotId = useStudio((s) => s.shotId)
   const setShot = useStudio((s) => s.setShot)
   const selectedStepId = useStudio((s) => s.selectedStepId)
+  const selectedInstanceId = useStudio((s) => s.selectedInstanceId)
+  const openInstanceId = useStudio((s) => s.openInstanceId)
   const activeRun = useStudio((s) => s.activeRun)
   const seedFromResults = useStudio((s) => s.seedFromResults)
   const showLeftPanel = useLayout((s) => s.showLeftPanel)
@@ -57,6 +61,17 @@ export function ShotsPage() {
   useEffect(() => {
     if (results) seedFromResults(results)
   }, [results, seedFromResults])
+
+  // Shared with the canvas, which asks for the same thing — TanStack dedupes it to one request.
+  const { data: placedList } = useQuery({
+    queryKey: ['placed', projectId, shot?.id, project?.modified],
+    queryFn: () => api.instances.placed(projectId!, shot!.id),
+    enabled: Boolean(projectId && shot?.instances.length),
+  })
+  const placedById = useMemo(
+    () => new Map((placedList ?? []).map((entry) => [entry.instance_id, entry])),
+    [placedList],
+  )
 
   const { data: report } = useQuery({
     queryKey: ['validate', projectId, shot?.id, project?.modified],
@@ -94,6 +109,8 @@ export function ShotsPage() {
   if (!project) return null
 
   const selectedStep = shot?.steps.find((s) => s.id === selectedStepId) ?? null
+  const selectedInstance = shot?.instances.find((i) => i.id === selectedInstanceId) ?? null
+  const openInstance = shot?.instances.find((i) => i.id === openInstanceId) ?? null
   const running = activeRun?.status === 'running' || startRun.isPending
 
   const shotMenu = (candidate: (typeof project.shots)[number]): MenuItem[] => [
@@ -201,7 +218,10 @@ export function ShotsPage() {
                   )}
                 >
                   <span className="truncate">{candidate.name}</span>
-                  <span className="text-[10px]">{candidate.steps.length}</span>
+                  {/* Placed templates count too — a shot made only of them is not an empty shot. */}
+                  <span className="text-[10px]">
+                    {candidate.steps.length + candidate.instances.length}
+                  </span>
                 </button>
               ))
             )}
@@ -232,7 +252,7 @@ export function ShotsPage() {
                     <Button
                       size="sm"
                       variant="primary"
-                      disabled={!shot.steps.length}
+                      disabled={!shot.steps.length && !shot.instances.length}
                       onClick={() => startRun.mutate({ mode: 'shot' })}
                     >
                       ▶ Run shot
@@ -241,7 +261,7 @@ export function ShotsPage() {
                       size="sm"
                       variant="ghost"
                       title="Ignore cached results and re-execute everything"
-                      disabled={!shot.steps.length}
+                      disabled={!shot.steps.length && !shot.instances.length}
                       onClick={() => startRun.mutate({ mode: 'shot', force: true })}
                     >
                       Force
@@ -269,7 +289,14 @@ export function ShotsPage() {
         )}
 
         <div className="min-h-0 flex-1">
-          {shot ? (
+          {openInstance && shot ? (
+            // Drilled into a placed template: the canvas shows what is inside it until the user comes back.
+            <TemplateContents
+              projectId={project.id}
+              shotName={shot.name}
+              instance={openInstance}
+            />
+          ) : shot ? (
             <ShotCanvas
               project={project}
               shot={shot}
@@ -285,7 +312,20 @@ export function ShotsPage() {
       {/* Right: inspector */}
       {showInspector && (
       <div className="min-h-0">
-        {selectedStep && shot ? (
+        {selectedInstance && shot ? (
+          <InstanceInspector
+            project={project}
+            shot={shot}
+            instance={selectedInstance}
+            placed={placedById.get(selectedInstance.id)}
+            onChanged={invalidate}
+            onRun={(stepIds: string[]) =>
+              stepIds.length
+                ? startRun.mutate({ mode: 'step', step_ids: stepIds })
+                : startRun.mutate({ mode: 'shot' })
+            }
+          />
+        ) : selectedStep && shot ? (
           <StepInspector
             project={project}
             shot={shot}
@@ -296,8 +336,8 @@ export function ShotsPage() {
         ) : (
           <Panel className="h-full">
             <PanelHeader>Inspector</PanelHeader>
-            <Empty title="No step selected">
-              Click a step on the canvas to edit its parameters and see its output.
+            <Empty title="Nothing selected">
+              Click a step or a placed template on the canvas to edit it and see its output.
             </Empty>
           </Panel>
         )}

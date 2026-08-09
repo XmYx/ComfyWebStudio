@@ -11,7 +11,7 @@ import type { Clip, Step } from '@/api/types'
 
 export type DialogId =
   | 'shortcuts' | 'about' | 'plugins' | 'newProject' | 'openProject'
-  | 'comfyBrowser' | 'buildPlugin' | 'exportProject' | 'history'
+  | 'comfyBrowser' | 'buildPlugin' | 'exportProject' | 'history' | 'render' | 'templates'
 
 /** What the shot canvas exposes to the menus. Registered by the canvas itself so the menu stays decoupled. */
 export interface CanvasApi {

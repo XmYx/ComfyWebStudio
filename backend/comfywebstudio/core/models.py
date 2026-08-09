@@ -253,6 +253,34 @@ class Link(Base):
     to_port: str
 
 
+class TemplateInstance(Base):
+    """A shot template placed on a canvas as one contained node.
+
+    The instance holds no structure of its own: it names a template in the shared library and the values
+    it overrides. What it *runs* is read from the template every time, so improving a template improves
+    every shot that placed it — which is the point of having templates at all.
+
+    ``workflow_map`` is the exception, and it has to be stored. Placing an instance copies the template's
+    workflows into the project so the project stays self-contained and exportable; this records which
+    project workflow each of the template's own workflow keys became. A template that has since grown a
+    new step has a key with no mapping, which is exactly the signal that this instance needs re-syncing.
+    """
+
+    id: str = Field(default_factory=lambda: new_id("inst"))
+    template_id: str
+    #: Overrides the template's own name on this canvas.
+    name: str = ""
+    enabled: bool = True
+    #: Values for the template's promoted controls, by promoted key.
+    param_overrides: dict[str, Any] = Field(default_factory=dict)
+    #: Template workflow key -> the project workflow id it was imported as.
+    workflow_map: dict[str, str] = Field(default_factory=dict)
+    #: The template revision this instance was last reconciled against.
+    template_revision: int = 0
+    ui_pos: Vec2 = Field(default_factory=Vec2)
+    ui_size: Size = Field(default_factory=Size)
+
+
 class Shot(Base):
     id: str = Field(default_factory=lambda: new_id("shot"))
     name: str = "Shot"
@@ -261,6 +289,8 @@ class Shot(Base):
     steps: list[Step] = Field(default_factory=list)
     #: Value nodes on the same canvas as the steps, kept separate because they never execute.
     nodes: list[ValueNode] = Field(default_factory=list)
+    #: Placed shot templates, each standing in for the steps it expands to at run time.
+    instances: list[TemplateInstance] = Field(default_factory=list)
     links: list[Link] = Field(default_factory=list)
     created: datetime = Field(default_factory=utcnow)
 
@@ -269,6 +299,9 @@ class Shot(Base):
 
     def node(self, node_id: str) -> ValueNode | None:
         return next((n for n in self.nodes if n.id == node_id), None)
+
+    def instance(self, instance_id: str) -> TemplateInstance | None:
+        return next((i for i in self.instances if i.id == instance_id), None)
 
     def links_into(self, step_id: str) -> list[Link]:
         return [link for link in self.links if link.to_step == step_id]

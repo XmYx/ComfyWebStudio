@@ -9,7 +9,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from ..core.errors import NotFound
-from ..core.graph import validate_new_link, validate_shot
+from ..core.graph import validate_new_link, validate_placed
 from ..core.models import (
     Link,
     PortKind,
@@ -20,6 +20,7 @@ from ..core.models import (
     ValueNodeKind,
     Vec2,
 )
+from ..core.template_capture import templates_for
 from .deps import ProjectDep, ShotDep, StateDep, find_step
 
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["shots"])
@@ -136,8 +137,8 @@ def delete_shot(state: StateDep, project: ProjectDep, shot_id: str) -> None:
 
 
 @router.get("/shots/{shot_id}/validate")
-def validate(project: ProjectDep, shot: ShotDep) -> dict:
-    report = validate_shot(project, shot)
+def validate(state: StateDep, project: ProjectDep, shot: ShotDep) -> dict:
+    report, _flat = validate_placed(project, shot, state.templates)
     return {
         "ok": report.ok,
         "order": report.order,
@@ -156,10 +157,13 @@ def duplicate_shot(state: StateDep, project: ProjectDep, shot: ShotDep) -> Shot:
 
     remap = {step.id: new_id("step") for step in copy.steps}
     remap.update({node.id: new_id("val") for node in copy.nodes})
+    remap.update({instance.id: new_id("inst") for instance in copy.instances})
     for step in copy.steps:
         step.id = remap[step.id]
     for node in copy.nodes:
         node.id = remap[node.id]
+    for instance in copy.instances:
+        instance.id = remap[instance.id]
     for link in copy.links:
         link.id = new_id("link")
         link.from_step = remap.get(link.from_step, link.from_step)
@@ -346,7 +350,9 @@ def create_link(
     it, with a reason.
     """
     link = Link(**body.model_dump())
-    validate_new_link(project, shot, link)
+    # Templates are only loaded when the shot actually places one — the common link touches neither end.
+    templates = templates_for(shot, state.templates) if shot.instances else None
+    validate_new_link(project, shot, link, templates)
     shot.links.append(link)
     state.store.save(project)
     return link

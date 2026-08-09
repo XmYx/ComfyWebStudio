@@ -21,7 +21,7 @@ from ..core.graph import (
     runnable_steps,
     topological_order,
     upstream_closure,
-    validate_shot,
+    validate_placed,
     value_nodes_into,
 )
 from ..core.models import (
@@ -54,11 +54,14 @@ class Orchestrator:
         settings: AppSettings,
         events: EventBus,
         backend_provider,
+        template_store=None,
     ):
         self.store = store
         self.media = media
         self.settings = settings
         self.events = events
+        #: The shared template library, so a shot's placed templates can be expanded before running.
+        self.templates = template_store
         #: ``async (backend_id | None) -> ComfyBackend``
         self.backend_provider = backend_provider
         self._tasks: dict[str, asyncio.Task] = {}
@@ -86,8 +89,11 @@ class Orchestrator:
         step_ids: list[str] | None = None,
         force: bool = False,
     ) -> Run:
-        """Queue a run and return immediately; progress arrives on the event bus."""
-        report = validate_shot(project, shot)
+        """Queue a run and return immediately; progress arrives on the event bus.
+
+        Placed templates are expanded first, so from here down a shot is nothing but steps and links.
+        """
+        report, shot = validate_placed(project, shot, self.templates)
         if not report.ok:
             raise ExecutionFailed(
                 "This shot cannot run yet.",

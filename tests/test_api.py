@@ -10,6 +10,8 @@ import asyncio
 import io
 import json
 
+import pytest
+
 from .test_execution import consumer_prompt, generator_prompt
 
 
@@ -524,6 +526,143 @@ async def test_render_video_produces_a_playable_file(client):
         assert sum(1 for _ in container.decode(stream)) >= 1
 
 
+# -- render scopes ---------------------------------------------------------------------------------------
+
+
+async def render_and_wait(client, project_id: str, body: dict, *, timeout: float = 90) -> dict:
+    """Kick off a render and return the `render.finished` payload."""
+    state = client.app_state
+    payload: dict = {}
+    done = asyncio.Event()
+
+    async def listen():
+        async with state.events.subscribe(project_id) as stream:
+            async for event in stream:
+                if event.type == "render.finished":
+                    payload.update(event.data)
+                    done.set()
+                    return
+
+    listener = asyncio.create_task(listen())
+    await asyncio.sleep(0)
+
+    response = await client.post(f"/api/projects/{project_id}/timeline/render", json=body)
+    if response.status_code != 202:
+        listener.cancel()
+        return {"status_code": response.status_code, **response.json()}
+
+    await asyncio.wait_for(done.wait(), timeout=timeout)
+    listener.cancel()
+    return payload
+
+
+async def timeline_of_two_clips(client) -> tuple[dict, list[dict]]:
+    """A cheap two-clip timeline: tiny frames, quarter-second clips, back to back."""
+    project, shot, _steps = await build_chain(client)
+    await run_and_wait(client, project["id"], shot["id"])
+    await client.post(f"/api/projects/{project['id']}/timeline/from-shots")
+    await client.patch(
+        f"/api/projects/{project['id']}/timeline", json={"fps": 4, "width": 32, "height": 32}
+    )
+
+    tracks = (await client.get(f"/api/projects/{project['id']}/timeline")).json()["tracks"]
+    track = tracks[0]
+    first = track["clips"][0]
+    await client.patch(
+        f"/api/projects/{project['id']}/timeline/tracks/{track['id']}/clips/{first['id']}",
+        json={"start": 0.0, "duration": 0.5, "name": "one"},
+    )
+    await client.post(
+        f"/api/projects/{project['id']}/timeline/tracks/{track['id']}/clips",
+        json={"source": first["source"], "start": 0.5, "duration": 0.5, "name": "two"},
+    )
+
+    clips = (await client.get(f"/api/projects/{project['id']}/timeline")).json()["tracks"][0]["clips"]
+    assert len(clips) == 2, clips
+    return project, clips
+
+
+async def test_rendering_a_range_covers_only_that_span(client):
+    project, _clips = await timeline_of_two_clips(client)
+
+    payload = await render_and_wait(
+        client, project["id"], {"name": "span", "scope": "range", "start_s": 0.5, "end_s": 1.0}
+    )
+    assert payload["ok"] is True, payload.get("error")
+    assert payload["duration"] == pytest.approx(0.5, abs=0.26), payload
+
+
+async def test_rendering_one_clip_produces_one_file_starting_at_that_clip(client):
+    project, clips = await timeline_of_two_clips(client)
+
+    payload = await render_and_wait(
+        client, project["id"], {"name": "single", "scope": "clip", "clip_id": clips[1]["id"]}
+    )
+    assert payload["ok"] is True, payload.get("error")
+    assert len(payload["outputs"]) == 1
+    assert "two" in payload["path"], "the file should be named after the clip"
+
+
+async def test_rendering_each_clip_separately_produces_a_file_per_clip(client):
+    project, _clips = await timeline_of_two_clips(client)
+
+    payload = await render_and_wait(client, project["id"], {"name": "batch", "scope": "clips"})
+    assert payload["ok"] is True, payload.get("error")
+    assert len(payload["outputs"]) == 2, payload
+
+    # Numbered in timeline order, so a file browser sorts them the way the cut runs.
+    names = [output["path"].rsplit("/", 1)[-1] for output in payload["outputs"]]
+    assert "001" in names[0] and "002" in names[1], names
+
+    listed = {item["name"] for item in (await client.get(f"/api/projects/{project['id']}/timeline/renders")).json()}
+    assert all(name in listed for name in names)
+
+
+async def test_render_output_settings_override_the_project_for_one_render_only(client):
+    project, _clips = await timeline_of_two_clips(client)
+
+    payload = await render_and_wait(
+        client, project["id"], {"name": "big", "width": 48, "height": 48, "fps": 5}
+    )
+    assert payload["ok"] is True, payload.get("error")
+
+    import av
+
+    path = client.app_state.store.resolve(project["id"], payload["path"])
+    with av.open(str(path)) as container:
+        stream = next(s for s in container.streams if s.type == "video")
+        assert (stream.codec_context.width, stream.codec_context.height) == (48, 48)
+
+    # ...and the project's own timeline is untouched.
+    timeline = (await client.get(f"/api/projects/{project['id']}/timeline")).json()
+    assert (timeline["width"], timeline["height"], timeline["fps"]) == (32, 32, 4)
+
+
+async def test_rendering_a_clip_without_saying_which_is_refused(client):
+    project, _clips = await timeline_of_two_clips(client)
+    result = await render_and_wait(client, project["id"], {"scope": "clip"})
+    assert result["status_code"] == 422
+    assert "Select a clip" in result["message"]
+
+
+async def test_a_still_of_one_clip_is_taken_from_inside_that_clip(client):
+    """The playhead is timeline-absolute; a single-clip render has to rebase it onto the clip."""
+    project, clips = await timeline_of_two_clips(client)
+
+    payload = await render_and_wait(
+        client,
+        project["id"],
+        {"name": "frame", "scope": "clip", "clip_id": clips[1]["id"], "still": True, "time_s": 0.75},
+    )
+    assert payload["ok"] is True, payload.get("error")
+    assert payload["kind"] == "image"
+
+    served = await client.get(
+        f"/api/projects/{project['id']}/media", params={"path": payload["path"]}
+    )
+    assert served.status_code == 200 and served.content[:4] == b"\x89PNG"
+
+
 # -- settings ------------------------------------------------------------------------------------------
 
 
@@ -657,6 +796,276 @@ async def test_importing_a_missing_comfy_workflow_is_a_clean_404(client):
         f"/api/comfy/projects/{project['id']}/import", json={"path": "nope.json"}
     )
     assert response.status_code == 404
+
+
+# -- shot templates --------------------------------------------------------------------------------------
+
+
+async def save_template(client, project_id: str, shot_id: str, **body) -> dict:
+    response = await client.post(
+        f"/api/projects/{project_id}/shots/{shot_id}/save-as-template", json=body
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+async def test_save_a_shot_to_the_library_and_place_it_in_another_project(client):
+    source, shot, _steps = await build_chain(client)
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+
+    listed = (await client.get("/api/templates")).json()
+    assert [t["name"] for t in listed] == ["Chain bit"]
+    assert listed[0]["step_count"] == 2
+
+    # A different project, with none of the source project's workflows.
+    target = await make_project(client, "Target")
+    other = (await client.post(f"/api/projects/{target['id']}/shots", json={"name": "S"})).json()
+    placed = await client.post(
+        f"/api/projects/{target['id']}/shots/{other['id']}/instances",
+        json={"template_id": template["id"], "name": "Bit"},
+    )
+    assert placed.status_code == 201, placed.text
+
+    # Placing brought the workflows along, so the target can actually run it.
+    loaded = (await client.get(f"/api/projects/{target['id']}")).json()
+    assert len(loaded["workflows"]) == 2
+    assert len(loaded["shots"][0]["instances"]) == 1
+
+    report = (
+        await client.get(f"/api/projects/{target['id']}/shots/{other['id']}/validate")
+    ).json()
+    assert report["ok"] is True, report["issues"]
+
+
+async def test_running_a_shot_expands_the_instance_it_contains(client):
+    source, shot, _steps = await build_chain(client)
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+
+    target = await make_project(client, "Target")
+    other = (await client.post(f"/api/projects/{target['id']}/shots", json={"name": "S"})).json()
+    instance = (
+        await client.post(
+            f"/api/projects/{target['id']}/shots/{other['id']}/instances",
+            json={"template_id": template["id"], "name": "Bit"},
+        )
+    ).json()
+
+    run = await run_and_wait(client, target["id"], other["id"])
+    assert run["status"] == "success", run.get("error")
+    # Both inner steps ran, under ids scoped to the instance that owns them.
+    assert len(run["step_runs"]) == 2
+    assert all(sr["step_id"].startswith(f"{instance['id']}:") for sr in run["step_runs"])
+    assert all(sr["status"] == "success" for sr in run["step_runs"])
+
+
+async def test_an_instance_control_reaches_the_inner_step_at_run_time(client):
+    source, shot, steps = await build_chain(client)
+    # Pin the generator's prompt so the template promotes it as a control.
+    await client.patch(
+        f"/api/projects/{source['id']}/steps/{steps[0]['id']}", json={"exposed_params": ["prompt"]}
+    )
+    source = (await client.get(f"/api/projects/{source['id']}")).json()
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+
+    control = next(c for c in template["controls"] if c["shown"])
+    assert control["inner_param"] == "prompt"
+
+    target = await make_project(client, "Target")
+    other = (await client.post(f"/api/projects/{target['id']}/shots", json={"name": "S"})).json()
+    instance = (
+        await client.post(
+            f"/api/projects/{target['id']}/shots/{other['id']}/instances",
+            json={"template_id": template["id"]},
+        )
+    ).json()
+    await client.patch(
+        f"/api/projects/{target['id']}/instances/{instance['id']}",
+        json={"param_overrides": {control["key"]: "a hedgehog"}},
+    )
+
+    run = await run_and_wait(client, target["id"], other["id"])
+    assert run["status"] == "success", run.get("error")
+    caption = next(
+        artifact
+        for step_run in run["step_runs"]
+        for artifact in step_run["outputs"]
+        if artifact["port_key"] == "caption"
+    )
+    assert caption["meta"]["value"] == "a hedgehog"
+
+
+async def test_the_placed_endpoint_describes_each_instance_surface(client):
+    source, shot, _steps = await build_chain(client)
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+    target = await make_project(client, "Target")
+    other = (await client.post(f"/api/projects/{target['id']}/shots", json={"name": "S"})).json()
+    await client.post(
+        f"/api/projects/{target['id']}/shots/{other['id']}/instances",
+        json={"template_id": template["id"]},
+    )
+
+    placed = (
+        await client.get(f"/api/projects/{target['id']}/shots/{other['id']}/placed")
+    ).json()
+    assert len(placed) == 1
+    assert placed[0]["missing"] is False and placed[0]["stale"] is False
+    # Everything the template does not consume itself comes out: both of the consumer's outputs, and the
+    # generator's caption, which the chain never wired anywhere. Its image, which is wired, does not.
+    outputs = {p["key"] for p in placed[0]["ports"] if p["direction"] == "out"}
+    assert outputs == {"final", "echo", "caption"}
+    assert "image" not in outputs
+
+
+async def test_a_promoted_output_port_addresses_a_real_artifact(client):
+    """The join the canvas and the inspector rely on to show a template's result.
+
+    A run stores artifacts against the expanded step id; a promoted port names an inner key and an inner
+    port. This asserts the two actually meet — without it a template can run perfectly and still look
+    like it produced nothing.
+    """
+    source, shot, _steps = await build_chain(client)
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+
+    target = await make_project(client, "Target")
+    other = (await client.post(f"/api/projects/{target['id']}/shots", json={"name": "S"})).json()
+    instance = (
+        await client.post(
+            f"/api/projects/{target['id']}/shots/{other['id']}/instances",
+            json={"template_id": template["id"]},
+        )
+    ).json()
+
+    run = await run_and_wait(client, target["id"], other["id"])
+    assert run["status"] == "success", run.get("error")
+
+    placed = (
+        await client.get(f"/api/projects/{target['id']}/shots/{other['id']}/placed")
+    ).json()[0]
+    by_step = {sr["step_id"]: sr for sr in run["step_runs"]}
+
+    resolved = {}
+    for port in (p for p in placed["ports"] if p["direction"] == "out"):
+        step_run = by_step.get(f"{instance['id']}:{port['inner_key']}")
+        assert step_run is not None, f"no run for the step behind {port['key']!r}"
+        artifact = next(
+            (a for a in step_run["outputs"] if a["port_key"] == port["inner_port"]), None
+        )
+        if artifact:
+            resolved[port["key"]] = artifact["kind"]
+
+    # Every output the node advertises resolved to something the run actually produced.
+    assert resolved == {"final": "image", "echo": "string", "caption": "string"}
+
+
+async def test_improving_a_template_reaches_a_placed_instance_after_a_sync(client):
+    source, shot, steps = await build_chain(client)
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+
+    target = await make_project(client, "Target")
+    other = (await client.post(f"/api/projects/{target['id']}/shots", json={"name": "S"})).json()
+    instance = (
+        await client.post(
+            f"/api/projects/{target['id']}/shots/{other['id']}/instances",
+            json={"template_id": template["id"]},
+        )
+    ).json()
+
+    # The source shot grows a third step, and the template is saved over itself.
+    third = (
+        await client.post(
+            f"/api/projects/{source['id']}/shots/{shot['id']}/steps",
+            json={"workflow_id": steps[0]["workflow_id"], "name": "Extra"},
+        )
+    ).json()
+    assert third["id"]
+    updated = await save_template(
+        client, source["id"], shot["id"], name="Chain bit", template_id=template["id"]
+    )
+    assert updated["revision"] == template["revision"] + 1
+
+    placed = (
+        await client.get(f"/api/projects/{target['id']}/shots/{other['id']}/placed")
+    ).json()
+    assert placed[0]["stale"] is True, "the instance should read as out of date"
+
+    synced = await client.post(f"/api/projects/{target['id']}/instances/{instance['id']}/sync")
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["instance"]["template_revision"] == updated["revision"]
+
+    run = await run_and_wait(client, target["id"], other["id"])
+    assert run["status"] == "success", run.get("error")
+    assert len(run["step_runs"]) == 3, "the instance should now run the template's third step"
+
+
+async def test_hiding_a_control_takes_it_off_the_node(client):
+    source, shot, steps = await build_chain(client)
+    await client.patch(
+        f"/api/projects/{source['id']}/steps/{steps[0]['id']}", json={"exposed_params": ["prompt"]}
+    )
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+    control = next(c for c in template["controls"] if c["shown"])
+
+    response = await client.patch(
+        f"/api/templates/{template['id']}/controls/{control['key']}",
+        json={"shown": False, "label": "Prompt"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["revision"] == template["revision"] + 1
+    assert not any(c["shown"] for c in response.json()["controls"])
+
+
+async def test_deleting_an_instance_removes_its_links(client):
+    source, shot, _steps = await build_chain(client)
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+    target = await make_project(client, "Target")
+    other = (await client.post(f"/api/projects/{target['id']}/shots", json={"name": "S"})).json()
+    instance = (
+        await client.post(
+            f"/api/projects/{target['id']}/shots/{other['id']}/instances",
+            json={"template_id": template["id"]},
+        )
+    ).json()
+
+    # Something downstream that actually takes an image, so the link is a legal one.
+    consumer = await import_workflow(client, target["id"], "Consume", consumer_prompt())
+    downstream = (
+        await client.post(
+            f"/api/projects/{target['id']}/shots/{other['id']}/steps",
+            json={"workflow_id": consumer["id"]},
+        )
+    ).json()
+    link = await client.post(
+        f"/api/projects/{target['id']}/shots/{other['id']}/links",
+        json={
+            "from_step": instance["id"], "from_port": "final",
+            "to_step": downstream["id"], "to_port": "image",
+        },
+    )
+    assert link.status_code == 201, link.text
+
+    await client.delete(f"/api/projects/{target['id']}/instances/{instance['id']}")
+    shots = (await client.get(f"/api/projects/{target['id']}/shots")).json()
+    assert shots[0]["instances"] == []
+    assert shots[0]["links"] == []
+
+
+async def test_deleting_a_template_leaves_a_clear_error_rather_than_a_broken_shot(client):
+    source, shot, _steps = await build_chain(client)
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+    target = await make_project(client, "Target")
+    other = (await client.post(f"/api/projects/{target['id']}/shots", json={"name": "S"})).json()
+    await client.post(
+        f"/api/projects/{target['id']}/shots/{other['id']}/instances",
+        json={"template_id": template["id"]},
+    )
+
+    assert (await client.delete(f"/api/templates/{template['id']}")).status_code == 204
+
+    report = (
+        await client.get(f"/api/projects/{target['id']}/shots/{other['id']}/validate")
+    ).json()
+    assert report["ok"] is False
+    assert any("not in the library" in issue["message"] for issue in report["issues"])
 
 
 # -- value nodes -----------------------------------------------------------------------------------------

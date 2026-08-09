@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from typing import Any
 
 from .errors import GraphError
 from .models import (
     VALUE_PORT,
     Link,
+    PortDirection,
     PortKind,
     Project,
     Shot,
@@ -41,7 +43,9 @@ class LinkSource:
         return self.step is not None
 
 
-def resolve_link_source(project: Project, shot: Shot, link: Link) -> LinkSource | None:
+def resolve_link_source(
+    project: Project, shot: Shot, link: Link, templates: dict[str, Any] | None = None
+) -> LinkSource | None:
     """What feeds this link, or None when the source or its port has gone."""
     step = shot.step(link.from_step)
     if step is not None:
@@ -52,16 +56,42 @@ def resolve_link_source(project: Project, shot: Shot, link: Link) -> LinkSource 
     node = shot.node(link.from_step)
     if node is not None and link.from_port == VALUE_PORT:
         return LinkSource(name=node.display_name, kind=node.output_kind(project))
-    return None
+
+    return _instance_end(shot, link.from_step, link.from_port, "out", templates)
+
+
+def _instance_end(
+    shot: Shot, node_id: str, port_key: str, direction: PortDirection,
+    templates: dict[str, Any] | None,
+) -> LinkSource | None:
+    """One end of a link that lands on a placed template's promoted port.
+
+    Hidden ports do not resolve: taking a port off the node has to also mean it cannot be connected, or
+    the canvas would happily draw a link to something the user cannot see.
+    """
+    instance = shot.instance(node_id)
+    if instance is None or not templates:
+        return None
+    template = templates.get(instance.template_id)
+    if template is None:
+        return None
+    port = template.port(port_key, direction)
+    if port is None or not port.shown:
+        return None
+    return LinkSource(name=instance.name or template.name, kind=port.kind)
 
 
 def source_label(shot: Shot, node_id: str) -> str | None:
-    """What to call the producing end of a link in a message, whichever kind of node it is."""
+    """What to call one end of a link in a message, whichever kind of node it is."""
     step = shot.step(node_id)
     if step is not None:
         return step.name
     node = shot.node(node_id)
-    return node.display_name if node is not None else None
+    if node is not None:
+        return node.display_name
+    instance = shot.instance(node_id)
+    # A placed template with no name of its own is still better described than by its id.
+    return (instance.name or "a placed template") if instance is not None else None
 
 
 def value_nodes_into(shot: Shot, step_id: str) -> dict[str, ValueNode]:
@@ -162,6 +192,26 @@ def upstream_closure(shot: Shot, step_ids: set[str]) -> set[str]:
             if link.from_step in steps and link.from_step not in seen:
                 pending.append(link.from_step)
     return seen
+
+
+def validate_placed(project: Project, shot: Shot, template_store) -> tuple[GraphReport, Shot]:
+    """Validate a shot with its placed templates unpacked, and hand back the shot that would run.
+
+    Everything below this line works on plain steps and links, so a template instance is expanded once
+    here and never thought about again. What expansion could not do — a template the library has lost, a
+    link to a promoted port that has since gone — is folded in as issues, because those are the user's
+    connections quietly not happening.
+    """
+    from .template_capture import flatten_shot, templates_for
+
+    flat = flatten_shot(shot, templates_for(shot, template_store))
+    report = validate_shot(project, flat.shot)
+    report.issues = (
+        [GraphIssue("error", message) for message in flat.errors]
+        + [GraphIssue("warning", message) for message in flat.warnings]
+        + report.issues
+    )
+    return report, flat.shot
 
 
 def validate_shot(project: Project, shot: Shot) -> GraphReport:
@@ -290,40 +340,52 @@ def validate_shot(project: Project, shot: Shot) -> GraphReport:
     return report
 
 
-def validate_new_link(project: Project, shot: Shot, link: Link) -> None:
+def _link_target(
+    project: Project, shot: Shot, link: Link, templates: dict[str, Any] | None
+) -> LinkSource | None:
+    """The consuming end of a link — a step's input port, or a placed template's promoted one."""
+    step = shot.step(link.to_step)
+    if step is not None:
+        workflow = project.workflow(step.workflow_id)
+        port = workflow.port(link.to_port, "in") if workflow else None
+        return LinkSource(name=step.name, kind=port.kind, step=step) if port else None
+    return _instance_end(shot, link.to_step, link.to_port, "in", templates)
+
+
+def validate_new_link(
+    project: Project, shot: Shot, link: Link, templates: dict[str, Any] | None = None
+) -> None:
     """Check a link the user is about to create, raising :class:`GraphError` with a specific reason.
 
     Called before the link is stored so the editor can refuse the connection rather than accept it and then
-    fail at run time.
+    fail at run time. ``templates`` is needed only when either end is a placed template, which is the one
+    case the shot alone cannot answer.
     """
     if link.from_step == link.to_step:
         raise GraphError("A step cannot feed itself.")
 
-    target = shot.step(link.to_step)
-    if target is None:
-        raise GraphError("A link must end at a step in this shot.")
-
-    source = resolve_link_source(project, shot, link)
+    source = resolve_link_source(project, shot, link, templates)
     if source is None:
         label = source_label(shot, link.from_step)
         raise GraphError(
             f"{label!r} has no output port {link.from_port!r}."
             if label is not None
-            else "A link must start at a step or value node in this shot."
+            else "A link must start at a step, a value node or a placed template in this shot."
         )
 
-    target_wf = project.workflow(target.workflow_id)
-    if target_wf is None:
-        raise GraphError("A step references a workflow that is not in the project.")
-
-    in_port = target_wf.port(link.to_port, "in")
-    if in_port is None:
-        raise GraphError(f"{target.name!r} has no input port {link.to_port!r}.")
-
-    if not can_connect(source.kind, in_port.kind):
+    target = _link_target(project, shot, link, templates)
+    if target is None:
+        label = source_label(shot, link.to_step)
         raise GraphError(
-            f"Cannot connect a {source.kind} output to a {in_port.kind} input.",
-            details={"from_kind": source.kind, "to_kind": in_port.kind},
+            f"{label!r} has no input port {link.to_port!r}."
+            if label is not None
+            else "A link must end at a step or a placed template in this shot."
+        )
+
+    if not can_connect(source.kind, target.kind):
+        raise GraphError(
+            f"Cannot connect a {source.kind} output to a {target.kind} input.",
+            details={"from_kind": source.kind, "to_kind": target.kind},
         )
 
     existing = next(
@@ -332,7 +394,7 @@ def validate_new_link(project: Project, shot: Shot, link: Link) -> None:
     )
     if existing is not None and existing.id != link.id:
         raise GraphError(
-            f"Input {in_port.display_name!r} is already connected. Disconnect it first.",
+            f"Input {link.to_port!r} on {target.name!r} is already connected. Disconnect it first.",
             details={"existing_link": existing.id},
         )
 

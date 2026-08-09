@@ -28,6 +28,10 @@ interface StudioState {
   projectId: string | null
   shotId: string | null
   selectedStepId: string | null
+  /** A placed template selected on the canvas. Mutually exclusive with `selectedStepId`. */
+  selectedInstanceId: string | null
+  /** The template currently drilled into, so the canvas can show what is inside a placed node. */
+  openInstanceId: string | null
   selectedClip: { trackId: string; clipId: string } | null
 
   activeRun: Run | null
@@ -38,6 +42,8 @@ interface StudioState {
   setProject: (id: string | null) => void
   setShot: (id: string | null) => void
   selectStep: (id: string | null) => void
+  selectInstance: (id: string | null) => void
+  openInstance: (id: string | null) => void
   selectClip: (selection: { trackId: string; clipId: string } | null) => void
 
   beginRun: (run: Run) => void
@@ -53,6 +59,8 @@ export const useStudio = create<StudioState>((set) => ({
   projectId: null,
   shotId: null,
   selectedStepId: null,
+  selectedInstanceId: null,
+  openInstanceId: null,
   selectedClip: null,
   activeRun: null,
   liveSteps: {},
@@ -60,9 +68,16 @@ export const useStudio = create<StudioState>((set) => ({
   historyTarget: null,
 
   setProject: (id) =>
-    set({ projectId: id, shotId: null, selectedStepId: null, liveSteps: {}, activeRun: null }),
-  setShot: (id) => set({ shotId: id, selectedStepId: null }),
-  selectStep: (id) => set({ selectedStepId: id }),
+    set({
+      projectId: id, shotId: null, selectedStepId: null, selectedInstanceId: null,
+      openInstanceId: null, liveSteps: {}, activeRun: null,
+    }),
+  setShot: (id) =>
+    set({ shotId: id, selectedStepId: null, selectedInstanceId: null, openInstanceId: null }),
+  // Selecting one clears the other: the inspector shows a step or a placed template, never both.
+  selectStep: (id) => set({ selectedStepId: id, selectedInstanceId: null }),
+  selectInstance: (id) => set({ selectedInstanceId: id, selectedStepId: null }),
+  openInstance: (id) => set({ openInstanceId: id, selectedStepId: null, selectedInstanceId: null }),
   selectClip: (selection) => set({ selectedClip: selection }),
 
   beginRun: (run) =>

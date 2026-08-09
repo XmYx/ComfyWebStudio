@@ -16,6 +16,7 @@ from .comfy.objectinfo import ObjectInfoCache
 from .core.errors import BackendUnavailable
 from .core.plugins import PluginStore
 from .core.store import ProjectStore
+from .core.template_store import TemplateStore
 from .execution.events import EventBus
 from .execution.orchestrator import Orchestrator
 from .media.store import MediaStore
@@ -114,9 +115,10 @@ class AppState:
         self.media_store = MediaStore(self.store)
         self.media = MediaTransfer(self.store, self.media_store, self.settings.preview)
         self.plugins = PluginStore(Path(self.settings.root) / "plugins", self.store)
+        self.templates = TemplateStore(Path(self.settings.root) / "templates")
         self.backends = BackendManager(self.settings, self.events)
         self.orchestrator = Orchestrator(
-            self.store, self.media, self.settings, self.events, self.backends.get
+            self.store, self.media, self.settings, self.events, self.backends.get, self.templates
         )
         #: Tokens handed to the ComfyUI bridge extension, mapped to the step they may write to.
         self.bridge_tokens: dict[str, dict[str, str]] = {}

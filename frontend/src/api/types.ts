@@ -55,6 +55,27 @@ export interface WorkflowRef {
   warnings: string[]
 }
 
+/** What a render covers. `clips` is a batch — one file per clip. */
+export type RenderScope = 'timeline' | 'range' | 'clip' | 'clips'
+
+export interface RenderRequest {
+  name?: string
+  /** A single frame instead of a movie, taken at `time_s`. */
+  still?: boolean
+  time_s?: number
+  scope?: RenderScope
+  start_s?: number
+  end_s?: number
+  clip_id?: string
+  /** Output overrides, applied for this render only. Omitted fields keep the project's settings. */
+  fps?: number
+  width?: number
+  height?: number
+  container?: string
+  video_codec?: string
+  crf?: number
+}
+
 export interface Vec2 { x: number; y: number }
 /** Canvas size of a node. Zero means "size to content". */
 export interface Size { w: number; h: number }
@@ -93,9 +114,92 @@ export interface ValueNode {
   ui_size: Size
 }
 
+/** A shot template placed on a canvas as one contained node. */
+export interface TemplateInstance {
+  id: string
+  template_id: string
+  name: string
+  enabled: boolean
+  /** Values for the template's promoted controls, by promoted key. */
+  param_overrides: Record<string, unknown>
+  workflow_map: Record<string, string>
+  template_revision: number
+  ui_pos: Vec2
+  ui_size: Size
+}
+
+/** One port the container node exposes, and the inner port it stands for. */
+export interface TemplatePort {
+  key: string
+  direction: 'in' | 'out'
+  kind: PortKind
+  inner_key: string
+  inner_port: string
+  label: string
+  optional: boolean
+  shown: boolean
+}
+
+/** One parameter the container node exposes. */
+export interface TemplateControl {
+  key: string
+  inner_key: string
+  inner_param: string
+  label: string
+  spec: ParamSpec | null
+  shown: boolean
+}
+
+export interface TemplateSummary {
+  id: string
+  name: string
+  description: string
+  revision: number
+  modified: string
+  source_project: string
+  step_count: number
+  input_count: number
+  output_count: number
+  control_count: number
+}
+
+/**
+ * The whole template, as `GET /api/templates/{id}` returns it.
+ *
+ * Deliberately not an extension of TemplateSummary: the counts on a summary are derived for the list and
+ * are absent here, where the real collections are present instead.
+ */
+export interface ShotTemplate {
+  id: string
+  name: string
+  description: string
+  revision: number
+  created: string
+  modified: string
+  source_project: string
+  workflows: Array<{ key: string; name: string; ports: PortSpec[]; params: ParamSpec[] }>
+  steps: Array<{ key: string; name: string; workflow_key: string; ui_pos: Vec2 }>
+  nodes: Array<{ key: string; name: string; kind: ValueNodeKind; value: unknown; ui_pos: Vec2 }>
+  /** Wiring inside the template, by key. */
+  links: Array<{ from_key: string; from_port: string; to_key: string; to_port: string }>
+  ports: TemplatePort[]
+  controls: TemplateControl[]
+}
+
+/** What the canvas needs to draw one placed instance: its surface, and whether it is current. */
+export interface PlacedTemplate {
+  instance_id: string
+  template_id: string
+  missing: boolean
+  stale?: boolean
+  summary?: TemplateSummary
+  ports?: TemplatePort[]
+  controls?: TemplateControl[]
+}
+
 export interface Link {
   id: string
-  /** A step id or a value node id — both are sources on the canvas. */
+  /** A step id, a value node id, or a placed template's id — all three are ends on the canvas. */
   from_step: string
   from_port: string
   to_step: string
@@ -109,6 +213,7 @@ export interface Shot {
   color: string | null
   steps: Step[]
   nodes: ValueNode[]
+  instances: TemplateInstance[]
   links: Link[]
 }
 

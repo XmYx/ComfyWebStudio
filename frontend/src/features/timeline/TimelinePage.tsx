@@ -3,10 +3,12 @@ import { useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { api, ApiError } from '@/api/client'
-import type { Clip, Project, ResolvedTimeline, Track, TrackKind } from '@/api/types'
+import type { Clip, Project, RenderRequest, ResolvedTimeline, Track, TrackKind } from '@/api/types'
 import { KIND_COLOR } from '@/lib/kinds'
 import { formatBytes, formatTimecode } from '@/lib/format'
 import { useStudio } from '@/store/studio'
+import { useLayout } from '@/store/layout'
+import { RenderDialog } from './RenderDialog'
 import {
   Button, Callout, Empty, Field, Modal, Panel, PanelHeader, ProgressBar,
   Select, TextInput, cx, useToast,
@@ -30,6 +32,10 @@ export function TimelinePage() {
   const renderProgress = useStudio((s) => s.renderProgress)
   const selectedClip = useStudio((s) => s.selectedClip)
   const selectClip = useStudio((s) => s.selectClip)
+  // Kept in the shared dialog slot so a menu command can open it from anywhere.
+  const dialog = useLayout((s) => s.dialog)
+  const openDialog = useLayout((s) => s.openDialog)
+  const closeDialog = useLayout((s) => s.closeDialog)
   const commandContext = useCommandContext()
   const contextMenu = useContextMenu()
 
@@ -68,9 +74,20 @@ export function TimelinePage() {
   })
 
   const render = useMutation({
-    mutationFn: (still: boolean) => api.timeline.render(projectId!, { still, time_s: playhead }),
+    mutationFn: (body: RenderRequest) => api.timeline.render(projectId!, body),
+    onSuccess: (result) => {
+      if (result.outputs > 1) toast.push('info', `Rendering ${result.outputs} files…`)
+    },
     onError: (error: ApiError) => toast.push('bad', error.message),
   })
+
+  // The clip the dialog offers as "selected clip", resolved from the timeline selection.
+  const selection = useMemo(() => {
+    if (!project || !selectedClip) return null
+    const track = project.timeline.tracks.find((t) => t.id === selectedClip.trackId)
+    const clip = track?.clips.find((c) => c.id === selectedClip.clipId)
+    return track && clip ? { track: track.id, clip } : null
+  }, [project, selectedClip])
 
   if (!project) return <Empty title="Loading…" />
 
@@ -116,16 +133,31 @@ export function TimelinePage() {
           />
         </label>
 
-        <Button size="sm" variant="ghost" onClick={() => render.mutate(true)} title="Render the frame at the playhead">
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => render.mutate({ still: true, time_s: playhead })}
+          title="Export the frame at the playhead as a PNG"
+        >
           Still
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={timeline.duration <= 0 || Boolean(renderProgress)}
+          onClick={() => render.mutate({ scope: 'timeline' })}
+          title="Render the whole timeline with the project's settings"
+        >
+          Render
         </Button>
         <Button
           size="sm"
           variant="primary"
           disabled={timeline.duration <= 0 || Boolean(renderProgress)}
-          onClick={() => render.mutate(false)}
+          onClick={() => openDialog('render')}
+          title="Choose what to render and how"
         >
-          Render
+          Render…
         </Button>
       </Panel>
 
@@ -198,6 +230,15 @@ export function TimelinePage() {
         project={project}
         onChanged={invalidate}
       />
+
+      <RenderDialog
+        open={dialog === 'render'}
+        onClose={closeDialog}
+        project={project}
+        playhead={playhead}
+        selectedClip={selection}
+        onRender={(body) => render.mutate(body)}
+      />
       <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
     </div>
   )
@@ -225,6 +266,10 @@ function TrackArea({
     { type: 'command', id: 'edit.copy' },
     { type: 'command', id: 'edit.cut' },
     { type: 'command', id: 'edit.paste' },
+    { type: 'separator' },
+    // The command reads the current selection, and right-clicking a clip selects it.
+    { type: 'command', id: 'render.clip' },
+    { type: 'command', id: 'render.dialog' },
     { type: 'separator' },
     {
       type: 'action',

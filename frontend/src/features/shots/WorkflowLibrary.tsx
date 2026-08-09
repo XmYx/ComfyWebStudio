@@ -8,6 +8,7 @@ import { KIND_COLOR } from '@/lib/kinds'
 import { relativeTime } from '@/lib/format'
 import { Badge, Button, Panel, PanelHeader, Spinner, useToast } from '@/components/ui'
 import { ComfyWorkflowBrowser } from './ComfyWorkflowBrowser'
+import { TemplateLibrary } from './TemplateLibrary'
 import { useLayout } from '@/store/layout'
 import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
 import { useCommandContext } from '@/features/menu/useCommandContext'
@@ -263,6 +264,13 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
         open={browsing}
         onClose={closeDialog}
         projectId={project.id}
+      />
+      <TemplateLibrary
+        open={dialog === 'templates'}
+        onClose={closeDialog}
+        projectId={project.id}
+        shot={shot ?? null}
+        onPlaced={onChanged}
       />
       <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
     </Panel>

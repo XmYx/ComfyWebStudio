@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -15,6 +16,12 @@ from ..core.models import Clip, ClipSource, Timeline, Track, TrackKind
 from ..execution.events import StudioEvent
 from ..render.compositor import TimelineResolver
 from ..render.encoder import TimelineRenderer
+from ..render.scope import (
+    find_clip,
+    renderable_clips,
+    timeline_for_clip,
+    timeline_for_range,
+)
 from .deps import ProjectDep, StateDep
 
 logger = logging.getLogger(__name__)
@@ -48,10 +55,34 @@ class CreateClipRequest(BaseModel):
     text: str = ""
 
 
+#: What a render covers. ``clips`` is a batch — one file per clip — the rest produce a single file.
+RenderScope = Literal["timeline", "range", "clip", "clips"]
+
+
 class RenderRequest(BaseModel):
     name: str | None = None
+    #: A single frame instead of a movie. Applies to whichever scope is selected.
     still: bool = False
     time_s: float = 0.0
+
+    scope: RenderScope = "timeline"
+    #: For ``range``. Absent bounds mean "from the start" and "to the end".
+    start_s: float | None = None
+    end_s: float | None = None
+    #: For ``clip``.
+    clip_id: str | None = None
+
+    # Output overrides, applied on top of the project's render settings for this render only. Left unset,
+    # each one keeps whatever the project already uses — this dialog is not a way to edit project settings
+    # by accident.
+    fps: float | None = None
+    width: int | None = None
+    height: int | None = None
+    container: str | None = None
+    video_codec: str | None = None
+    crf: int | None = None
+    audio_codec: str | None = None
+    audio_bitrate: str | None = None
 
 
 # -- timeline ------------------------------------------------------------------------------------------
@@ -295,51 +326,160 @@ def build_from_shots(
 # -- render --------------------------------------------------------------------------------------------
 
 
+@dataclass(slots=True)
+class _RenderJob:
+    """One output file: the timeline to render and what to call it."""
+
+    timeline: Timeline
+    name: str
+    #: Where in this job's timeline a still should be taken, already rebased onto it.
+    still_at: float = 0.0
+
+
+def _plan(project, body: RenderRequest, base_name: str) -> list[_RenderJob]:
+    """Turn the request into the list of files it asks for.
+
+    Each scope is expressed as a derived timeline, so the encoder only ever sees "render this timeline" —
+    exporting one clip and exporting the whole cut are the same code path with different input.
+    """
+    timeline = project.timeline
+
+    if body.scope == "range":
+        start = max(0.0, body.start_s or 0.0)
+        end = body.end_s if body.end_s is not None else timeline.duration
+        return [
+            _RenderJob(
+                timeline=timeline_for_range(timeline, start, end),
+                name=base_name,
+                still_at=max(0.0, body.time_s - start),
+            )
+        ]
+
+    if body.scope == "clip":
+        if not body.clip_id:
+            raise ValidationFailed("Select a clip to render, or choose a different scope.")
+        found = find_clip(timeline, body.clip_id)
+        if found is None:
+            raise NotFound(f"No clip {body.clip_id!r} in this timeline")
+        _track, clip = found
+        return [
+            _RenderJob(
+                timeline=timeline_for_clip(timeline, body.clip_id),
+                name=f"{base_name}-{slugify(clip.name or 'clip')}",
+                still_at=max(0.0, body.time_s - clip.start),
+            )
+        ]
+
+    if body.scope == "clips":
+        clips = renderable_clips(timeline)
+        if not clips:
+            raise ValidationFailed(
+                "There is nothing to render one clip at a time — every clip is disabled or on a muted "
+                "track."
+            )
+        # Numbered, so the files sort into timeline order in a file browser.
+        return [
+            _RenderJob(
+                timeline=timeline_for_clip(timeline, clip.id),
+                name=f"{base_name}-{index:03d}-{slugify(clip.name or 'clip')}",
+            )
+            for index, (_track, clip) in enumerate(clips, start=1)
+        ]
+
+    return [_RenderJob(timeline=timeline, name=base_name, still_at=body.time_s)]
+
+
+def _output_settings(state, body: RenderRequest, timeline: Timeline):
+    """Encoder settings for this render: the project's, with the request's overrides on top."""
+    settings = state.settings.render.model_copy()
+    settings.fps = body.fps or timeline.fps or settings.fps
+    for field in ("container", "video_codec", "crf", "audio_codec", "audio_bitrate"):
+        value = getattr(body, field)
+        if value is not None:
+            setattr(settings, field, value)
+    return settings
+
+
 @router.post("/render", status_code=202)
 async def render_timeline(state: StateDep, project: ProjectDep, body: RenderRequest) -> dict:
-    """Render the timeline. Runs in a worker thread; progress arrives on the event bus."""
+    """Render the timeline, or part of it. Runs in a worker thread; progress arrives on the event bus."""
     if project.timeline.duration <= 0 and not body.still:
         raise ValidationFailed("The timeline is empty — add at least one clip before rendering.")
 
     render_id = new_id("render")
-    name = slugify(body.name or f"{project.name}-{render_id[-6:]}")
-    destination = state.store.renders_dir(project.id) / name
+    base_name = slugify(body.name or f"{project.name}-{render_id[-6:]}")
+    jobs = _plan(project, body, base_name)
 
-    settings = state.settings.render.model_copy()
-    settings.fps = project.timeline.fps or settings.fps
+    # Composition size and rate live on the timeline itself, so an override goes on the derived copy —
+    # the project's own timeline settings are left exactly as the user set them.
+    for job in jobs:
+        if body.fps:
+            job.timeline.fps = body.fps
+        if body.width:
+            job.timeline.width = body.width
+        if body.height:
+            job.timeline.height = body.height
 
     loop = asyncio.get_running_loop()
 
-    def progress(fraction: float, message: str) -> None:
-        # Called from the render thread; hop back onto the loop before touching the event bus.
-        event = StudioEvent(
-            type="render.progress",
-            project_id=project.id,
-            data={"render_id": render_id, "progress": fraction, "message": message},
-        )
-        loop.call_soon_threadsafe(state.events.publish, event)
+    def progress_for(index: int) -> Any:
+        def progress(fraction: float, message: str) -> None:
+            # Called from the render thread; hop back onto the loop before touching the event bus.
+            # Batches report overall progress, so one bar covers the whole export rather than snapping
+            # back to zero for every clip.
+            overall = (index + fraction) / len(jobs)
+            event = StudioEvent(
+                type="render.progress",
+                project_id=project.id,
+                data={
+                    "render_id": render_id,
+                    "progress": overall,
+                    "message": message if len(jobs) == 1 else f"{index + 1}/{len(jobs)} · {message}",
+                },
+            )
+            loop.call_soon_threadsafe(state.events.publish, event)
 
-    renderer = TimelineRenderer(state.store, project, settings, on_progress=progress)
+        return progress
 
     async def run() -> None:
+        outputs: list[dict[str, Any]] = []
         try:
-            # PyAV encoding is CPU-bound and releases the GIL; a thread keeps the API responsive.
-            result = await asyncio.to_thread(
-                renderer.render_still if body.still else renderer.render,
-                destination,
-                **({"time_s": body.time_s} if body.still else {}),
-            )
+            for index, job in enumerate(jobs):
+                renderer = TimelineRenderer(
+                    state.store,
+                    project,
+                    _output_settings(state, body, job.timeline),
+                    on_progress=progress_for(index),
+                )
+                destination = state.store.renders_dir(project.id) / job.name
+                # PyAV encoding is CPU-bound and releases the GIL; a thread keeps the API responsive.
+                result = await asyncio.to_thread(
+                    renderer.render_still if body.still else renderer.render,
+                    destination,
+                    timeline=job.timeline,
+                    **({"time_s": job.still_at} if body.still else {}),
+                )
+                outputs.append(
+                    {
+                        "path": state.store.relativize(project.id, result.path),
+                        "kind": result.kind,
+                        "duration": result.duration,
+                        "frames": result.frames,
+                        "warnings": result.warnings,
+                    }
+                )
+
             state.events.emit(
                 "render.finished",
                 project_id=project.id,
                 data={
                     "render_id": render_id,
                     "ok": True,
-                    "path": state.store.relativize(project.id, result.path),
-                    "kind": result.kind,
-                    "duration": result.duration,
-                    "frames": result.frames,
-                    "warnings": result.warnings,
+                    "scope": body.scope,
+                    "outputs": outputs,
+                    # The first output is repeated at the top level so a single-file render reads the
+                    # same as it always has.
+                    **outputs[0],
                 },
             )
         except Exception as exc:  # noqa: BLE001 - report, never crash the server
@@ -347,11 +487,18 @@ async def render_timeline(state: StateDep, project: ProjectDep, body: RenderRequ
             state.events.emit(
                 "render.finished",
                 project_id=project.id,
-                data={"render_id": render_id, "ok": False, "error": str(exc)},
+                data={
+                    "render_id": render_id,
+                    "ok": False,
+                    "error": str(exc),
+                    "scope": body.scope,
+                    # Whatever did finish before the failure is still on disk and still useful.
+                    "outputs": outputs,
+                },
             )
 
     asyncio.create_task(run())
-    return {"render_id": render_id, "status": "started"}
+    return {"render_id": render_id, "status": "started", "outputs": len(jobs)}
 
 
 @router.get("/renders")
