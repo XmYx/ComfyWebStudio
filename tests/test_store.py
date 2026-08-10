@@ -59,6 +59,40 @@ def test_corrupt_project_json_reports_the_file(store, project):
         store.load(project.id)
 
 
+def test_concurrent_saves_never_corrupt_the_file(store, project):
+    """Two saves at once must not produce a file that no longer parses.
+
+    They used to. Every write went through one shared ``project.json.tmp``, so a second writer truncated
+    it under the first, the first carried on at its own offset, and what landed was a complete document
+    with another document's tail welded on. The project then vanished from the picker, because an
+    unreadable project.json is a project the store skips.
+    """
+    import threading
+
+    path = store.project_dir(project.id) / PROJECT_FILE
+    failures: list[str] = []
+
+    def hammer(index: int) -> None:
+        for round_ in range(12):
+            # Wildly different sizes, so a partial overwrite leaves a tail rather than matching bytes.
+            project.description = f"{index}" * (10 if round_ % 2 else 4000)
+            try:
+                store.save(project)
+                json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:  # noqa: BLE001 - the failure is the result being asserted
+                failures.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=hammer, args=(i,)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not failures, failures[:3]
+    # ...and nothing is left lying around next to the real file.
+    assert not list(path.parent.glob("*.tmp"))
+
+
 def test_future_schema_version_is_refused(store, project):
     path = store.project_dir(project.id) / PROJECT_FILE
     data = json.loads(path.read_text())

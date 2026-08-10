@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   applyNodeChanges,
-  Background, BackgroundVariant, Controls, ReactFlow, ReactFlowProvider, useNodesState, useReactFlow,
+  Background, BackgroundVariant, Controls, ReactFlow, ReactFlowProvider,
+  useNodesInitialized, useNodesState, useReactFlow,
   type Connection, type Edge, type Node, type NodeChange,
 } from '@xyflow/react'
 
@@ -16,14 +17,17 @@ import { Empty, useToast } from '@/components/ui'
 import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
 import { useCommandContext } from '@/features/menu/useCommandContext'
 import { StepNode, type StepNodeData } from './StepNode'
-import { ValueNodeCard, VALUE_NODE_LABELS, type ValueNodeData } from './ValueNodeCard'
+import {
+  ValueNodeCard, VALUE_NODE_LABELS, type ShotSourceOption, type ValueNodeData,
+} from './ValueNodeCard'
 import { TemplateNode, type TemplateNodeData } from './TemplateNode'
 import { belongsToInstance, outputsForInstance } from '@/lib/instances'
+import { isOurDrag, readDrag } from '@/lib/dnd'
 
 const NODE_TYPES = { step: StepNode, value: ValueNodeCard, template: TemplateNode }
 
 /** Offered by the "Add value node" menu, in the order they appear there. */
-const VALUE_NODE_KINDS: ValueNodeKind[] = ['string', 'int', 'float', 'boolean', 'media']
+const VALUE_NODE_KINDS: ValueNodeKind[] = ['string', 'int', 'float', 'boolean', 'media', 'shot']
 
 /** Shared so a step with no links does not get a fresh Set on every render, remounting its node. */
 const EMPTY_KEYS: Set<string> = new Set()
@@ -35,8 +39,10 @@ type CanvasNodeData = StepNodeData | ValueNodeData | TemplateNodeData
 function valueNodeKind(
   project: Project, kind: ValueNodeKind, assetId: string | null, mediaKind: PortKind,
 ): PortKind {
-  if (kind !== 'media') return kind
-  return (assetId && project.assets[assetId]?.kind) || mediaKind
+  // A source node carries whatever is behind it; a literal carries its own type.
+  if (kind === 'media') return (assetId && project.assets[assetId]?.kind) || mediaKind
+  if (kind === 'shot') return mediaKind
+  return kind
 }
 
 /**
@@ -95,6 +101,27 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
   const openInstance = useStudio((s) => s.openInstance)
 
   const assets = useMemo(() => Object.values(project.assets), [project.assets])
+
+  // Every *other* shot's output ports, for a dropped shot node to choose from. A shot cannot source
+  // itself: that would be a cycle the executor could never satisfy.
+  const shotSources = useMemo<ShotSourceOption[]>(
+    () =>
+      project.shots
+        .filter((other) => other.id !== shot.id && !other.template_edit_id)
+        .flatMap((other) =>
+          other.steps.flatMap((step) =>
+            (project.workflows[step.workflow_id]?.ports ?? [])
+              .filter((port) => port.direction === 'out')
+              .map((port) => ({
+                shotId: other.id,
+                shotName: other.name,
+                port: port.key,
+                kind: port.kind,
+              })),
+          ),
+        ),
+    [project.shots, project.workflows, shot.id],
+  )
 
   // Every placed template's surface in one request. Keyed on the shot's own modified stamp so placing,
   // syncing or editing a template refetches, but panning the canvas does not.
@@ -161,11 +188,12 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
           node,
           projectId: project.id,
           assets,
+          shotSources,
           outputKind: valueNodeKind(project, node.kind, node.asset_id, node.media_kind),
           onChanged,
         },
       })),
-    [shot.nodes, project, assets, onChanged],
+    [shot.nodes, project, assets, shotSources, onChanged],
   )
 
   // React Flow is used in controlled mode, so a drag only moves a node if the change is applied back to
@@ -187,6 +215,8 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       shot.steps.map((step) => {
         const live = liveSteps[step.id]
         const preview = live?.outputs?.find((a) => a.thumb)
+        // A video output can be scrubbed by hovering the node, so the file itself is handed down too.
+        const clip = live?.outputs?.find((a) => a.kind === 'video')
         return {
           id: step.id,
           type: 'step',
@@ -199,6 +229,8 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
             workflow: project.workflows[step.workflow_id],
             live,
             thumbUrl: preview?.thumb ? api.media.url(project.id, preview.thumb) : null,
+            videoUrl: clip ? api.media.url(project.id, clip.path) : null,
+            videoDuration: typeof clip?.meta?.duration === 'number' ? clip.meta.duration : null,
             selected: step.id === selectedStepId,
             linkedKeys: linkedByStep.get(step.id) ?? EMPTY_KEYS,
             onRun: onRunStep,
@@ -300,6 +332,21 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       }),
     [shot, project, liveSteps, placed],
   )
+
+  // Fit once the nodes have actually been measured.
+  //
+  // React Flow's `fitView` prop only fires while it is initialising, which is too early if the canvas
+  // mounted before its container had a size — the viewport then stays at the origin and a graph laid out
+  // anywhere else is simply off screen. Waiting for `useNodesInitialized` is the reliable moment. Guarded
+  // per shot so it happens on arrival and never again: re-fitting while someone is panning would fight
+  // them for control of the view.
+  const nodesInitialized = useNodesInitialized()
+  const fittedShot = useRef<string | null>(null)
+  useEffect(() => {
+    if (!nodesInitialized || fittedShot.current === shot.id) return
+    fittedShot.current = shot.id
+    flow.fitView({ padding: 0.25, maxZoom: 1 })
+  }, [nodesInitialized, shot.id, flow])
 
   // Hand the Window menu a handle on this canvas, and take it back on unmount so a stale one cannot
   // outlive the view it belonged to.
@@ -473,6 +520,49 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     [project.id, shot.id, flow, onChanged, toast],
   )
 
+  /**
+   * Dropping a library entry onto the canvas.
+   *
+   * Each kind becomes the node that means it: a workflow becomes a step, an asset becomes a media source,
+   * a shot becomes a node supplying that shot's last result, and a template is placed as a container.
+   * Everything lands where it was dropped rather than in a corner.
+   */
+  const onDrop = useCallback(
+    async (event: React.DragEvent) => {
+      const payload = readDrag(event)
+      if (!payload) return
+      event.preventDefault()
+
+      const at = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY })
+      try {
+        if (payload.kind === 'workflow') {
+          await api.steps.create(project.id, shot.id, payload.id, { ui_pos: at })
+        } else if (payload.kind === 'asset') {
+          await api.nodes.create(project.id, shot.id, {
+            kind: 'media', name: payload.name, asset_id: payload.id,
+            media_kind: payload.mediaKind as PortKind, ui_pos: at,
+          })
+        } else if (payload.kind === 'shot') {
+          // Default to the first output that shot offers, so the node is useful the moment it lands.
+          const first = shotSources.find((source) => source.shotId === payload.id)
+          await api.nodes.create(project.id, shot.id, {
+            kind: 'shot', name: payload.name,
+            source_shot_id: payload.id,
+            source_port: first?.port,
+            media_kind: first?.kind ?? 'image',
+            ui_pos: at,
+          })
+        } else if (payload.kind === 'template') {
+          await api.instances.place(project.id, shot.id, { template_id: payload.id, ui_pos: at })
+        }
+        onChanged()
+      } catch (error) {
+        toast.push('bad', (error as ApiError).message)
+      }
+    },
+    [project.id, shot.id, flow, shotSources, onChanged, toast],
+  )
+
   const placeTemplateItems = useCallback(
     (event: React.MouseEvent): MenuItem[] =>
       (templates ?? []).map((template) => ({
@@ -527,9 +617,37 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     },
   ]
 
+  /** Its outputs that actually produced something, as "save this as an asset" entries. */
+  const saveAsAssetItems = (step: (typeof shot.steps)[number]): MenuItem[] =>
+    (liveSteps[step.id]?.outputs ?? []).map((artifact) => ({
+      type: 'action' as const,
+      label: `${artifact.port_key} (${artifact.kind})`,
+      onSelect: async () => {
+        try {
+          const asset = await api.media.capture(project.id, {
+            shot_id: shot.id,
+            step_id: step.id,
+            port_key: artifact.port_key,
+            name: `${step.name} · ${artifact.port_key}`,
+          })
+          toast.push('ok', `Saved “${asset.name}” to the asset library.`)
+          onChanged()
+        } catch (error) {
+          toast.push('bad', (error as ApiError).message)
+        }
+      },
+    }))
+
   const nodeMenu = (step: (typeof shot.steps)[number]): MenuItem[] => [
     { type: 'header', label: step.name },
     { type: 'action', label: 'Run this step', shortcut: undefined, onSelect: () => onRunStep(step.id) },
+    {
+      type: 'submenu',
+      label: 'Save output as asset',
+      items: saveAsAssetItems(step),
+      // Nothing to save until it has produced something.
+      disabled: !(liveSteps[step.id]?.outputs ?? []).length,
+    },
     { type: 'separator' },
     { type: 'command', id: 'edit.copy' },
     { type: 'command', id: 'edit.cut' },
@@ -718,11 +836,18 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
       <div
         className="h-full"
         onContextMenu={(event) => contextMenu.open(event, paneMenu(event))}
+        // An empty shot is exactly when someone drags their first thing in, so it has to accept drops too.
+        onDrop={onDrop}
+        onDragOver={(event) => {
+          if (!isOurDrag(event)) return
+          event.preventDefault()
+          event.dataTransfer.dropEffect = 'copy'
+        }}
       >
         <Empty title="This shot has no steps yet">
-          Add a workflow from the left panel, or right-click here. Each step runs one ComfyUI workflow;
-          connect an output port to an input port to chain them. Right-click also adds value nodes —
-          text, numbers or imported media — to feed those inputs.
+          Drag a workflow, shot, asset or template in from the left, or right-click here. Each step runs
+          one ComfyUI workflow; connect an output port to an input port to chain them. Right-click also
+          adds value nodes — text, numbers or media — to feed those inputs.
         </Empty>
         <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
       </div>
@@ -768,6 +893,14 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
         if (step) contextMenu.open(event, nodeMenu(step))
       }}
       onEdgeContextMenu={(event, edge) => contextMenu.open(event, edgeMenu(edge.id))}
+      onDrop={onDrop}
+      // dragover must be prevented for a drop to fire at all, but only for our own drags — otherwise the
+      // canvas swallows file drags meant for the rest of the page.
+      onDragOver={(event) => {
+        if (!isOurDrag(event)) return
+        event.preventDefault()
+        event.dataTransfer.dropEffect = 'copy'
+      }}
       fitView
       fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
       proOptions={{ hideAttribution: true }}

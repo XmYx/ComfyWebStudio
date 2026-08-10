@@ -798,6 +798,161 @@ async def test_importing_a_missing_comfy_workflow_is_a_clean_404(client):
     assert response.status_code == 404
 
 
+# -- assets and source nodes -----------------------------------------------------------------------------
+
+
+async def test_capturing_a_step_output_as_an_asset(client):
+    project, shot, steps = await build_chain(client)
+    await run_and_wait(client, project["id"], shot["id"])
+
+    response = await client.post(
+        f"/api/projects/{project['id']}/assets/capture",
+        json={
+            "shot_id": shot["id"], "step_id": steps[0]["id"],
+            "port_key": "image", "name": "Hero frame",
+        },
+    )
+    assert response.status_code == 201, response.text
+    asset = response.json()
+
+    assert asset["name"] == "Hero frame" and asset["kind"] == "image"
+    assert asset["source"]["step_id"] == steps[0]["id"]
+    assert asset["generated"], "a generated asset should record when it was produced"
+
+    # It behaves like any other asset — the media endpoint serves it.
+    served = await client.get(
+        f"/api/projects/{project['id']}/media", params={"path": asset["path"]}
+    )
+    assert served.status_code == 200
+
+
+async def test_capturing_before_anything_ran_is_refused(client):
+    project, shot, steps = await build_chain(client)
+    response = await client.post(
+        f"/api/projects/{project['id']}/assets/capture",
+        json={"shot_id": shot["id"], "step_id": steps[0]["id"], "port_key": "image"},
+    )
+    assert response.status_code == 422
+    assert "Run it first" in response.json()["message"]
+
+
+async def test_refreshing_a_generated_asset_picks_up_a_newer_result(client):
+    project, shot, steps = await build_chain(client)
+    await run_and_wait(client, project["id"], shot["id"])
+    asset = (
+        await client.post(
+            f"/api/projects/{project['id']}/assets/capture",
+            json={"shot_id": shot["id"], "step_id": steps[0]["id"], "port_key": "caption"},
+        )
+    ).json()
+
+    # Change what the step produces, then re-run so there is a genuinely different result.
+    await client.patch(
+        f"/api/projects/{project['id']}/steps/{steps[0]['id']}",
+        json={"param_overrides": {"prompt": "a completely different caption"}},
+    )
+    await run_and_wait(client, project["id"], shot["id"], mode="shot", force=True)
+
+    refreshed = await client.post(f"/api/projects/{project['id']}/assets/{asset['id']}/refresh")
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["sha256"] != asset["sha256"], "it should point at the newer result"
+
+
+async def test_refreshing_an_imported_asset_is_refused(client):
+    project = await make_project(client)
+    upload = await client.post(
+        f"/api/projects/{project['id']}/assets",
+        files={"file": ("still.png", io.BytesIO(_png_bytes()), "image/png")},
+    )
+    asset = upload.json()
+    assert asset["source"] is None
+
+    response = await client.post(f"/api/projects/{project['id']}/assets/{asset['id']}/refresh")
+    assert response.status_code == 422
+    assert "imported" in response.json()["message"]
+
+
+async def test_a_dropped_shot_node_feeds_a_step_its_last_result(client):
+    """Dropping a shot supplies what it produced. It is a source: it does not re-run the shot."""
+    source, source_shot, _steps = await build_chain(client)
+    await run_and_wait(client, source["id"], source_shot["id"])
+
+    # A second shot that consumes what the first one made.
+    consumer_wf = await import_workflow(client, source["id"], "Consume2", consumer_prompt())
+    shot = (await client.post(f"/api/projects/{source['id']}/shots", json={"name": "Uses it"})).json()
+    step = (
+        await client.post(
+            f"/api/projects/{source['id']}/shots/{shot['id']}/steps",
+            json={"workflow_id": consumer_wf["id"]},
+        )
+    ).json()
+    node = (
+        await client.post(
+            f"/api/projects/{source['id']}/shots/{shot['id']}/nodes",
+            json={
+                "kind": "shot", "name": "From chain",
+                "source_shot_id": source_shot["id"], "source_port": "final",
+                "media_kind": "image",
+            },
+        )
+    ).json()
+    link = await client.post(
+        f"/api/projects/{source['id']}/shots/{shot['id']}/links",
+        json={
+            "from_step": node["id"], "from_port": "value",
+            "to_step": step["id"], "to_port": "image",
+        },
+    )
+    assert link.status_code == 201, link.text
+
+    run = await run_and_wait(client, source["id"], shot["id"])
+    assert run["status"] == "success", run.get("error")
+    # Only the consuming step ran — the source shot was read, not executed.
+    assert [sr["step_id"] for sr in run["step_runs"]] == [step["id"]]
+
+
+async def test_a_shot_node_with_nothing_chosen_is_refused_before_running(client):
+    project, shot, _steps = await build_chain(client)
+    # A step of its own, so its image input is free to wire the source node into.
+    workflow = await import_workflow(client, project["id"], "Consume2", consumer_prompt())
+    step = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+            json={"workflow_id": workflow["id"]},
+        )
+    ).json()
+    node = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/nodes",
+            json={"kind": "shot", "media_kind": "image"},
+        )
+    ).json()
+    link = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/links",
+        json={
+            "from_step": node["id"], "from_port": "value",
+            "to_step": step["id"], "to_port": "image",
+        },
+    )
+    assert link.status_code == 201, link.text
+
+    report = (
+        await client.get(f"/api/projects/{project['id']}/shots/{shot['id']}/validate")
+    ).json()
+    assert report["ok"] is False
+    assert any("no shot output chosen" in i["message"] for i in report["issues"])
+
+
+def _png_bytes() -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (8, 8), (90, 20, 30)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 # -- shot templates --------------------------------------------------------------------------------------
 
 
@@ -995,6 +1150,124 @@ async def test_improving_a_template_reaches_a_placed_instance_after_a_sync(clien
     run = await run_and_wait(client, target["id"], other["id"])
     assert run["status"] == "success", run.get("error")
     assert len(run["step_runs"]) == 3, "the instance should now run the template's third step"
+
+
+async def test_opening_a_template_gives_back_an_editable_shot(client):
+    source, shot, _steps = await build_chain(client)
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+
+    target = await make_project(client, "Target")
+    opened = await client.post(f"/api/projects/{target['id']}/templates/{template['id']}/edit")
+    assert opened.status_code == 201, opened.text
+    session = opened.json()
+
+    # A real shot, with the template's contents and its workflows imported into this project.
+    assert session["template_edit_id"] == template["id"]
+    assert {s["name"] for s in session["steps"]} == {"Generate", "Consume"}
+    assert len(session["links"]) == 1
+    assert len((await client.get(f"/api/projects/{target['id']}")).json()["workflows"]) == 2
+
+    # Opening again reuses the session rather than forking a second copy of it.
+    again = await client.post(f"/api/projects/{target['id']}/templates/{template['id']}/edit")
+    assert again.json()["id"] == session["id"]
+
+
+async def test_editing_a_template_and_saving_it_reaches_placed_instances(client):
+    source, shot, _steps = await build_chain(client)
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+
+    target = await make_project(client, "Target")
+    other = (await client.post(f"/api/projects/{target['id']}/shots", json={"name": "S"})).json()
+    instance = (
+        await client.post(
+            f"/api/projects/{target['id']}/shots/{other['id']}/instances",
+            json={"template_id": template["id"]},
+        )
+    ).json()
+
+    # Open the template, add a step to it, and save it back.
+    session = (
+        await client.post(f"/api/projects/{target['id']}/templates/{template['id']}/edit")
+    ).json()
+    workflow_id = session["steps"][0]["workflow_id"]
+    await client.post(
+        f"/api/projects/{target['id']}/shots/{session['id']}/steps",
+        json={"workflow_id": workflow_id, "name": "Added while editing"},
+    )
+    saved = await client.post(
+        f"/api/projects/{target['id']}/shots/{session['id']}/save-as-template", json={}
+    )
+    assert saved.status_code == 201, saved.text
+    assert saved.json()["id"] == template["id"], "it should save over the template, not fork one"
+    assert saved.json()["revision"] == template["revision"] + 1
+    assert len(saved.json()["steps"]) == 3
+
+    # The instance follows immediately — the user edited the template, so it is not "out of date".
+    placed = (
+        await client.get(f"/api/projects/{target['id']}/shots/{other['id']}/placed")
+    ).json()[0]
+    assert placed["stale"] is False
+    assert placed["summary"]["step_count"] == 3
+
+    run = await run_and_wait(client, target["id"], other["id"])
+    assert run["status"] == "success", run.get("error")
+    assert len(run["step_runs"]) == 3, "the added step should now run inside the placed instance"
+    assert instance["id"]
+
+
+async def test_saving_over_a_template_keeps_the_surface_choices(client):
+    """Re-deriving promotions must not un-hide everything the user hid."""
+    source, shot, steps = await build_chain(client)
+    await client.patch(
+        f"/api/projects/{source['id']}/steps/{steps[0]['id']}", json={"exposed_params": ["prompt"]}
+    )
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+
+    control = next(c for c in template["controls"] if c["shown"])
+    port = next(p for p in template["ports"] if p["direction"] == "out")
+    await client.patch(
+        f"/api/templates/{template['id']}/controls/{control['key']}",
+        json={"shown": False, "label": "Renamed control"},
+    )
+    await client.patch(
+        f"/api/templates/{template['id']}/ports/{port['key']}", json={"label": "Renamed port"},
+    )
+
+    # Save the source shot over it again, which re-derives every promotion from scratch.
+    resaved = await save_template(
+        client, source["id"], shot["id"], name="Chain bit", template_id=template["id"]
+    )
+
+    kept_control = next(c for c in resaved["controls"] if c["key"] == control["key"])
+    assert kept_control["shown"] is False and kept_control["label"] == "Renamed control"
+    kept_port = next(p for p in resaved["ports"] if p["key"] == port["key"])
+    assert kept_port["label"] == "Renamed port"
+
+
+async def test_a_template_session_stays_out_of_the_timeline(client):
+    source, shot, _steps = await build_chain(client)
+    await run_and_wait(client, source["id"], shot["id"])
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+    await client.post(f"/api/projects/{source['id']}/templates/{template['id']}/edit")
+
+    timeline = (await client.post(f"/api/projects/{source['id']}/timeline/from-shots")).json()
+    # One clip for the real shot, and nothing for the editing session.
+    assert len(timeline["tracks"][0]["clips"]) == 1
+
+
+async def test_closing_a_session_leaves_the_template_alone(client):
+    source, shot, _steps = await build_chain(client)
+    template = await save_template(client, source["id"], shot["id"], name="Chain bit")
+    session = (
+        await client.post(f"/api/projects/{source['id']}/templates/{template['id']}/edit")
+    ).json()
+
+    response = await client.delete(f"/api/projects/{source['id']}/templates/edit/{session['id']}")
+    assert response.status_code == 204
+
+    shots = (await client.get(f"/api/projects/{source['id']}/shots")).json()
+    assert all(s["id"] != session["id"] for s in shots)
+    assert (await client.get(f"/api/templates/{template['id']}")).status_code == 200
 
 
 async def test_hiding_a_control_takes_it_off_the_node(client):

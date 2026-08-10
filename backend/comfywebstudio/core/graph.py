@@ -237,15 +237,24 @@ def validate_shot(project: Project, shot: Shot) -> GraphReport:
                 )
             )
 
-    # A media node with nothing chosen has nothing to hand downstream, and the step it feeds will fail at
-    # run time rather than when the user wired it up.
+    # A source node with nothing behind it has nothing to hand downstream, and the step it feeds would
+    # fail at run time rather than when the user wired it up.
     wired = {link.from_step for link in shot.links}
     for node in shot.nodes:
-        if node.kind == "media" and node.id in wired and not project.assets.get(node.asset_id or ""):
+        if node.id not in wired or not node.is_source:
+            continue
+        if node.kind == "media" and not project.assets.get(node.asset_id or ""):
             report.issues.append(
                 GraphIssue(
                     "error",
                     f"{node.display_name!r} has no media selected, so the step it feeds cannot run.",
+                )
+            )
+        elif node.kind == "shot" and not (node.source_shot_id and node.source_port):
+            report.issues.append(
+                GraphIssue(
+                    "error",
+                    f"{node.display_name!r} has no shot output chosen, so the step it feeds cannot run.",
                 )
             )
 

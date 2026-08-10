@@ -267,6 +267,16 @@ export const api = {
         method: 'POST',
         body: json(body),
       }),
+    /**
+     * Open a template's graph as an editable shot.
+     *
+     * The session is a real shot, so the ordinary canvas edits it; saving it back over the template is
+     * just `saveShot` with the template id, which the session already carries.
+     */
+    edit: (projectId: string, templateId: string) =>
+      request<Shot>(`/api/projects/${projectId}/templates/${templateId}/edit`, { method: 'POST' }),
+    closeSession: (projectId: string, shotId: string) =>
+      request<void>(`/api/projects/${projectId}/templates/edit/${shotId}`, { method: 'DELETE' }),
   },
 
   instances: {
@@ -340,6 +350,23 @@ export const api = {
     },
     removeAsset: (projectId: string, assetId: string) =>
       request<void>(`/api/projects/${projectId}/assets/${assetId}`, { method: 'DELETE' }),
+    renameAsset: (projectId: string, assetId: string, name: string) =>
+      request<Asset>(`/api/projects/${projectId}/assets/${assetId}`, {
+        method: 'PATCH',
+        body: json({ name }),
+      }),
+    /** Promote a step's output into a named asset that remembers what made it. */
+    capture: (
+      projectId: string,
+      body: { shot_id: string; step_id: string; port_key: string; name?: string },
+    ) =>
+      request<Asset>(`/api/projects/${projectId}/assets/capture`, {
+        method: 'POST',
+        body: json(body),
+      }),
+    /** Point a generated asset at its source's latest result. Does not run anything. */
+    refresh: (projectId: string, assetId: string) =>
+      request<Asset>(`/api/projects/${projectId}/assets/${assetId}/refresh`, { method: 'POST' }),
   },
 
   // -- timeline ------------------------------------------------------------------------------------

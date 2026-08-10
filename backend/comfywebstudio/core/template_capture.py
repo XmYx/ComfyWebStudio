@@ -531,6 +531,121 @@ def place_instance(
     return instance
 
 
+def materialise(
+    project: Project,
+    template: ShotTemplate,
+    template_store,
+    project_store,
+    *,
+    name: str = "",
+) -> Shot:
+    """Turn a template back into a real, editable shot.
+
+    This is what "open a template" means. Rather than building a second editor that understands templates,
+    the template is unpacked into ordinary steps, value nodes and links and handed to the canvas that
+    already exists — so editing a template is editing a shot, with every control, link and ComfyUI round
+    trip working exactly as it does anywhere else.
+
+    Template keys become the step and node ids, so saving the session back over the template lands on the
+    same keys and the promotion choices made against them survive.
+    """
+    mapping = adopt_workflows(project, template, template_store, project_store)
+    shot = Shot(
+        name=name or f"Editing: {template.name}",
+        template_edit_id=template.id,
+    )
+
+    for step in template.steps:
+        workflow_id = mapping.get(step.workflow_key)
+        if not workflow_id:
+            continue
+        shot.steps.append(
+            Step(
+                id=step.key,
+                name=step.name,
+                workflow_id=workflow_id,
+                enabled=step.enabled,
+                param_overrides=dict(step.param_overrides),
+                exposed_params=list(step.exposed_params),
+                seed_mode=step.seed_mode,
+                notes=step.notes,
+                ui_pos=step.ui_pos.model_copy(),
+                ui_size=step.ui_size.model_copy(),
+            )
+        )
+
+    for node in template.nodes:
+        shot.nodes.append(
+            ValueNode(
+                id=node.key,
+                name=node.name,
+                kind=node.kind,
+                value=node.value,
+                media_kind=node.media_kind,
+                ui_pos=node.ui_pos.model_copy(),
+                ui_size=node.ui_size.model_copy(),
+            )
+        )
+
+    live = {step.id for step in shot.steps} | {node.id for node in shot.nodes}
+    for link in template.links:
+        if link.from_key in live and link.to_key in live:
+            shot.links.append(
+                Link(
+                    from_step=link.from_key,
+                    from_port=link.from_port,
+                    to_step=link.to_key,
+                    to_port=link.to_port,
+                )
+            )
+
+    _normalise_positions(shot)
+    return shot
+
+
+#: Where the top-left of a materialised graph lands, so it opens on screen rather than off it.
+LAYOUT_MARGIN = 60.0
+
+
+def _normalise_positions(shot: Shot) -> None:
+    """Shift a materialised graph so it starts near the origin.
+
+    A template keeps the coordinates of the shot it was captured from, which are wherever that user had
+    panned to — frequently far negative. Opening it would then show an empty canvas with the nodes off
+    somewhere to the left. Shifting is enough; the relative layout, which is the part the author meant, is
+    untouched.
+    """
+    placed = [*shot.steps, *shot.nodes]
+    if not placed:
+        return
+
+    left = min(item.ui_pos.x for item in placed)
+    top = min(item.ui_pos.y for item in placed)
+    for item in placed:
+        item.ui_pos.x += LAYOUT_MARGIN - left
+        item.ui_pos.y += LAYOUT_MARGIN - top
+
+
+def carry_over_promotions(captured: ShotTemplate, previous: ShotTemplate) -> None:
+    """Keep the surface choices the user already made when saving over a template.
+
+    Promotions are re-derived on every capture, which would otherwise un-hide every control the user
+    hid and throw away every port they renamed. Anything whose key survives keeps its label and its
+    shown flag; anything new arrives with the derived default.
+    """
+    ports = {port.key: port for port in previous.ports}
+    for port in captured.ports:
+        kept = ports.get(port.key)
+        if kept is not None and kept.inner_key == port.inner_key:
+            port.label, port.shown = kept.label, kept.shown
+
+    controls = {control.key: control for control in previous.controls}
+    for control in captured.controls:
+        kept = controls.get(control.key)
+        if kept is not None and kept.inner_key == control.inner_key:
+            control.label, control.shown = kept.label, kept.shown
+
+
 def sync_instance(
     project: Project,
     instance: TemplateInstance,

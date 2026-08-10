@@ -67,6 +67,9 @@ class CreateValueNodeRequest(BaseModel):
     name: str | None = None
     value: Any = None
     asset_id: str | None = None
+    #: For a ``shot`` node: which shot's output to take, and which of its ports.
+    source_shot_id: str | None = None
+    source_port: str | None = None
     media_kind: PortKind | None = None
     ui_pos: Vec2 | None = None
     ui_size: Size | None = None
@@ -76,6 +79,8 @@ class UpdateValueNodeRequest(BaseModel):
     name: str | None = None
     value: Any = None
     asset_id: str | None = None
+    source_shot_id: str | None = None
+    source_port: str | None = None
     media_kind: PortKind | None = None
     ui_pos: Vec2 | None = None
     ui_size: Size | None = None
@@ -251,7 +256,7 @@ def delete_step(state: StateDep, project: ProjectDep, step_id: str) -> None:
 
 #: What a freshly placed node holds, so it is immediately usable rather than empty.
 _VALUE_NODE_DEFAULTS: dict[str, Any] = {
-    "string": "", "int": 0, "float": 0.0, "boolean": False, "media": None,
+    "string": "", "int": 0, "float": 0.0, "boolean": False, "media": None, "shot": None,
 }
 
 
@@ -283,6 +288,8 @@ def create_value_node(
         name=body.name or "",
         value=body.value if body.value is not None else _VALUE_NODE_DEFAULTS.get(body.kind),
         asset_id=body.asset_id,
+        source_shot_id=body.source_shot_id,
+        source_port=body.source_port,
         # Stacked below the steps rather than beside them: value nodes feed inputs, so the left-hand
         # column is where the user will look for them.
         ui_pos=body.ui_pos or Vec2(x=-220.0, y=80.0 + 120.0 * len(shot.nodes)),
@@ -316,7 +323,7 @@ def update_value_node(
     elif body.clear_value:
         node.value = None
 
-    for field in ("name", "media_kind", "ui_pos", "ui_size"):
+    for field in ("name", "source_shot_id", "source_port", "media_kind", "ui_pos", "ui_size"):
         value = getattr(body, field)
         if value is not None:
             setattr(node, field, value)

@@ -7,6 +7,7 @@ import type { Project, Shot, WorkflowRef } from '@/api/types'
 import { KIND_COLOR } from '@/lib/kinds'
 import { relativeTime } from '@/lib/format'
 import { Badge, Button, Panel, PanelHeader, Spinner, useToast } from '@/components/ui'
+import { startDrag } from '@/lib/dnd'
 import { ComfyWorkflowBrowser } from './ComfyWorkflowBrowser'
 import { TemplateLibrary } from './TemplateLibrary'
 import { useLayout } from '@/store/layout'
@@ -171,8 +172,13 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
             {workflows.map((workflow) => (
               <div
                 key={workflow.id}
+                draggable
+                onDragStart={(event) =>
+                  startDrag(event, { kind: 'workflow', id: workflow.id, name: workflow.name })
+                }
                 onContextMenu={(event) => contextMenu.open(event, workflowMenu(workflow))}
-                className="rounded-md border border-[var(--color-edge)] bg-[var(--color-surface)] p-2"
+                title="Drag onto the canvas to add it as a step"
+                className="cursor-grab rounded-md border border-[var(--color-edge)] bg-[var(--color-surface)] p-2 active:cursor-grabbing"
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">

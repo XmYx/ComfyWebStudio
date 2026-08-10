@@ -32,6 +32,15 @@ export const VALUE_NODE_LABELS: Record<ValueNodeKind, string> = {
   float: 'Number',
   boolean: 'Boolean',
   media: 'Media',
+  shot: 'Shot output',
+}
+
+/** One output another shot offers, flattened for the picker. */
+export interface ShotSourceOption {
+  shotId: string
+  shotName: string
+  port: string
+  kind: PortKind
 }
 
 export interface ValueNodeData extends Record<string, unknown> {
@@ -39,12 +48,14 @@ export interface ValueNodeData extends Record<string, unknown> {
   projectId: string
   /** Project assets, for the media picker. */
   assets: Asset[]
+  /** Every other shot's output ports, for the shot-source picker. */
+  shotSources: ShotSourceOption[]
   outputKind: PortKind
   onChanged: () => void
 }
 
 export function ValueNodeCard({ data, selected }: NodeProps) {
-  const { node, projectId, assets, outputKind, onChanged } = data as ValueNodeData
+  const { node, projectId, assets, shotSources, outputKind, onChanged } = data as ValueNodeData
   const color = KIND_COLOR[outputKind] ?? 'var(--kind-file)'
   const sized = node.ui_size?.w > 0 && node.ui_size?.h > 0
 
@@ -86,6 +97,14 @@ export function ValueNodeCard({ data, selected }: NodeProps) {
             // The empty option means "none", which is a clear rather than an unknown asset id.
             onPick={(assetId) => patch(assetId ? { asset_id: assetId } : { clear_asset: true })}
             onKind={(kind) => patch({ media_kind: kind })}
+          />
+        ) : node.kind === 'shot' ? (
+          <ShotSourceBody
+            node={node}
+            sources={shotSources}
+            onPick={(shotId, port, kind) =>
+              patch({ source_shot_id: shotId, source_port: port, media_kind: kind })
+            }
           />
         ) : (
           <ScalarBody node={node} onChange={(value) => patch({ value })} />
@@ -178,6 +197,51 @@ function ScalarBody({ node, onChange }: { node: ValueNode; onChange: (value: unk
       value={String(draft ?? '')}
       onChange={(e) => set(e.target.value)}
     />
+  )
+}
+
+/**
+ * A node that hands on whatever another shot last produced.
+ *
+ * It is a *source*, not a call: picking a shot output here does not make that shot run. What arrives is
+ * its most recent result, which is why the node says so rather than implying otherwise.
+ */
+function ShotSourceBody({
+  node, sources, onPick,
+}: {
+  node: ValueNode
+  sources: ShotSourceOption[]
+  onPick: (shotId: string, port: string, kind: PortKind) => void
+}) {
+  const current = sources.find(
+    (s) => s.shotId === node.source_shot_id && s.port === node.source_port,
+  )
+
+  return (
+    <div className="space-y-1.5">
+      <Select
+        className="nodrag !py-0.5 !text-[10px]"
+        value={current ? `${current.shotId}|${current.port}` : ''}
+        onChange={(e) => {
+          const option = sources.find((s) => `${s.shotId}|${s.port}` === e.target.value)
+          if (option) onPick(option.shotId, option.port, option.kind)
+        }}
+      >
+        <option value="">
+          {sources.length ? 'Choose a shot output…' : 'No other shot has outputs yet'}
+        </option>
+        {sources.map((option) => (
+          <option key={`${option.shotId}|${option.port}`} value={`${option.shotId}|${option.port}`}>
+            {option.shotName} · {option.port} ({option.kind})
+          </option>
+        ))}
+      </Select>
+      <div className="text-[9px] leading-snug text-[var(--color-ink-dim)]">
+        {current
+          ? 'Supplies that shot’s most recent result. Run it there to refresh.'
+          : 'Nothing chosen yet.'}
+      </div>
+    </div>
   )
 }
 

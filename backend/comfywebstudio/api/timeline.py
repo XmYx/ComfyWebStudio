@@ -262,7 +262,11 @@ def build_from_shots(
     """
     from ..core.graph import topological_order
 
-    shots = [s for s in project.shots if shot_ids is None or s.id in shot_ids]
+    # An open template editing session is not a shot the user cut; it must not land in the timeline.
+    shots = [
+        s for s in project.shots
+        if not s.template_edit_id and (shot_ids is None or s.id in shot_ids)
+    ]
     if not shots:
         raise ValidationFailed("No shots to build from.")
 

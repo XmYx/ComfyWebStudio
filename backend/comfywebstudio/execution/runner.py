@@ -72,11 +72,22 @@ class PinnedInput:
     scalar: Any = None
     #: Set for a media node. ``None`` on a media node whose asset has not been chosen.
     asset: Asset | None = None
+    #: Set for a dropped shot node — the artifact that shot last produced on the chosen port.
+    artifact: Artifact | None = None
     #: What to call it when something is wrong with it.
     label: str = "value node"
 
     @property
+    def media_path(self) -> str | None:
+        """The project-relative file this pin supplies, whichever kind of source it is."""
+        if self.artifact is not None:
+            return self.artifact.path
+        return self.asset.path if self.asset is not None else None
+
+    @property
     def fingerprint(self) -> str:
+        if self.artifact is not None:
+            return self.artifact.sha256 or self.artifact.path
         if self.asset is not None:
             return self.asset.sha256 or self.asset.path
         return f"{self.kind}:{self.scalar!r}"
@@ -288,16 +299,17 @@ class StepRunner:
 
             pin = pinned.get(port.key)
             if pin is not None:
+                source = pin.media_path
                 if scalar_port:
                     scalar_overrides[port.key] = pin.scalar
-                elif pin.asset is None:
+                elif source is None:
                     raise StepFailed(
-                        f"Input {port.display_name!r} is connected to {pin.label!r}, which has no media "
-                        "selected."
+                        f"Input {port.display_name!r} is connected to {pin.label!r}, which has nothing to "
+                        "give it yet — choose its media, or run the shot it comes from."
                     )
                 else:
                     media_sources[port.key] = await self._stage_file(
-                        backend, pin.asset.path, port.kind, run_key,
+                        backend, source, port.kind, run_key,
                         what=f"{pin.label!r}, feeding input {port.display_name!r}",
                     )
                 continue

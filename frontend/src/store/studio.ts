@@ -36,6 +36,9 @@ interface StudioState {
 
   activeRun: Run | null
   liveSteps: Record<string, LiveStep>
+  /** Timeline transport. Shared, so a floating monitor and the timeline agree on where we are. */
+  playhead: number
+  playing: boolean
   renderProgress: { id: string; progress: number; message: string } | null
   historyTarget: HistoryTarget | null
 
@@ -50,6 +53,8 @@ interface StudioState {
   endRun: (status: Run['status'], error?: string | null) => void
   patchStep: (stepId: string, patch: LiveStep) => void
   seedFromResults: (results: Record<string, { step_run: StepRun }>) => void
+  setPlayhead: (time: number) => void
+  setPlaying: (playing: boolean) => void
   setRenderProgress: (progress: StudioState['renderProgress']) => void
   setHistoryTarget: (target: HistoryTarget | null) => void
   clearLive: () => void
@@ -64,6 +69,8 @@ export const useStudio = create<StudioState>((set) => ({
   selectedClip: null,
   activeRun: null,
   liveSteps: {},
+  playhead: 0,
+  playing: false,
   renderProgress: null,
   historyTarget: null,
 
@@ -79,6 +86,8 @@ export const useStudio = create<StudioState>((set) => ({
   selectInstance: (id) => set({ selectedInstanceId: id, selectedStepId: null }),
   openInstance: (id) => set({ openInstanceId: id, selectedStepId: null, selectedInstanceId: null }),
   selectClip: (selection) => set({ selectedClip: selection }),
+  setPlayhead: (playhead) => set({ playhead }),
+  setPlaying: (playing) => set({ playing }),
 
   beginRun: (run) =>
     set((state) => ({

@@ -216,7 +216,7 @@ def save_settings(settings: AppSettings, path: Path | None = None) -> Path:
     """Persist settings atomically so a crash mid-write cannot leave an unreadable file."""
     settings.ensure_dirs()
     target = path or settings.settings_file
-    tmp = target.with_suffix(".json.tmp")
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
     payload = settings.model_dump(mode="json", exclude_none=False)
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=False), encoding="utf-8")
     os.replace(tmp, target)

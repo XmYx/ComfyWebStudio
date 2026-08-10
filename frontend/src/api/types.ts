@@ -96,7 +96,7 @@ export interface Step {
 }
 
 /** What a value node holds. `media` points at an imported asset; the rest are literals. */
-export type ValueNodeKind = 'string' | 'int' | 'float' | 'boolean' | 'media'
+export type ValueNodeKind = 'string' | 'int' | 'float' | 'boolean' | 'media' | 'shot'
 
 /** The single output port every value node has. Mirrors VALUE_PORT in core/models.py. */
 export const VALUE_PORT = 'value'
@@ -108,7 +108,10 @@ export interface ValueNode {
   kind: ValueNodeKind
   value: unknown
   asset_id: string | null
-  /** What an empty media node offers, so it can be wired before the footage is chosen. */
+  /** For a `shot` node: whose output to take, and which port of it. */
+  source_shot_id: string | null
+  source_port: string | null
+  /** What an empty source node offers, so it can be wired before its source is chosen. */
   media_kind: PortKind
   ui_pos: Vec2
   ui_size: Size
@@ -211,6 +214,8 @@ export interface Shot {
   name: string
   notes: string
   color: string | null
+  /** Set when this shot is an open editing session for that template rather than a shot of its own. */
+  template_edit_id: string | null
   steps: Step[]
   nodes: ValueNode[]
   instances: TemplateInstance[]
@@ -299,12 +304,21 @@ export interface Timeline {
   duration: number
 }
 
+/** What produces a generated asset. Absent on imported media. */
+export interface AssetSource {
+  shot_id: string
+  step_id: string
+  port_key: string
+}
+
 export interface Asset {
   id: string
   name: string
   kind: PortKind
   path: string
   thumb: string | null
+  source?: AssetSource | null
+  generated?: string | null
   meta: Record<string, any>
 }
 

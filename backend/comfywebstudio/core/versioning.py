@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .diffing import Change, diff_projects, summarize
 from .errors import NotFound, ValidationFailed
@@ -264,18 +265,24 @@ class VersionStore:
         sha = _hash(project)
         path = self.snapshot_dir / f"{sha}.json.gz"
         if not path.is_file():
-            temp = path.with_suffix(".gz.tmp")
-            with gzip.open(temp, "wt", encoding="utf-8") as handle:
-                json.dump(project, handle, ensure_ascii=False)
-            os.replace(temp, path)
+            temp = _temp_beside(path)
+            try:
+                with gzip.open(temp, "wt", encoding="utf-8") as handle:
+                    json.dump(project, handle, ensure_ascii=False)
+                os.replace(temp, path)
+            finally:
+                temp.unlink(missing_ok=True)
         return sha
 
     def _rewrite(self, versions: list[Version]) -> None:
-        temp = self.log_path.with_suffix(".jsonl.tmp")
-        with open(temp, "w", encoding="utf-8") as handle:
-            for version in versions:
-                handle.write(json.dumps(version.to_dict(), ensure_ascii=False) + "\n")
-        os.replace(temp, self.log_path)
+        temp = _temp_beside(self.log_path)
+        try:
+            with open(temp, "w", encoding="utf-8") as handle:
+                for version in versions:
+                    handle.write(json.dumps(version.to_dict(), ensure_ascii=False) + "\n")
+            os.replace(temp, self.log_path)
+        finally:
+            temp.unlink(missing_ok=True)
 
     def _prune(self) -> None:
         """Drop the oldest unnamed versions, and any snapshot nothing references any more."""
@@ -437,6 +444,15 @@ class _Suspension:
 
 
 # -- helpers ---------------------------------------------------------------------------------------------
+
+
+def _temp_beside(path: Path) -> Path:
+    """A scratch name next to ``path``, unique per write.
+
+    Same reasoning as the project store: two writers sharing one temp name truncate each other's work
+    mid-write and can leave a file that no longer parses. Same directory, so ``os.replace`` stays atomic.
+    """
+    return path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
 
 
 def _hash(project: dict[str, Any]) -> str:

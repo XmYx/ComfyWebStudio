@@ -302,15 +302,35 @@ class Orchestrator:
         self, project: Project, shot: Shot, step: Step
     ) -> dict[str, PinnedInput]:
         """Values feeding this step from canvas value nodes, keyed by *its* input port name."""
-        return {
-            port_key: PinnedInput(
+        pinned: dict[str, PinnedInput] = {}
+        for port_key, node in value_nodes_into(shot, step.id).items():
+            pinned[port_key] = PinnedInput(
                 kind=node.output_kind(project),
                 scalar=node.value,
                 asset=project.assets.get(node.asset_id or ""),
+                artifact=self._shot_output(project, node),
                 label=node.display_name,
             )
-            for port_key, node in value_nodes_into(shot, step.id).items()
-        }
+        return pinned
+
+    def _shot_output(self, project: Project, node) -> Artifact | None:
+        """What a dropped shot node supplies: that shot's most recent result on the chosen port.
+
+        Read rather than produced — a dropped shot is a *source*, so it never causes the shot behind it to
+        run. If it has no result yet the step that consumes it fails with that reason, which is the honest
+        outcome: the fix is to run the source, and nobody wants a canvas that quietly starts GPU work.
+        """
+        if node.kind != "shot" or not node.source_shot_id or not node.source_port:
+            return None
+        latest = self.store.latest_step_runs(project.id, node.source_shot_id)
+        # Newest first, so a port produced by several steps resolves to the most recent one.
+        for entry in latest.values():
+            artifact = next(
+                (a for a in entry["step_run"].outputs if a.port_key == node.source_port), None
+            )
+            if artifact is not None:
+                return artifact
+        return None
 
     def _merge(self, run: Run, step_run: StepRun) -> None:
         for index, existing in enumerate(run.step_runs):

@@ -12,9 +12,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, Query, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from ..core.errors import NotFound, ValidationFailed
-from ..core.models import Asset
+from ..core.models import Asset, AssetSource, utcnow
 from ..media.probe import guess_kind, probe
 from .deps import ProjectDep, StateDep
 
@@ -82,6 +83,114 @@ async def upload_asset(state: StateDep, project: ProjectDep, file: UploadFile) -
         thumb=state.media.thumbs.ensure(project.id, path, sha, kind),
     )
     project.assets[asset.id] = asset
+    state.store.save(project)
+    return asset
+
+
+class CaptureAssetRequest(BaseModel):
+    """Save what a step produced as a named asset of the project."""
+
+    shot_id: str
+    step_id: str
+    port_key: str
+    name: str | None = None
+
+
+def _artifact_for(state, project, body: CaptureAssetRequest):
+    """The most recent successful artifact on that port, or None when the step has not produced one."""
+    latest = state.store.latest_step_runs(project.id, body.shot_id).get(body.step_id)
+    if latest is None:
+        return None
+    return next(
+        (a for a in latest["step_run"].outputs if a.port_key == body.port_key), None
+    )
+
+
+@router.post("/assets/capture", status_code=201)
+def capture_asset(state: StateDep, project: ProjectDep, body: CaptureAssetRequest) -> Asset:
+    """Promote a step's output into an asset that remembers what made it.
+
+    The media is not copied: a run's artifacts already live in the project's content-addressed store, so
+    the asset points at the same bytes. What the asset adds is a name, a place in the library, and the
+    source it can be refreshed from.
+    """
+    artifact = _artifact_for(state, project, body)
+    if artifact is None:
+        raise ValidationFailed(
+            "That step has not produced anything on that port yet. Run it first."
+        )
+
+    asset = Asset(
+        name=body.name or f"{body.port_key}",
+        kind=artifact.kind,
+        path=artifact.path,
+        thumb=artifact.thumb,
+        sha256=artifact.sha256,
+        meta=dict(artifact.meta),
+        source=AssetSource(shot_id=body.shot_id, step_id=body.step_id, port_key=body.port_key),
+        generated=utcnow(),
+    )
+    project.assets[asset.id] = asset
+    state.store.save(project)
+    state.events.emit("project.changed", project_id=project.id, data={"action": "asset_captured"})
+    return asset
+
+
+@router.post("/assets/{asset_id}/refresh")
+def refresh_asset(state: StateDep, project: ProjectDep, asset_id: str) -> Asset:
+    """Point a generated asset at its source's latest result.
+
+    Deliberately does not run anything. Re-running is what the Run button is for, and an asset silently
+    kicking off a GPU job because someone opened a panel would be a surprise nobody asked for.
+    """
+    asset = project.assets.get(asset_id)
+    if asset is None:
+        raise NotFound(f"No asset {asset_id!r}")
+    if asset.source is None:
+        raise ValidationFailed(
+            f"{asset.name!r} was imported, so there is nothing to refresh it from."
+        )
+
+    artifact = _artifact_for(
+        state,
+        project,
+        CaptureAssetRequest(
+            shot_id=asset.source.shot_id,
+            step_id=asset.source.step_id,
+            port_key=asset.source.port_key,
+        ),
+    )
+    if artifact is None:
+        raise ValidationFailed(
+            "The step this asset comes from has no result yet. Run it, then refresh."
+        )
+
+    if artifact.sha256 and artifact.sha256 == asset.sha256:
+        return asset  # already current; nothing to write
+
+    asset.kind = artifact.kind
+    asset.path = artifact.path
+    asset.thumb = artifact.thumb
+    asset.sha256 = artifact.sha256
+    asset.meta = dict(artifact.meta)
+    asset.generated = utcnow()
+    state.store.save(project)
+    state.events.emit("project.changed", project_id=project.id, data={"action": "asset_refreshed"})
+    return asset
+
+
+class RenameAssetRequest(BaseModel):
+    name: str
+
+
+@router.patch("/assets/{asset_id}")
+def rename_asset(
+    state: StateDep, project: ProjectDep, asset_id: str, body: RenameAssetRequest
+) -> Asset:
+    asset = project.assets.get(asset_id)
+    if asset is None:
+        raise NotFound(f"No asset {asset_id!r}")
+    asset.name = body.name
     state.store.save(project)
     return asset
 

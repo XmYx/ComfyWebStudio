@@ -9,6 +9,7 @@ import { formatBytes, formatTimecode } from '@/lib/format'
 import { useStudio } from '@/store/studio'
 import { useLayout } from '@/store/layout'
 import { RenderDialog } from './RenderDialog'
+import { Monitor } from './Monitor'
 import {
   Button, Callout, Empty, Field, Modal, Panel, PanelHeader, ProgressBar,
   Select, TextInput, cx, useToast,
@@ -21,14 +22,24 @@ const MAX_PX_PER_SECOND = 400
 const TRACK_HEIGHT = 56
 const HEADER_WIDTH = 140
 
-export function TimelinePage() {
+/**
+ * The timeline.
+ *
+ * `embedded` drops the surrounding panels — monitor, clip inspector, renders — because in the docked
+ * workspace each of those is a widget of its own and duplicating them here would be noise.
+ */
+export function TimelinePage({ embedded = false }: { embedded?: boolean } = {}) {
   const { projectId } = useParams<{ projectId: string }>()
   const toast = useToast()
   const queryClient = useQueryClient()
 
   const [zoom, setZoom] = useState(40)
-  const [playhead, setPlayhead] = useState(0)
   const [adding, setAdding] = useState(false)
+  // The transport lives in the shared store so a floating Monitor widget follows the same playhead.
+  const playhead = useStudio((s) => s.playhead)
+  const setPlayhead = useStudio((s) => s.setPlayhead)
+  const playing = useStudio((s) => s.playing)
+  const setPlaying = useStudio((s) => s.setPlaying)
   const renderProgress = useStudio((s) => s.renderProgress)
   const selectedClip = useStudio((s) => s.selectedClip)
   const selectClip = useStudio((s) => s.selectClip)
@@ -96,7 +107,10 @@ export function TimelinePage() {
   const errors = (resolved?.clips ?? []).filter((c) => c.error)
 
   return (
-    <div className="grid h-full grid-rows-[auto_1fr_auto] gap-2 p-2">
+    <div
+      className={cx('grid h-full gap-2', embedded ? 'p-0' : 'p-2')}
+      style={{ gridTemplateRows: embedded ? 'auto 1fr' : 'auto 1fr auto' }}
+    >
       {/* Toolbar */}
       <Panel className="flex items-center gap-2 px-3 py-2">
         <Button size="sm" onClick={() => buildFromShots.mutate()}>Build from shots</Button>
@@ -189,7 +203,7 @@ export function TimelinePage() {
             zoom={zoom}
             duration={duration}
             playhead={playhead}
-            onScrub={setPlayhead}
+            onScrub={(time) => { setPlaying(false); setPlayhead(time) }}
             onChanged={invalidate}
             selectedClip={selectedClip}
             onSelectClip={selectClip}
@@ -198,8 +212,21 @@ export function TimelinePage() {
         )}
       </Panel>
 
-      {/* Bottom: inspector + renders */}
-      <div className="grid grid-cols-[1fr_320px] gap-2">
+      {/* Bottom: monitor, inspector and renders. Each is its own widget in the docked workspace. */}
+      {!embedded && (
+      <div className="grid grid-cols-[320px_1fr_320px] gap-2">
+        <Panel className="flex max-h-52 min-h-0 flex-col overflow-hidden">
+          <PanelHeader>Monitor</PanelHeader>
+          <Monitor
+            className="min-h-0 flex-1"
+            project={project}
+            resolved={resolved}
+            playhead={playhead}
+            onScrub={setPlayhead}
+            playing={playing}
+            onPlayingChange={setPlaying}
+          />
+        </Panel>
         <ClipInspector project={project} onChanged={invalidate} />
         <Panel className="max-h-52 overflow-hidden">
           <PanelHeader>Renders</PanelHeader>
@@ -223,6 +250,7 @@ export function TimelinePage() {
           </div>
         </Panel>
       </div>
+      )}
 
       <AddClipModal
         open={adding}
@@ -379,9 +407,32 @@ function TrackArea({
     return map
   }, [resolved])
 
-  const scrub = (event: React.MouseEvent) => {
-    const rect = event.currentTarget.getBoundingClientRect()
-    onScrub(Math.max(0, (event.clientX - rect.left + (scrollRef.current?.scrollLeft ?? 0)) / zoom))
+  /** Time under a pointer, in seconds, accounting for how far the lanes are scrolled. */
+  const timeAt = (clientX: number, element: HTMLElement) => {
+    const rect = element.getBoundingClientRect()
+    return Math.max(0, (clientX - rect.left + (scrollRef.current?.scrollLeft ?? 0)) / zoom)
+  }
+
+  const scrub = (event: React.MouseEvent) =>
+    onScrub(timeAt(event.clientX, event.currentTarget as HTMLElement))
+
+  /**
+   * Press-and-drag scrubbing.
+   *
+   * Listeners go on the window rather than the ruler: the pointer routinely leaves a 28px-tall strip
+   * while dragging, and a drag that stops working the moment you stray off the element is worse than no
+   * drag at all.
+   */
+  const beginScrub = (event: React.MouseEvent) => {
+    const element = event.currentTarget as HTMLElement
+    onScrub(timeAt(event.clientX, element))
+    const move = (e: MouseEvent) => onScrub(timeAt(e.clientX, element))
+    const up = () => {
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+    }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
   }
 
   return (
@@ -398,7 +449,14 @@ function TrackArea({
 
       <div ref={scrollRef} className="min-w-0 flex-1 overflow-auto">
         <div style={{ width: Math.max(width, 600) }}>
-          <Ruler duration={duration} zoom={zoom} fps={project.timeline.fps} onScrub={scrub} />
+          <Ruler
+            duration={duration}
+            zoom={zoom}
+            fps={project.timeline.fps}
+            playhead={playhead}
+            onScrub={scrub}
+            onBeginScrub={beginScrub}
+          />
 
           <div className="relative">
             {project.timeline.tracks.map((track) => (
@@ -440,8 +498,15 @@ function TrackArea({
 }
 
 function Ruler({
-  duration, zoom, fps, onScrub,
-}: { duration: number; zoom: number; fps: number; onScrub: (e: React.MouseEvent) => void }) {
+  duration, zoom, fps, playhead, onScrub, onBeginScrub,
+}: {
+  duration: number
+  zoom: number
+  fps: number
+  playhead: number
+  onScrub: (e: React.MouseEvent) => void
+  onBeginScrub: (e: React.MouseEvent) => void
+}) {
   // Choose a tick interval that keeps labels ~60px apart at any zoom.
   const candidates = [0.5, 1, 2, 5, 10, 30, 60, 120]
   const interval = candidates.find((c) => c * zoom >= 60) ?? 300
@@ -449,8 +514,9 @@ function Ruler({
 
   return (
     <div
-      className="relative h-7 cursor-pointer border-b border-[var(--color-edge)] bg-[var(--color-panel-2)]"
+      className="relative h-7 cursor-ew-resize select-none border-b border-[var(--color-edge)] bg-[var(--color-panel-2)]"
       onClick={onScrub}
+      onMouseDown={onBeginScrub}
     >
       {Array.from({ length: ticks + 1 }, (_, i) => (
         <div key={i} className="absolute top-0 h-full" style={{ left: i * interval * zoom }}>
@@ -460,6 +526,15 @@ function Ruler({
           </span>
         </div>
       ))}
+
+      {/* The grab handle. Wide enough to hit, and it sits above the ticks so it is always reachable. */}
+      <div
+        className="pointer-events-none absolute -top-px z-10 -ml-[6px] h-full"
+        style={{ left: playhead * zoom }}
+      >
+        <div className="h-2.5 w-3 rounded-b-sm bg-[var(--color-accent)]" />
+        <div className="ml-[5px] h-[calc(100%-0.625rem)] w-px bg-[var(--color-accent)]" />
+      </div>
     </div>
   )
 }

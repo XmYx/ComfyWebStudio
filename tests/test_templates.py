@@ -20,10 +20,12 @@ from comfywebstudio.core.models import (
     ValueNode,
 )
 from comfywebstudio.core.template_capture import (
+    LAYOUT_MARGIN,
     capture_shot,
     expand_instance,
     flatten_shot,
     inner_id,
+    materialise,
     place_instance,
     sync_instance,
     templates_for,
@@ -334,6 +336,26 @@ def test_syncing_reports_what_it_reconciled(app_state, library, source_project):
     assert instance.template_revision == updated.revision
     assert instance.param_overrides == {"generate.prompt": "kept"}
     assert any("no longer exist" in change for change in changes)
+
+
+def test_opening_a_template_brings_its_graph_on_screen(app_state, library, source_project):
+    """A template keeps the coordinates of the shot it came from, which are often far off-canvas."""
+    shot = source_project.shots[0]
+    shot.steps[0].ui_pos.x, shot.steps[0].ui_pos.y = -1800.0, -940.0
+    shot.steps[1].ui_pos.x, shot.steps[1].ui_pos.y = -1500.0, -940.0
+    shot.nodes[0].ui_pos.x, shot.nodes[0].ui_pos.y = -1800.0, -700.0
+    app_state.store.save(source_project)
+
+    template = save(app_state, library, source_project, shot)
+    target = app_state.store.create("Target")
+    session = materialise(target, template, library, app_state.store)
+
+    placed = [*session.steps, *session.nodes]
+    assert min(item.ui_pos.x for item in placed) == LAYOUT_MARGIN
+    assert min(item.ui_pos.y for item in placed) == LAYOUT_MARGIN
+    # Shifted, not rearranged: the layout its author chose is what makes the graph readable.
+    assert session.steps[1].ui_pos.x - session.steps[0].ui_pos.x == 300.0
+    assert session.nodes[0].ui_pos.y - session.steps[0].ui_pos.y == 240.0
 
 
 def test_a_missing_template_is_an_error_not_a_silent_skip(app_state, library, source_project):

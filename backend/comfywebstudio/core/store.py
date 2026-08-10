@@ -26,6 +26,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ..settings import AppSettings
 from .errors import Conflict, NotFound, ValidationFailed
@@ -485,11 +486,21 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     """Write JSON via a temp file in the same directory, then rename.
 
     Same-directory matters: ``os.replace`` is only atomic within a filesystem.
+
+    The temp name is unique per write, and that is not a detail. A shared ``<name>.tmp`` means two saves
+    of the same project race *inside* the temp file: the second truncates it while the first is still
+    writing, and the first then carries on at its own offset. What lands is one document with the tail of
+    another glued to the end — a file that no longer parses at all, so the project silently disappears
+    from the list. Observed in the wild before this was fixed.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    temp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(temp, path)
+    temp = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
+    try:
+        temp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        # A failed write must not leave litter next to the real file.
+        temp.unlink(missing_ok=True)
 
 
 def ensure_workflow_registered(project: Project, workflow: WorkflowRef) -> None:

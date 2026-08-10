@@ -3,6 +3,7 @@ import { Handle, NodeResizer, Position, useUpdateNodeInternals, type NodeProps }
 import type { ParamSpec, PortSpec, Step, WorkflowRef } from '@/api/types'
 import { KIND_COLOR } from '@/lib/kinds'
 import { ParamWidget } from '@/features/params/ParamForm'
+import { HoverScrub } from '@/features/preview/HoverScrub'
 import { Badge, ProgressBar, cx } from '@/components/ui'
 import type { LiveStep } from '@/store/studio'
 
@@ -13,6 +14,9 @@ export interface StepNodeData extends Record<string, unknown> {
   workflow: WorkflowRef | undefined
   live: LiveStep | undefined
   thumbUrl: string | null
+  /** Set when this step produced a video, so the preview can be scrubbed by hovering it. */
+  videoUrl: string | null
+  videoDuration: number | null
   selected: boolean
   /** Input port keys driven by a link, so a pinned parameter for one is shown but not editable. */
   linkedKeys: Set<string>
@@ -38,8 +42,8 @@ const STATUS_TONE = {
  * output port on the right, colour-coded by kind so a mismatch is visible before you try to drag it.
  */
 export function StepNode({ id, data, selected }: NodeProps) {
-  const { step, workflow, live, thumbUrl, linkedKeys, onRun, onToggle, onParamChange } =
-    data as StepNodeData
+  const { step, workflow, live, thumbUrl, videoUrl, videoDuration, linkedKeys, onRun, onToggle,
+    onParamChange } = data as StepNodeData
   const inputs = workflow?.ports.filter((p) => p.direction === 'in') ?? []
   const outputs = workflow?.ports.filter((p) => p.direction === 'out') ?? []
   const status = live?.status
@@ -122,9 +126,15 @@ export function StepNode({ id, data, selected }: NodeProps) {
         </div>
       )}
 
-      {thumbUrl && (
+      {(thumbUrl || videoUrl) && (
         <div className={cx('shrink-0 border-b border-[var(--color-edge)] bg-black/40', sized && 'min-h-0 flex-1')}>
-          <img src={thumbUrl} alt="" className={cx('w-full object-contain', sized ? 'h-full' : 'h-24')} />
+          <HoverScrub
+            thumbUrl={thumbUrl}
+            videoUrl={videoUrl}
+            duration={videoDuration}
+            className="h-full w-full"
+            mediaClassName={cx('w-full object-contain', sized ? 'h-full' : 'h-24')}
+          />
         </div>
       )}
 

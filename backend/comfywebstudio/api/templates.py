@@ -15,7 +15,13 @@ from pydantic import BaseModel
 
 from ..core.errors import NotFound, ValidationFailed
 from ..core.models import Shot, Size, TemplateInstance, Vec2
-from ..core.template_capture import capture_shot, place_instance, sync_instance
+from ..core.template_capture import (
+    capture_shot,
+    carry_over_promotions,
+    materialise,
+    place_instance,
+    sync_instance,
+)
 from ..core.template_store import summarize
 from ..core.templates import ShotTemplate, TemplateSummary
 from .deps import ProjectDep, ShotDep, StateDep
@@ -145,29 +151,90 @@ def save_shot_as_template(
     Passing ``template_id`` overwrites an existing template, which is how an improvement reaches every
     shot that already placed it.
     """
+    # Saving an editing session back is the same operation as saving any other shot — it just already
+    # knows which template it belongs to.
+    template_id = body.template_id or shot.template_edit_id
+
+    previous: ShotTemplate | None = None
     revision = 1
-    if body.template_id:
+    if template_id:
         try:
-            revision = state.templates.get(body.template_id).revision + 1
+            previous = state.templates.get(template_id)
+            revision = previous.revision + 1
         except NotFound:
-            revision = 1
+            previous = None
 
     try:
         captured = capture_shot(
             project,
             shot,
             state.store,
-            name=body.name or shot.name,
-            description=body.description,
-            template_id=body.template_id,
+            name=body.name or (previous.name if previous else shot.name),
+            description=body.description or (previous.description if previous else ""),
+            template_id=template_id,
             revision=revision,
         )
     except ValueError as exc:
         raise ValidationFailed(str(exc)) from exc
 
+    if previous is not None:
+        carry_over_promotions(captured.template, previous)
+
     template = state.templates.save(captured.template, captured.graphs)
-    logger.info("Saved shot %r as template %s", shot.name, template.id)
+
+    # Every instance of this template in this project follows immediately. Someone who just edited a
+    # template from inside one of its instances expects that instance to reflect the edit, not to sit
+    # there flagged as out of date against a change they made themselves.
+    refreshed = _resync_project_instances(state, project, template)
+    state.store.save(project)
+
+    logger.info(
+        "Saved shot %r as template %s (revision %d, %d instance(s) refreshed)",
+        shot.name, template.id, template.revision, refreshed,
+    )
     return template
+
+
+def _resync_project_instances(state, project, template: ShotTemplate) -> int:
+    count = 0
+    for other in project.shots:
+        for instance in other.instances:
+            if instance.template_id != template.id:
+                continue
+            sync_instance(project, instance, template, state.templates, state.store)
+            count += 1
+    return count
+
+
+@router.post("/templates/{template_id}/edit", status_code=201)
+def open_template_for_editing(state: StateDep, project: ProjectDep, template_id: str) -> Shot:
+    """Open a template's graph as an editable shot, reusing an open session if there is one.
+
+    The session is a real shot with ``template_edit_id`` set, so the canvas, the inspector and the ComfyUI
+    round trip all work on it unchanged. It is hidden from the shot list because it is not a shot the user
+    made — it is a template being worked on.
+    """
+    template = state.templates.get(template_id)
+
+    existing = next((s for s in project.shots if s.template_edit_id == template_id), None)
+    if existing is not None:
+        return existing
+
+    shot = materialise(project, template, state.templates, state.store)
+    project.shots.append(shot)
+    state.store.save(project)
+    state.events.emit("project.changed", project_id=project.id, data={"action": "template_opened"})
+    return shot
+
+
+@router.delete("/templates/edit/{shot_id}", status_code=204)
+def close_template_session(state: StateDep, project: ProjectDep, shot_id: str) -> None:
+    """Discard an editing session. The template itself is untouched — only unsaved edits are lost."""
+    shot = next((s for s in project.shots if s.id == shot_id), None)
+    if shot is None or not shot.template_edit_id:
+        raise NotFound(f"No open template session {shot_id!r}")
+    project.shots = [s for s in project.shots if s.id != shot_id]
+    state.store.save(project)
 
 
 # -- instances -----------------------------------------------------------------------------------------

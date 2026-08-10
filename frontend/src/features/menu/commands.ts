@@ -11,7 +11,7 @@ import type { QueryClient } from '@tanstack/react-query'
 
 import { api, ApiError } from '@/api/client'
 import type { Clip, Project, RenderRequest, Shot, Step } from '@/api/types'
-import { useLayout } from '@/store/layout'
+import { DEFAULT_WIDGETS, WIDGET_LABELS, useLayout, type WidgetId } from '@/store/layout'
 import { useStudio } from '@/store/studio'
 
 export interface CommandContext {
@@ -492,6 +492,24 @@ export const COMMANDS: Command[] = [
     label: 'Go to Settings',
     run: (ctx) => ctx.navigate('/settings'),
   },
+  // One command per widget, generated from the registry so a new panel needs no menu wiring.
+  ...(Object.keys(DEFAULT_WIDGETS) as WidgetId[]).map((id) => ({
+    id: `window.widget.${id}`,
+    label: WIDGET_LABELS[id],
+    enabled: hasProject,
+    checked: () => useLayout.getState().widgets[id].visible,
+    run: () => useLayout.getState().toggleWidget(id),
+  })),
+  ...(Object.keys(DEFAULT_WIDGETS) as WidgetId[]).map((id) => ({
+    id: `window.float.${id}`,
+    label: `Float ${WIDGET_LABELS[id]}`,
+    enabled: hasProject,
+    checked: () => useLayout.getState().widgets[id].floating,
+    run: () => {
+      const state = useLayout.getState()
+      state.floatWidget(id, !state.widgets[id].floating)
+    },
+  })),
   {
     id: 'window.reset',
     label: 'Reset Layout',
@@ -659,6 +677,17 @@ export const MENUS: Menu[] = [
       cmd('window.shots'),
       cmd('window.timeline'),
       cmd('window.settings'),
+      sep(),
+      {
+        type: 'submenu',
+        label: 'Panels',
+        items: (Object.keys(DEFAULT_WIDGETS) as WidgetId[]).map((id) => cmd(`window.widget.${id}`)),
+      },
+      {
+        type: 'submenu',
+        label: 'Float',
+        items: (Object.keys(DEFAULT_WIDGETS) as WidgetId[]).map((id) => cmd(`window.float.${id}`)),
+      },
       sep(),
       cmd('window.reset'),
     ],

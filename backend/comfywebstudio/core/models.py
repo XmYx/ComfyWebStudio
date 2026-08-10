@@ -24,8 +24,12 @@ PortKind = Literal[
 ]
 PortDirection = Literal["in", "out"]
 ParamKind = Literal["string", "int", "float", "boolean", "choice"]
-#: What a value node on the shot canvas holds. ``media`` points at an imported asset; the rest are literals.
-ValueNodeKind = Literal["string", "int", "float", "boolean", "media"]
+#: What a value node on the shot canvas holds.
+#:
+#: The literals are self-explanatory. ``media`` points at an asset in the project's library, and ``shot``
+#: at another shot's output — the last thing it produced, not a re-run of it. Both are *sources*: they
+#: supply something a step consumes without themselves executing.
+ValueNodeKind = Literal["string", "int", "float", "boolean", "media", "shot"]
 SeedMode = Literal["fixed", "randomize", "increment"]
 RunMode = Literal["step", "chain", "shot", "timeline"]
 TrackKind = Literal["video", "audio", "text", "overlay"]
@@ -209,10 +213,14 @@ class ValueNode(Base):
     kind: ValueNodeKind = "string"
     #: The literal, for every kind but ``media``.
     value: Any = None
-    #: The imported asset, for ``media``.
+    #: The asset, for ``media``.
     asset_id: str | None = None
-    #: What an empty ``media`` node offers, so it can be wired up before the footage is chosen. Kept in
-    #: step with the asset once there is one — the asset is the truth, this is the placeholder.
+    #: Which shot and output port to take the last result from, for ``shot``.
+    source_shot_id: str | None = None
+    source_port: str | None = None
+    #: What an empty ``media`` or ``shot`` node offers, so it can be wired up before the source is
+    #: chosen. Kept in step with the real thing once there is one — that is the truth, this the
+    #: placeholder.
     media_kind: PortKind = "image"
     ui_pos: Vec2 = Field(default_factory=Vec2)
     ui_size: Size = Field(default_factory=Size)
@@ -221,12 +229,19 @@ class ValueNode(Base):
     def display_name(self) -> str:
         return self.name or DEFAULT_VALUE_NODE_NAMES.get(self.kind, "Value")
 
+    @property
+    def is_source(self) -> bool:
+        """True when this node supplies media from elsewhere rather than a value typed into it."""
+        return self.kind in {"media", "shot"}
+
     def output_kind(self, project: Project | None = None) -> PortKind:
         """What this node's output port carries."""
-        if self.kind != "media":
-            return self.kind  # type: ignore[return-value]
-        asset = project.assets.get(self.asset_id or "") if project else None
-        return asset.kind if asset else self.media_kind
+        if self.kind == "media":
+            asset = project.assets.get(self.asset_id or "") if project else None
+            return asset.kind if asset else self.media_kind
+        if self.kind == "shot":
+            return self.media_kind
+        return self.kind  # type: ignore[return-value]
 
 
 #: Shown on the canvas until the user names a node.
@@ -236,6 +251,7 @@ DEFAULT_VALUE_NODE_NAMES: dict[str, str] = {
     "float": "Number",
     "boolean": "Boolean",
     "media": "Media",
+    "shot": "Shot output",
 }
 
 
@@ -286,6 +302,13 @@ class Shot(Base):
     name: str = "Shot"
     notes: str = ""
     color: str | None = None
+    #: Set when this shot is not a shot at all but an open editing session for a template.
+    #:
+    #: A template is a captured shot, so the honest way to let one be edited is to materialise it back
+    #: into a real shot and hand it to the editor that already exists — every step, link and parameter
+    #: control works unchanged. The marker keeps these out of the shot list and out of the timeline, and
+    #: lets a second "edit" on the same template reuse the session rather than forking it.
+    template_edit_id: str | None = None
     steps: list[Step] = Field(default_factory=list)
     #: Value nodes on the same canvas as the steps, kept separate because they never execute.
     nodes: list[ValueNode] = Field(default_factory=list)
@@ -477,8 +500,25 @@ class Timeline(Base):
 # -- project -------------------------------------------------------------------------------------------
 
 
+class AssetSource(Base):
+    """What produces a generated asset: one output port of one step in one shot."""
+
+    shot_id: str
+    step_id: str
+    port_key: str
+
+
 class Asset(Base):
-    """Media in the project that no step produced — imported footage, reference images, music."""
+    """A named piece of media the project owns.
+
+    Two kinds, deliberately one model. An **imported** asset is footage, a still or music the user brought
+    in, and has no source. A **generated** one was produced by a step and remembers which one, so it can
+    be refreshed from a later run rather than becoming a dead copy of an old result.
+
+    Both look identical everywhere they are used — a media value node, a timeline clip, a dropped source
+    node — which is the point: whether a piece of media was imported or made should not change how it is
+    wired up.
+    """
 
     id: str = Field(default_factory=lambda: new_id("asset"))
     name: str = ""
@@ -487,7 +527,15 @@ class Asset(Base):
     thumb: str | None = None
     sha256: str = ""
     meta: dict[str, Any] = Field(default_factory=dict)
+    #: Absent for imported media; set for anything a step produced.
+    source: AssetSource | None = None
+    #: When the source last refreshed it, so the UI can say how current a generated asset is.
+    generated: datetime | None = None
     created: datetime = Field(default_factory=utcnow)
+
+    @property
+    def is_generated(self) -> bool:
+        return self.source is not None
 
 
 class ProjectSettings(Base):
