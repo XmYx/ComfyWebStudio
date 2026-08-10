@@ -41,6 +41,9 @@ export function InstanceInspector({ project, shot, instance, placed, onChanged, 
   const openInstance = useStudio((s) => s.openInstance)
 
   const title = instance.name || placed?.summary?.name || 'Template'
+  //: A placed shot rather than a library template. Read live, so it has no revision and never syncs.
+  const nested = Boolean(placed?.source_shot_id)
+  const kindWord = nested ? 'shot' : 'template'
   const controls = placed?.controls ?? []
 
   // The expanded steps this instance owns, so "Run" can target exactly them.
@@ -67,8 +70,10 @@ export function InstanceInspector({ project, shot, instance, placed, onChanged, 
   if (placed?.missing) {
     return (
       <Panel className="p-3">
-        <Callout tone="bad" title="Missing template">
-          This node points at a template that is no longer in the library.
+        <Callout tone="bad" title={nested ? 'Missing shot' : 'Missing template'}>
+          {nested
+            ? 'This node stands for a shot that is no longer in this project.'
+            : 'This node points at a template that is no longer in the library.'}
         </Callout>
       </Panel>
     )
@@ -89,7 +94,7 @@ export function InstanceInspector({ project, shot, instance, placed, onChanged, 
               size="sm"
               disabled={!shot}
               onClick={() => onRun(innerStepIds)}
-              title="Run the steps inside this template"
+              title={`Run the steps inside this ${kindWord}`}
             >
               ▶ Run
             </Button>
@@ -97,7 +102,7 @@ export function InstanceInspector({ project, shot, instance, placed, onChanged, 
               size="sm"
               variant="ghost"
               onClick={() => openInstance(instance.id)}
-              title="Look inside this template"
+              title={`Look inside this ${kindWord}`}
             >
               Open
             </Button>
@@ -137,7 +142,7 @@ export function InstanceInspector({ project, shot, instance, placed, onChanged, 
           <div className="space-y-3 p-3">
             {!controls.length && (
               <div className="text-xs leading-relaxed text-[var(--color-ink-dim)]">
-                This template shows no controls. Open the template library to expose some of the
+                This {kindWord} shows no controls. Open the template library to expose some of the
                 parameters it carries.
               </div>
             )}
@@ -162,7 +167,7 @@ export function InstanceInspector({ project, shot, instance, placed, onChanged, 
           <div className="p-3">
             {!outputs.length ? (
               <div className="text-xs text-[var(--color-ink-dim)]">
-                This template exposes no output ports.
+                This {kindWord} exposes no output ports.
               </div>
             ) : (
               <div className="space-y-3">
@@ -178,7 +183,7 @@ export function InstanceInspector({ project, shot, instance, placed, onChanged, 
                       <ArtifactPreview projectId={project.id} artifacts={[artifact]} />
                     ) : (
                       <div className="rounded border border-dashed border-[var(--color-edge)] px-2 py-3 text-center text-[10px] text-[var(--color-ink-dim)]">
-                        Nothing produced yet — run this template.
+                        Nothing produced yet — run this {kindWord}.
                       </div>
                     )}
                   </div>
@@ -190,7 +195,10 @@ export function InstanceInspector({ project, shot, instance, placed, onChanged, 
 
         {tab === 'settings' && (
           <div className="space-y-3 p-3">
-            <Field label="Name on this canvas" hint="leave empty to use the template's own name">
+            <Field
+              label="Name on this canvas"
+              hint={`leave empty to use the ${kindWord}'s own name`}
+            >
               <TextInput
                 defaultValue={instance.name}
                 placeholder={placed?.summary?.name ?? 'Template'}
@@ -208,12 +216,21 @@ export function InstanceInspector({ project, shot, instance, placed, onChanged, 
             </div>
 
             <div className="rounded-md border border-[var(--color-edge)] p-2 text-[10px] leading-relaxed text-[var(--color-ink-dim)]">
-              <div>Template: {placed?.summary?.name ?? instance.template_id}</div>
               <div>
-                Revision {instance.template_revision}
-                {placed?.summary && placed.summary.revision !== instance.template_revision
-                  ? ` · library is at ${placed.summary.revision}`
-                  : ' · up to date'}
+                {nested ? 'Shot' : 'Template'}: {placed?.summary?.name ?? instance.template_id}
+              </div>
+              <div>
+                {nested ? (
+                  // Nothing to be out of date with: the shot is read fresh on every draw and every run.
+                  'Read live from that shot · values are this node\u2019s own'
+                ) : (
+                  <>
+                    Revision {instance.template_revision}
+                    {placed?.summary && placed.summary.revision !== instance.template_revision
+                      ? ` · library is at ${placed.summary.revision}`
+                      : ' · up to date'}
+                  </>
+                )}
               </div>
               <div>{placed?.summary?.step_count ?? 0} step(s) inside</div>
             </div>

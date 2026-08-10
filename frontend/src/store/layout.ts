@@ -41,6 +41,7 @@ export interface Clipboard {
  */
 export type WidgetId =
   | 'shots' | 'workflows' | 'assets' | 'canvas' | 'inspector' | 'timeline' | 'monitor' | 'renders'
+  | 'comfy'
 
 export interface WidgetState {
   /** Hidden widgets keep their place in the dock tree, so showing one puts it back where it was. */
@@ -63,6 +64,8 @@ export const DEFAULT_WIDGETS: Record<WidgetId, WidgetState> = {
   inspector: { visible: true, floating: false, rect: { x: 640, y: 120, w: 360, h: 560 } },
   monitor: { visible: false, floating: false, rect: { x: 700, y: 160, w: 420, h: 340 } },
   renders: { visible: false, floating: false, rect: { x: 740, y: 200, w: 340, h: 300 } },
+  // Off by default: it loads a whole second application, and nobody wants that until they ask for it.
+  comfy: { visible: false, floating: false, rect: { x: 240, y: 140, w: 1100, h: 700 }, noScroll: true },
 }
 
 /** Panels on the left, the canvas and timeline in the middle, the inspector stack on the right. */
@@ -71,7 +74,7 @@ export const defaultTree = (): DockNode =>
     'row',
     [
       group(['shots', 'workflows', 'assets'], 'shots'),
-      group(['canvas', 'timeline'], 'canvas'),
+      group(['canvas', 'timeline', 'comfy'], 'canvas'),
       group(['inspector', 'monitor', 'renders'], 'inspector'),
     ],
     [0.2, 0.55, 0.25],
@@ -86,6 +89,7 @@ export const WIDGET_LABELS: Record<WidgetId, string> = {
   timeline: 'Timeline',
   monitor: 'Monitor',
   renders: 'Renders',
+  comfy: 'ComfyUI',
 }
 
 interface LayoutState {
@@ -94,6 +98,8 @@ interface LayoutState {
   widgets: Record<WidgetId, WidgetState>
   /** How the docked panels are arranged: nested rows and columns of tab groups. */
   tree: DockNode
+  /** A panel filling the whole workspace, hiding the rest until it is restored. */
+  maximized: WidgetId | null
 
   dialog: DialogId | null
   clipboard: Clipboard | null
@@ -104,12 +110,16 @@ interface LayoutState {
 
   setWidget: (id: WidgetId, patch: Partial<WidgetState>) => void
   toggleWidget: (id: WidgetId) => void
+  /** Make a panel visible and frontmost, wherever it lives. Unlike toggling, this only ever shows it. */
+  showWidget: (id: WidgetId) => void
   floatWidget: (id: WidgetId, floating: boolean) => void
   /** Drop a widget onto a group: tabbed into it, or split off one of its edges. */
   dockWidget: (id: WidgetId, groupId: string, position: DropPosition) => void
   /** Drop a widget against an outer edge of the workspace, spanning it. */
   dockWidgetToEdge: (id: WidgetId, edge: Exclude<DropPosition, 'centre'>) => void
   setActive: (groupId: string, id: WidgetId) => void
+  /** Fill the workspace with one panel, or restore the layout. Passing the maximized one restores. */
+  toggleMaximized: (id: WidgetId | null) => void
   /** Drag a splitter: `fraction` is the new share of the child before the boundary. */
   resizeDock: (splitId: string, index: number, fraction: number) => void
 
@@ -139,12 +149,14 @@ export const useLayout = create<LayoutState>()(
       ...DEFAULTS,
       widgets: clone(DEFAULT_WIDGETS),
       tree: defaultTree(),
+      maximized: null,
       dialog: null,
       clipboard: null,
       canvas: null,
 
       toggleCompact: () => set((s) => ({ compactMode: !s.compactMode })),
-      resetLayout: () => set({ ...DEFAULTS, widgets: clone(DEFAULT_WIDGETS), tree: defaultTree() }),
+      resetLayout: () =>
+        set({ ...DEFAULTS, widgets: clone(DEFAULT_WIDGETS), tree: defaultTree(), maximized: null }),
 
       setWidget: (id, patch) =>
         set((s) => ({ widgets: { ...s.widgets, [id]: { ...s.widgets[id], ...patch } } })),
@@ -156,7 +168,18 @@ export const useLayout = create<LayoutState>()(
           // A widget shown again has to be somewhere — one dragged out and hidden has no place left.
           const tree = visible && !widgets[id].floating ? ensurePlaced(s.tree, id) : s.tree
           // And it has to be the front tab, or showing it would appear to do nothing.
-          return { widgets, tree: visible ? activateIn(tree, id) : tree }
+          return {
+            widgets,
+            tree: visible ? activateIn(tree, id) : tree,
+            maximized: !visible && s.maximized === id ? null : s.maximized,
+          }
+        }),
+
+      showWidget: (id) =>
+        set((s) => {
+          const widgets = { ...s.widgets, [id]: { ...s.widgets[id], visible: true } }
+          const tree = widgets[id].floating ? s.tree : activateIn(ensurePlaced(s.tree, id), id)
+          return { widgets, tree }
         }),
 
       floatWidget: (id, floating) =>
@@ -164,7 +187,7 @@ export const useLayout = create<LayoutState>()(
           const widgets = { ...s.widgets, [id]: { ...s.widgets[id], floating, visible: true } }
           // Floating takes it out of the tree entirely; docking it again gives it a home and the focus.
           const tree = floating ? removeWidget(s.tree, id) : activateIn(ensurePlaced(s.tree, id), id)
-          return { widgets, tree }
+          return { widgets, tree, maximized: floating && s.maximized === id ? null : s.maximized }
         }),
 
       dockWidget: (id, groupId, position) =>
@@ -180,6 +203,16 @@ export const useLayout = create<LayoutState>()(
         })),
 
       setActive: (groupId, id) => set((s) => ({ tree: activateTab(s.tree, groupId, id) })),
+
+      toggleMaximized: (id) =>
+        set((s) => ({
+          maximized: id === null || s.maximized === id ? null : id,
+          // Maximising something hidden would show an empty workspace, so it comes back with it.
+          widgets: id && id !== s.maximized
+            ? { ...s.widgets, [id]: { ...s.widgets[id], visible: true, floating: false } }
+            : s.widgets,
+          tree: id && id !== s.maximized ? ensurePlaced(s.tree, id) : s.tree,
+        })),
 
       resizeDock: (splitId, index, fraction) =>
         set((s) => ({ tree: resizeSplit(s.tree, splitId, index, fraction) })),
@@ -200,6 +233,7 @@ export const useLayout = create<LayoutState>()(
         compactMode: state.compactMode,
         widgets: state.widgets,
         tree: state.tree,
+        maximized: state.maximized,
       }),
       /**
        * A stored layout is not trustworthy: it may predate a widget existing, or still place one that has

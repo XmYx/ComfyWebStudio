@@ -39,6 +39,7 @@ from .templates import (
     TemplateStep,
     TemplateValueNode,
     TemplateWorkflow,
+    referenced_shot,
 )
 
 logger = logging.getLogger(__name__)
@@ -168,6 +169,86 @@ def capture_shot(
     template.ports = _derive_ports(template, project, workflow_keys)
     template.controls = _derive_controls(template, project, workflow_keys)
     return CapturedTemplate(template=template, graphs=graphs)
+
+
+def capture_structure(project: Project, shot: Shot, *, name: str = "") -> ShotTemplate:
+    """A shot's structure as a template, without lifting it out of the project.
+
+    The difference from :func:`capture_shot` is what the workflow keys are. That one invents portable
+    slugs and bundles the graphs, because the template is going into a shared library and has to survive
+    away from here. This one uses the project's own workflow ids as the keys and bundles nothing, because
+    the result never leaves the project — which is what a nested shot needs, and why an instance of one
+    has no workflow map to keep in sync.
+
+    Placed instances are expected to be flattened away already; any that remain are skipped, along with
+    the links touching them.
+    """
+    keys = _keys_for(shot)
+    workflows: list[TemplateWorkflow] = []
+    seen: set[str] = set()
+
+    for step in shot.steps:
+        if step.workflow_id in seen:
+            continue
+        workflow = project.workflow(step.workflow_id)
+        if workflow is None:
+            continue  # reported by the validator as a step with no workflow, not raised from here
+        seen.add(step.workflow_id)
+        workflows.append(
+            TemplateWorkflow(
+                key=workflow.id,
+                name=workflow.name,
+                hash=workflow.hash,
+                ports=[p.model_copy(deep=True) for p in workflow.ports],
+                params=[p.model_copy(deep=True) for p in workflow.params],
+            )
+        )
+
+    template = ShotTemplate(
+        name=name or shot.name,
+        workflows=workflows,
+        steps=[
+            TemplateStep(
+                key=keys[step.id],
+                name=step.name,
+                workflow_key=step.workflow_id,
+                param_overrides=dict(step.param_overrides),
+                exposed_params=list(step.exposed_params),
+                seed_mode=step.seed_mode,
+                enabled=step.enabled,
+                notes=step.notes,
+                ui_pos=step.ui_pos.model_copy(),
+                ui_size=step.ui_size.model_copy(),
+            )
+            for step in shot.steps
+            if step.workflow_id in seen
+        ],
+        nodes=[
+            TemplateValueNode(
+                key=keys[node.id],
+                name=node.name,
+                kind=node.kind,
+                value=node.value,
+                media_kind=node.media_kind,
+                ui_pos=node.ui_pos.model_copy(),
+                ui_size=node.ui_size.model_copy(),
+            )
+            for node in shot.nodes
+        ],
+        links=[
+            TemplateLink(
+                from_key=keys[link.from_step],
+                from_port=link.from_port,
+                to_key=keys[link.to_step],
+                to_port=link.to_port,
+            )
+            for link in shot.links
+            if link.from_step in keys and link.to_step in keys
+        ],
+    )
+    template.ports = _derive_ports(template, project, {})
+    template.controls = _derive_controls(template, project, {})
+    return template
 
 
 def _keys_for(shot: Shot) -> dict[str, str]:
@@ -349,8 +430,14 @@ def expand_instance(
     result = ExpandedInstance()
     label = instance.name or template.name
 
+    # A nested shot keyed its workflows by the project's own workflow ids, so the map is an identity it
+    # never had to store. That is also what lets a nested shot gain a step without the node going stale.
+    nested = referenced_shot(template.id) is not None
+
     for step in template.steps:
-        workflow_id = instance.workflow_map.get(step.workflow_key)
+        workflow_id = instance.workflow_map.get(step.workflow_key) or (
+            step.workflow_key if nested else ""
+        )
         if not workflow_id:
             result.errors.append(
                 f"{label!r} has no workflow for {step.name!r}. The template has changed since it was "
@@ -520,10 +607,13 @@ def place_instance(
     ui_pos: Vec2 | None = None,
 ) -> TemplateInstance:
     """Put a template on a shot's canvas as one node."""
+    # A nested shot's workflows are already this project's, keyed by their own ids — there is nothing to
+    # adopt, and an empty map is what tells expansion to read the key as the workflow id.
+    nested = referenced_shot(template.id) is not None
     instance = TemplateInstance(
         template_id=template.id,
         name=name,
-        workflow_map=adopt_workflows(project, template, template_store, project_store),
+        workflow_map={} if nested else adopt_workflows(project, template, template_store, project_store),
         template_revision=template.revision,
         ui_pos=ui_pos or Vec2(x=40.0 + 300.0 * len(shot.instances), y=340.0),
     )
@@ -758,14 +848,12 @@ def _instance_label(
     return "a template instance"
 
 
-def templates_for(shot: Shot, template_store) -> dict[str, ShotTemplate]:
-    """Load every template a shot places, skipping any the library has lost."""
-    loaded: dict[str, ShotTemplate] = {}
-    for instance in shot.instances:
-        if instance.template_id in loaded:
-            continue
-        try:
-            loaded[instance.template_id] = template_store.get(instance.template_id)
-        except Exception as exc:  # noqa: BLE001 - a missing template is reported, not fatal
-            logger.debug("Template %s could not be loaded: %s", instance.template_id, exc)
-    return loaded
+def templates_for(project: Project, shot: Shot, template_store) -> dict[str, ShotTemplate]:
+    """Every template a shot places, skipping any the library has lost.
+
+    Placed *shots* are captured live and come back in the same mapping, so nothing downstream has to know
+    which of the two kinds it is holding.
+    """
+    from .shot_sources import collect_templates
+
+    return collect_templates(project, shot, template_store)

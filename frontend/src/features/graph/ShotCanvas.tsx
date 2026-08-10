@@ -23,6 +23,7 @@ import {
 import { TemplateNode, type TemplateNodeData } from './TemplateNode'
 import { belongsToInstance, outputsForInstance } from '@/lib/instances'
 import { isOurDrag, readDrag } from '@/lib/dnd'
+import { useOpenInComfy } from '@/features/comfy/useOpenInComfy'
 
 const NODE_TYPES = { step: StepNode, value: ValueNodeCard, template: TemplateNode }
 
@@ -99,6 +100,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
   const selectStep = useStudio((s) => s.selectStep)
   const selectInstance = useStudio((s) => s.selectInstance)
   const openInstance = useStudio((s) => s.openInstance)
+  const openInComfyPanel = useOpenInComfy()
 
   const assets = useMemo(() => Object.values(project.assets), [project.assets])
 
@@ -543,15 +545,23 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
             media_kind: payload.mediaKind as PortKind, ui_pos: at,
           })
         } else if (payload.kind === 'shot') {
-          // Default to the first output that shot offers, so the node is useful the moment it lands.
-          const first = shotSources.find((source) => source.shotId === payload.id)
-          await api.nodes.create(project.id, shot.id, {
-            kind: 'shot', name: payload.name,
-            source_shot_id: payload.id,
-            source_port: first?.port,
-            media_kind: first?.kind ?? 'image',
-            ui_pos: at,
-          })
+          // A dropped shot lands as one contained node, exactly as a template does: its own ports to
+          // wire, its own controls to edit, and its values held here rather than in the shot it came
+          // from. Alt-drop falls back to the older single-output reference node.
+          if (event.altKey) {
+            const first = shotSources.find((source) => source.shotId === payload.id)
+            await api.nodes.create(project.id, shot.id, {
+              kind: 'shot', name: payload.name,
+              source_shot_id: payload.id,
+              source_port: first?.port,
+              media_kind: first?.kind ?? 'image',
+              ui_pos: at,
+            })
+          } else {
+            await api.instances.place(project.id, shot.id, {
+              source_shot_id: payload.id, ui_pos: at,
+            })
+          }
         } else if (payload.kind === 'template') {
           await api.instances.place(project.id, shot.id, { template_id: payload.id, ui_pos: at })
         }
@@ -686,15 +696,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     {
       type: 'action',
       label: 'Open workflow in ComfyUI',
-      onSelect: async () => {
-        try {
-          const result = await api.workflows.openInComfy(project.id, step.workflow_id)
-          if (result.hint) toast.push('bad', result.hint)
-          window.open(result.url, '_blank', 'noopener')
-        } catch (error) {
-          toast.push('bad', (error as ApiError).message)
-        }
-      },
+      onSelect: () => void openInComfyPanel(project.id, step.workflow_id),
     },
     { type: 'separator' },
     { type: 'command', id: 'edit.delete' },
@@ -835,6 +837,7 @@ function Canvas({ project, shot, onChanged, onRunStep }: Props) {
     return (
       <div
         className="h-full"
+        data-testid="empty-canvas"
         onContextMenu={(event) => contextMenu.open(event, paneMenu(event))}
         // An empty shot is exactly when someone drags their first thing in, so it has to accept drops too.
         onDrop={onDrop}

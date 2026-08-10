@@ -29,6 +29,8 @@ const state = {
   timer: 0,
   busy: false,
   lastBadgePath: /** @type {string|null|undefined} */ (undefined),
+  /** Set while *we* are putting a graph on the canvas, so our own load is not mistaken for an edit. */
+  loading: false,
 };
 
 // -- binding persistence -------------------------------------------------------------------------------
@@ -170,10 +172,63 @@ async function whenCanvasReady(timeoutMs = 30000) {
   return false;
 }
 
-/** True when ComfyUI is showing the workflow at `path`, with its graph actually on the canvas. */
-function isShowing(path) {
+/**
+ * The workflow document as ComfyUI has it on disk.
+ *
+ * Read straight from the user directory rather than through the workflow store. `activeState` looks like
+ * the obvious source and is a trap: once a workflow is the active one it reflects the *live canvas*, so
+ * an open that produced an empty canvas reports an empty document, and checking the canvas against it
+ * always agrees. This is the file, and it does not move.
+ */
+async function readSavedWorkflow(path) {
+  try {
+    const response = await api.getUserData(path);
+    if (response.status !== 200) return null;
+    const document = await response.json();
+    return Array.isArray(document?.nodes) ? document : null;
+  } catch (err) {
+    console.warn(`[WebStudio] could not read ${path} from ComfyUI`, err);
+    return null;
+  }
+}
+
+/**
+ * True when the graph on the canvas is really this document's.
+ *
+ * Node ids rather than a count: a restored session that happens to have the same number of nodes would
+ * otherwise pass, and that is exactly the case that made this look fixed when it was not.
+ */
+function graphMatches(document) {
+  const wanted = document?.nodes;
+  if (!Array.isArray(wanted) || !wanted.length) return false;
+  try {
+    const graph = app.rootGraph ?? app.graph;
+    const have = new Set((graph?._nodes ?? []).map((node) => String(node.id)));
+    return have.size === wanted.length && wanted.every((node) => have.has(String(node.id)));
+  } catch {
+    return false;
+  }
+}
+
+/** True when ComfyUI has the workflow at `path` open *and* its saved graph is the one on screen. */
+function isShowing(path, document) {
   const active = app.extensionManager?.workflow?.activeWorkflow?.path;
-  return active === path && canvasNodeCount() > 0;
+  return active === path && graphMatches(document);
+}
+
+/**
+ * Clear the "unsaved changes" mark that loading a graph leaves behind.
+ *
+ * We only ever load a workflow's own saved content, so the dot on the tab would claim an edit that was
+ * never made — and would nag on close.
+ */
+function markUnchanged(workflow) {
+  try {
+    workflow.changeTracker?.reset?.();
+    workflow.isModified = false;
+  } catch {
+    /* a cosmetic flag; not worth failing the open over */
+  }
 }
 
 /**
@@ -191,19 +246,30 @@ function isShowing(path) {
  *   3. ComfyUI restores its own persisted session during boot, and that restore lands *after* we open.
  *      It re-activates whatever the user last had open, so our workflow ends up in the tab strip while a
  *      different one is on screen.
+ *   4. Worst of all, `openWorkflow` can switch which workflow is *active* — right name, right path, not
+ *      temporary — while leaving the previous graph on the canvas. The tab looks perfect and the content
+ *      belongs to something else, so the graph itself has to be checked, and pushed in when it is wrong.
  *
- * Hence: re-assert until the workflow we asked for is genuinely the active one, and then confirm it stays
- * that way — a single successful check can still be undone a moment later by (3).
+ * Hence: re-assert until the workflow we asked for is genuinely the one on screen, and then confirm it
+ * stays that way — a single successful check can still be undone a moment later by (3).
  */
 async function openSavedWorkflow(path, { timeoutMs = 15000, delayMs = 400, settleMs = 700 } = {}) {
   const store = app.extensionManager?.workflow;
   if (!path || !store?.getWorkflowByPath) return false;
 
+  state.loading = true;
   try {
     // The framework may have only just written the file, so refresh before looking it up.
     await store.syncWorkflows();
     const workflow = store.getWorkflowByPath(path);
     if (!workflow) return false;
+
+    // What "the one already saved in ComfyUI" means, fetched once and treated as the truth from here on.
+    const saved = await readSavedWorkflow(path);
+    if (!saved) {
+      console.warn(`[WebStudio] ${path} has no readable saved graph; falling back`);
+      return false;
+    }
 
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -215,10 +281,25 @@ async function openSavedWorkflow(path, { timeoutMs = 15000, delayMs = 400, settl
       await store.openWorkflow(workflow, { force: true });
       await sleep(delayMs);
 
-      if (isShowing(path)) {
+      // The workflow is active but its graph is not on screen — put it there, from the file itself, so
+      // what the user gets is what ComfyUI has saved rather than any copy the framework is holding.
+      if (!graphMatches(saved)) {
+        await app.loadGraphData(saved, true, true, workflow);
+        await sleep(delayMs);
+        markUnchanged(workflow);
+      }
+
+      if (isShowing(path, saved)) {
         // Let the boot sequence finish and check again; if something stole the canvas back, go round.
         await sleep(settleMs);
-        if (isShowing(path)) return true;
+        if (isShowing(path, saved)) {
+          // The change tracker re-marks the workflow dirty a beat *after* a graph lands — and again once
+          // subgraph nodes finish resolving — so one reset loses the race and the tab claims an edit
+          // nobody made. A few spread out afterwards is cheap and makes it stick.
+          markUnchanged(workflow);
+          for (const delay of [300, 900, 2000]) setTimeout(() => markUnchanged(workflow), delay);
+          return true;
+        }
       }
     }
 
@@ -231,6 +312,10 @@ async function openSavedWorkflow(path, { timeoutMs = 15000, delayMs = 400, settl
   } catch (err) {
     console.warn("[WebStudio] could not open the saved workflow, falling back", err);
     return false;
+  } finally {
+    // Cleared a beat late: onAfterChange fires asynchronously after a graph lands, and clearing on the
+    // same tick would let our own load through as if the user had edited something.
+    setTimeout(() => { state.loading = false; }, AUTOSYNC_DEBOUNCE_MS);
   }
 }
 
@@ -304,11 +389,14 @@ async function saveBack({ silent = false, binding = null } = {}) {
 
 function scheduleAutoSync(delayMs = AUTOSYNC_DEBOUNCE_MS) {
   if (!activeBinding()) return;
+  // Opening a workflow lays its graph on the canvas, which looks exactly like an edit to LiteGraph. Left
+  // alone, merely *looking* at a workflow would push it back and rewrite the user's own file on disk.
+  if (state.loading) return;
   clearTimeout(state.timer);
   state.timer = setTimeout(() => {
     // Re-check on fire: onAfterChange also fires while a workflow is being loaded and when the user
     // switches tabs, and by now the active workflow may not be the one that triggered this.
-    if (activeBinding()) void saveBack({ silent: true });
+    if (!state.loading && activeBinding()) void saveBack({ silent: true });
   }, delayMs);
 }
 

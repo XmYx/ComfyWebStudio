@@ -10,7 +10,8 @@ export function cx(...parts: Array<string | false | null | undefined>): string {
 
 type ButtonProps = {
   children: ReactNode
-  onClick?: () => void
+  /** The event is passed through, so a handler can read modifiers such as shift. */
+  onClick?: (event: React.MouseEvent<HTMLButtonElement>) => void
   variant?: 'primary' | 'default' | 'ghost' | 'danger'
   size?: 'sm' | 'md'
   disabled?: boolean

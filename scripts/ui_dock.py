@@ -35,6 +35,14 @@ TREE_JS = """
 
 SIZES_JS = "() => JSON.parse(localStorage.getItem('comfywebstudio.layout')).state.tree.sizes"
 
+#: The tab labels of each dock group, in layout order — the layout as rendered rather than as stored.
+GROUPS_JS = """
+() => [...document.querySelectorAll('[data-dock-group]')].map(
+  (group) => [...group.querySelectorAll('[data-tabstrip] button')]
+    .map((b) => b.textContent.trim()).filter((t) => t && t.length > 1)
+)
+"""
+
 
 def check(condition: bool, message: str) -> None:
     print(f"  [{'ok  ' if condition else 'FAIL'}] {message}")
@@ -92,10 +100,14 @@ def main() -> int:
         page.wait_for_timeout(1200)
 
         print("The default layout")
+        # Read from the DOM rather than the stored layout: nothing has changed yet, so the store has not
+        # been persisted, and the rendered tab strips are what the user is actually looking at.
+        rendered = page.evaluate(GROUPS_JS)
         check(
-            page.evaluate(TREE_JS)
-            == "row[(shots,workflows,assets) (canvas,timeline) (inspector,monitor,renders)]",
-            f"three columns of tab groups ({page.evaluate(TREE_JS)})",
+            # Timeline, ComfyUI, Monitor and Renders share these groups but start hidden, so they are
+            # not drawn as tabs — the columns are the three panels a new workspace actually shows.
+            rendered == [["Shots", "Workflows", "Assets"], ["Canvas"], ["Inspector"]],
+            f"the visible panels are grouped into three columns ({rendered})",
         )
         check(page.locator("[role=separator]").count() >= 1, "with splitters between them")
 
@@ -105,7 +117,7 @@ def main() -> int:
         drag(page, centre_of(tab), (canvas["x"] + canvas["width"] / 2, canvas["y"] + canvas["height"] * 0.9))
         tree = page.evaluate(TREE_JS)
         check(
-            tree == "row[(shots,workflows,assets) column[(canvas,timeline) (inspector)] (monitor,renders)]",
+            tree == "row[(shots,workflows,assets) column[(canvas,timeline,comfy) (inspector)] (monitor,renders)]",
             f"splits it into a column, the panel underneath ({tree})",
         )
         if shots:
@@ -142,7 +154,7 @@ def main() -> int:
         check(
             # The bottom strip held only Shots, so the column wrapping the workspace has to collapse back
             # to the row underneath it. The column made earlier, which still holds two panels, must stay.
-            tree.startswith("row[") and "column[(canvas,timeline) (inspector)]" in tree,
+            tree.startswith("row[") and "column[(canvas,timeline,comfy) (inspector)]" in tree,
             f"and the strip it vacated collapses, leaving the other split alone ({tree})",
         )
 

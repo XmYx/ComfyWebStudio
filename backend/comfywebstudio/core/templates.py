@@ -41,6 +41,26 @@ from .models import (
 #: Deliberately the same convention ComfyUI uses for subgraph execution ids.
 KEY_SEPARATOR = ":"
 
+#: Marks a placed node that stands for another *shot* in the same project rather than a library template.
+#:
+#: It lives in the instance's ``template_id`` on purpose. Everything that draws, validates, expands or runs
+#: a placed node already resolves it through one id, so giving a nested shot a reference in the same shape
+#: means all of that works on it unchanged — which is precisely what "behave the same as a template" asks
+#: for. The only code that has to know the difference is the resolver that turns the id into a template.
+SHOT_SOURCE_PREFIX = "shot:"
+
+
+def shot_reference(shot_id: str) -> str:
+    """The reference a placed node uses to point at another shot."""
+    return f"{SHOT_SOURCE_PREFIX}{shot_id}"
+
+
+def referenced_shot(reference: str) -> str | None:
+    """The shot id behind a reference, or None when it names a library template."""
+    if reference.startswith(SHOT_SOURCE_PREFIX):
+        return reference[len(SHOT_SOURCE_PREFIX):] or None
+    return None
+
 
 class TemplateWorkflow(Base):
     """A workflow a template's steps need, carried with it so the template travels between projects."""

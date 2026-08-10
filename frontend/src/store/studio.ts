@@ -32,6 +32,16 @@ interface StudioState {
   selectedInstanceId: string | null
   /** The template currently drilled into, so the canvas can show what is inside a placed node. */
   openInstanceId: string | null
+  /**
+   * What the embedded ComfyUI panel is showing.
+   *
+   * Held here rather than inside the panel so that opening a workflow can point the panel at it from
+   * anywhere — the workflow library, a node's menu — without those knowing the panel exists. Null means
+   * "just show ComfyUI", which is what it opens with.
+   */
+  comfyUrl: string | null
+  /** Bumped on every request, so asking for the URL already showing still reloads the frame. */
+  comfyNonce: number
   selectedClip: { trackId: string; clipId: string } | null
 
   activeRun: Run | null
@@ -47,6 +57,8 @@ interface StudioState {
   selectStep: (id: string | null) => void
   selectInstance: (id: string | null) => void
   openInstance: (id: string | null) => void
+  /** Point the embedded ComfyUI panel somewhere. Bumped even for the same URL, to force a reload. */
+  showInComfy: (url: string | null) => void
   selectClip: (selection: { trackId: string; clipId: string } | null) => void
 
   beginRun: (run: Run) => void
@@ -66,6 +78,8 @@ export const useStudio = create<StudioState>((set) => ({
   selectedStepId: null,
   selectedInstanceId: null,
   openInstanceId: null,
+  comfyUrl: null,
+  comfyNonce: 0,
   selectedClip: null,
   activeRun: null,
   liveSteps: {},
@@ -85,6 +99,7 @@ export const useStudio = create<StudioState>((set) => ({
   selectStep: (id) => set({ selectedStepId: id, selectedInstanceId: null }),
   selectInstance: (id) => set({ selectedInstanceId: id, selectedStepId: null }),
   openInstance: (id) => set({ openInstanceId: id, selectedStepId: null, selectedInstanceId: null }),
+  showInComfy: (url) => set((s) => ({ comfyUrl: url, comfyNonce: s.comfyNonce + 1 })),
   selectClip: (selection) => set({ selectedClip: selection }),
   setPlayhead: (playhead) => set({ playhead }),
   setPlaying: (playing) => set({ playing }),

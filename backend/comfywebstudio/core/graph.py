@@ -204,7 +204,7 @@ def validate_placed(project: Project, shot: Shot, template_store) -> tuple[Graph
     """
     from .template_capture import flatten_shot, templates_for
 
-    flat = flatten_shot(shot, templates_for(shot, template_store))
+    flat = flatten_shot(shot, templates_for(project, shot, template_store))
     report = validate_shot(project, flat.shot)
     report.issues = (
         [GraphIssue("error", message) for message in flat.errors]

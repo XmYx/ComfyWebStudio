@@ -283,7 +283,7 @@ export const api = {
     place: (
       projectId: string,
       shotId: string,
-      body: { template_id: string; name?: string; ui_pos?: Vec2 },
+      body: { template_id?: string; source_shot_id?: string; name?: string; ui_pos?: Vec2 },
     ) =>
       request<TemplateInstance>(`/api/projects/${projectId}/shots/${shotId}/instances`, {
         method: 'POST',

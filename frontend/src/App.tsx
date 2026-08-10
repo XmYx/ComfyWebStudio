@@ -82,6 +82,9 @@ function ProjectShell({ children }: { children: React.ReactNode }) {
       case 'workflow.synced': {
         const removed: string[] = event.data.removed_ports ?? []
         const broken: unknown[] = event.data.broken_links ?? []
+        // Values a step had set for itself do not follow a change made in ComfyUI — saying so is the
+        // difference between "the sync is broken" and "that one is deliberately different".
+        const kept: string[] = event.data.kept_values ?? []
         toast.push(
           removed.length ? 'bad' : 'ok',
           removed.length
@@ -89,6 +92,13 @@ function ProjectShell({ children }: { children: React.ReactNode }) {
               `${broken.length} link(s) were disconnected.`
             : `${event.data.name ?? 'Workflow'} synced from ComfyUI — ${event.data.ports} port(s).`,
         )
+        if (kept.length) {
+          toast.push(
+            'info',
+            `${kept.join(', ')} kept the value set here rather than the one from ComfyUI. ` +
+              'Clear it on the step to follow ComfyUI again.',
+          )
+        }
         queryClient.invalidateQueries({ queryKey: ['project', projectId] })
         queryClient.invalidateQueries({ queryKey: ['workflows', projectId] })
         break

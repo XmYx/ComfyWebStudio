@@ -1689,3 +1689,101 @@ async def test_bridge_prefers_the_ui_graph_when_one_exists(client, fake_comfy):
 
     assert payload["has_ui_graph"] is True
     assert payload["workflow"]["nodes"]
+
+
+async def _sync_from_comfy(client, project_id: str, workflow_id: str, prompt: dict) -> dict:
+    """What the bridge extension does when ComfyUI saves: push the edited prompt back."""
+    opened = (
+        await client.post(f"/api/projects/{project_id}/workflows/{workflow_id}/open-in-comfy")
+    ).json()
+    response = await client.post(
+        "/api/bridge/workflow",
+        headers={"X-WebStudio-Token": opened["token"]},
+        json={"step_id": workflow_id, "workflow": {"nodes": [], "links": []}, "prompt": prompt},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def test_a_value_changed_in_comfyui_reaches_the_steps_using_it(client):
+    """The whole point of syncing: change it in ComfyUI, see it in the framework.
+
+    A step keeps an override for every parameter it has been given a value for, and an override beats the
+    workflow's default — so without this, editing a value in ComfyUI updated the workflow and changed
+    nothing the user could actually see.
+    """
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Generate", generator_prompt())
+    shot = (await client.post(f"/api/projects/{project['id']}/shots", json={"name": "S"})).json()
+    step = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+            json={"workflow_id": workflow["id"]},
+        )
+    ).json()
+
+    # The step is holding the value the workflow had when it was placed — a copy, not a decision.
+    await client.patch(
+        f"/api/projects/{project['id']}/steps/{step['id']}",
+        json={"param_overrides": {"prompt": "a cat"}},
+    )
+
+    edited = generator_prompt()
+    edited["1"]["inputs"]["value"] = "a dog"
+    result = await _sync_from_comfy(client, project["id"], workflow["id"], edited)
+
+    assert result["adopted_values"] == ["prompt"]
+    updated = (await client.get(f"/api/projects/{project['id']}")).json()
+    step_now = updated["shots"][0]["steps"][0]
+    assert "prompt" not in step_now["param_overrides"], "the stale copy should have been let go"
+
+    stored = (
+        await client.get(f"/api/projects/{project['id']}/workflows/{workflow['id']}")
+    ).json()
+    assert next(p["default"] for p in stored["params"] if p["key"] == "prompt") == "a dog"
+
+
+async def test_a_value_the_user_set_themselves_is_not_overwritten(client):
+    """Two steps sharing a workflow are meant to be able to differ, so a deliberate value stays put."""
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Generate", generator_prompt())
+    shot = (await client.post(f"/api/projects/{project['id']}/shots", json={"name": "S"})).json()
+    step = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+            json={"workflow_id": workflow["id"]},
+        )
+    ).json()
+    await client.patch(
+        f"/api/projects/{project['id']}/steps/{step['id']}",
+        json={"param_overrides": {"prompt": "this step is different on purpose"}},
+    )
+
+    edited = generator_prompt()
+    edited["1"]["inputs"]["value"] = "a dog"
+    result = await _sync_from_comfy(client, project["id"], workflow["id"], edited)
+
+    assert result["kept_values"] == ["prompt"]
+    assert result["adopted_values"] == []
+    updated = (await client.get(f"/api/projects/{project['id']}")).json()
+    assert updated["shots"][0]["steps"][0]["param_overrides"]["prompt"] == (
+        "this step is different on purpose"
+    )
+
+
+async def test_a_step_with_no_value_of_its_own_needs_no_adopting(client):
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Generate", generator_prompt())
+    shot = (await client.post(f"/api/projects/{project['id']}/shots", json={"name": "S"})).json()
+    await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+        json={"workflow_id": workflow["id"]},
+    )
+
+    edited = generator_prompt()
+    edited["1"]["inputs"]["value"] = "a dog"
+    result = await _sync_from_comfy(client, project["id"], workflow["id"], edited)
+
+    # Nothing to adopt: with no override it already reads through to the workflow's new value.
+    assert result["adopted_values"] == []
+    assert result["kept_values"] == []

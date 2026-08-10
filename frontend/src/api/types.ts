@@ -193,6 +193,8 @@ export interface ShotTemplate {
 export interface PlacedTemplate {
   instance_id: string
   template_id: string
+  /** Set when this node stands for another shot in the project rather than a library template. */
+  source_shot_id?: string | null
   missing: boolean
   stale?: boolean
   summary?: TemplateSummary

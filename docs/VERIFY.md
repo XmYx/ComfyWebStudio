@@ -22,7 +22,10 @@ cd frontend && npm run typecheck && npx vitest run
 | `scripts/ui_menus.py` | the menus: shortcuts, undo/redo, panel toggles, dialogs | a running app |
 | `scripts/ui_features.py` | node resize, context menus, history panel and element restore | a running app |
 | `scripts/ui_dismiss.py` | menus close on a click elsewhere, including surfaces that swallow mousedown | a running app |
+| `tests/test_shot_sources.py` | a shot placed in a shot: live structure, instanced values, cycles refused | fake ComfyUI |
 | `scripts/ui_dock.py` | panels dock beside/above/below each other, splitters resize, rim docking | a running app |
+| `scripts/ui_nested_shots.py` | dragging a shot into a shot places it as one contained node | a running app |
+| `scripts/ui_comfy_panel.py` | ComfyUI embeds in a panel, maximises without reloading, workflows open into it | app + real ComfyUI |
 | `scripts/ui_open_in_comfy.py` | opening a workflow lands on a *named, saved* ComfyUI workflow | app + real ComfyUI |
 | `scripts/ui_bridge_binding.py` | each ComfyUI workflow syncs back only to its own step | app + real ComfyUI |
 
@@ -66,7 +69,10 @@ afterwards, so they are repeatable and never touch your real work.
       dependents are marked **skipped**, not failed.
 
 ### Editing in ComfyUI
-- [ ] "Open in ComfyUI" opens a new tab with the graph loaded and a green **WebStudio · Linked** badge.
+- [ ] "Open in ComfyUI" shows the **ComfyUI** panel with the graph loaded and a green **WebStudio · Linked**
+      badge; shift-clicking the button still opens a real browser tab instead.
+- [ ] The panel's ⤢ fills the workspace and ⤡ gives the layout back, *without* reloading ComfyUI — an
+      unsaved graph in the frame survives both.
 - [ ] The ComfyUI tab shows the workflow's **name**, not "Unsaved Workflow", and <kbd>Ctrl</kbd>+<kbd>S</kbd>
       there saves in place without asking for a name.
 - [ ] A workflow imported with **From ComfyUI** reopens *its original file* — check the tab name matches and

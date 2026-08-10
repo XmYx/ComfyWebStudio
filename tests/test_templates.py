@@ -378,6 +378,6 @@ def test_templates_for_skips_what_the_library_has_lost(app_state, library, sourc
     template = save(app_state, library, source_project, source_project.shots[0])
     place_instance(target, shot, template, library, app_state.store)
 
-    assert set(templates_for(shot, library)) == {template.id}
+    assert set(templates_for(target, shot, library)) == {template.id}
     library.delete(template.id)
-    assert templates_for(shot, library) == {}
+    assert templates_for(target, shot, library) == {}

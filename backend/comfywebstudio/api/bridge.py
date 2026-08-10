@@ -124,6 +124,7 @@ async def save_workflow(
     raw_params = [p for p in workflow.params if p.source == "raw_widget" and p.node_id in body.prompt]
 
     previous_ports = {p.key for p in workflow.ports}
+    previous_defaults = {p.key: p.default for p in workflow.params}
     workflow.ports = analysis.ports
     workflow.params = [*analysis.params, *raw_params]
     workflow.hash = analysis.hash
@@ -143,6 +144,8 @@ async def save_workflow(
     except Exception as exc:  # noqa: BLE001 - syncing back must not fail over a userdata write
         logger.debug("Could not refresh ComfyUI's copy of %r: %s", workflow.name, exc)
 
+    adopted, kept = _adopt_new_defaults(project, workflow, previous_defaults)
+
     removed = previous_ports - {p.key for p in workflow.ports}
     broken = drop_links_for_removed_ports(project, workflow.id, removed)
     state.store.save(project)
@@ -157,11 +160,13 @@ async def save_workflow(
             "params": len(workflow.params),
             "removed_ports": sorted(removed),
             "broken_links": broken,
+            "adopted_values": sorted(adopted),
+            "kept_values": sorted(kept),
         },
     )
     logger.info(
-        "Workflow %r synced from ComfyUI: %d ports, %d params", workflow.name,
-        len(workflow.ports), len(workflow.params),
+        "Workflow %r synced from ComfyUI: %d ports, %d params, %d value(s) adopted", workflow.name,
+        len(workflow.ports), len(workflow.params), len(adopted),
     )
 
     return {
@@ -172,4 +177,46 @@ async def save_workflow(
         "param_count": len(workflow.params),
         "removed_ports": sorted(removed),
         "broken_links": broken,
+        "adopted_values": sorted(adopted),
+        "kept_values": sorted(kept),
     }
+
+
+def _adopt_new_defaults(
+    project, workflow, previous_defaults: dict[str, Any]
+) -> tuple[set[str], set[str]]:
+    """Let steps follow a value the user just changed in ComfyUI, without losing their own.
+
+    A step stores an override for every parameter it has ever been given a value for, and an override
+    always wins over the workflow's default — so editing a value in ComfyUI updated the workflow and
+    changed nothing the user could see. That is the bug this exists to fix.
+
+    The distinction that makes it safe: an override *equal to the old default* was never a decision, just
+    a copy of it, so it follows the new value. One that differs was somebody deliberately setting this
+    step apart — two steps sharing a workflow are meant to be able to differ — so it stays, and is
+    reported instead, rather than being silently overwritten.
+    """
+    new_defaults = {p.key: p.default for p in workflow.params}
+    moved = {
+        key: value
+        for key, value in new_defaults.items()
+        if key in previous_defaults and previous_defaults[key] != value
+    }
+    if not moved:
+        return set(), set()
+
+    adopted: set[str] = set()
+    kept: set[str] = set()
+    for shot in project.shots:
+        for step in shot.steps:
+            if step.workflow_id != workflow.id:
+                continue
+            for key in moved:
+                if key not in step.param_overrides:
+                    continue  # nothing of its own, so it already shows the new value
+                if step.param_overrides[key] == previous_defaults[key]:
+                    del step.param_overrides[key]
+                    adopted.add(key)
+                else:
+                    kept.add(key)
+    return adopted, kept

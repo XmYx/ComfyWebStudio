@@ -8,6 +8,7 @@ import { KIND_COLOR } from '@/lib/kinds'
 import { relativeTime } from '@/lib/format'
 import { Badge, Button, Panel, PanelHeader, Spinner, useToast } from '@/components/ui'
 import { startDrag } from '@/lib/dnd'
+import { useOpenInComfy } from '@/features/comfy/useOpenInComfy'
 import { ComfyWorkflowBrowser } from './ComfyWorkflowBrowser'
 import { TemplateLibrary } from './TemplateLibrary'
 import { useLayout } from '@/store/layout'
@@ -39,6 +40,11 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
     { type: 'action', label: 'Add as a step', disabled: !shot, onSelect: () => void addStep(workflow) },
     { type: 'separator' },
     { type: 'action', label: 'Open in ComfyUI', onSelect: () => void openInComfy(workflow) },
+    {
+      type: 'action',
+      label: 'Open in ComfyUI (new tab)',
+      onSelect: () => void openInComfy(workflow, true),
+    },
     {
       type: 'action',
       label: 'Sync from ComfyUI',
@@ -110,17 +116,13 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
     }
   }
 
-  const openInComfy = async (workflow: WorkflowRef) => {
+  const openInComfyPanel = useOpenInComfy()
+
+  const openInComfy = async (workflow: WorkflowRef, newTab = false) => {
     setBusyId(workflow.id)
-    try {
-      const result = await api.workflows.openInComfy(project.id, workflow.id)
-      if (result.hint) toast.push('bad', result.hint)
-      window.open(result.url, '_blank', 'noopener')
-    } catch (error) {
-      toast.push('bad', (error as ApiError).message)
-    } finally {
-      setBusyId(null)
-    }
+    // Shows it in the embedded ComfyUI panel; shift-click still opens a real tab.
+    await openInComfyPanel(project.id, workflow.id, { newTab })
+    setBusyId(null)
   }
 
   return (
@@ -223,7 +225,7 @@ export function WorkflowLibrary({ project, shot, onChanged }: Props) {
                   <Button
                     size="sm"
                     variant="ghost"
-                    onClick={() => openInComfy(workflow)}
+                    onClick={(event) => openInComfy(workflow, event.shiftKey)}
                     disabled={busyId === workflow.id}
                     title="Open this workflow in ComfyUI; saving there syncs it back here"
                   >

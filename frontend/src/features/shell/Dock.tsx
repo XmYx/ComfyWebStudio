@@ -66,6 +66,7 @@ export function Dock({ render }: Props) {
   const floatWidget = useLayout((s) => s.floatWidget)
   const setWidget = useLayout((s) => s.setWidget)
 
+  const toggleMaximized = useLayout((s) => s.toggleMaximized)
   const workspace = useRef<HTMLDivElement>(null)
   const [drag, setDrag] = useState<DragState | null>(null)
 
@@ -135,6 +136,8 @@ export function Dock({ render }: Props) {
         // tab would end in a drop, re-docking the panel into its own group and shuffling the tab order
         // under the cursor.
         if (!dragging && Math.hypot(e.clientX - from.x, e.clientY - from.y) < DRAG_THRESHOLD_PX) return
+        // Dragging a panel is about where it sits in the layout, so restore the layout to drop it into.
+        if (!dragging) toggleMaximized(null)
         dragging = true
         setDrag({ id, x: e.clientX, y: e.clientY, target: targetAt(e.clientX, e.clientY) })
       }
@@ -169,7 +172,7 @@ export function Dock({ render }: Props) {
       window.addEventListener('mousemove', move)
       window.addEventListener('mouseup', up)
     },
-    [targetAt, dockWidget, dockWidgetToEdge, floatWidget, setWidget, widgets],
+    [targetAt, dockWidget, dockWidgetToEdge, floatWidget, setWidget, toggleMaximized, widgets],
   )
 
   return (
@@ -325,13 +328,31 @@ function DockGroup({
   const setActive = useLayout((s) => s.setActive)
   const toggleWidget = useLayout((s) => s.toggleWidget)
   const floatWidget = useLayout((s) => s.floatWidget)
+  const maximized = useLayout((s) => s.maximized)
+  const toggleMaximized = useLayout((s) => s.toggleMaximized)
 
-  const shown = node.active && node.tabs.includes(node.active) ? node.active : node.tabs[0]
+  /**
+   * Maximising lifts this group over the workspace rather than rendering a different tree.
+   *
+   * That distinction matters more than it sounds: a panel can own live state its React subtree is the
+   * only copy of — the embedded ComfyUI is a whole application in an iframe — and rebuilding the tree
+   * around it would remount that frame and throw the user's unsaved graph away. Everything else stays
+   * mounted underneath, simply covered.
+   */
+  const filling = Boolean(maximized && node.tabs.includes(maximized))
+  const shown = filling
+    ? maximized!
+    : node.active && node.tabs.includes(node.active) ? node.active : node.tabs[0]
+  const isMaximized = Boolean(shown && maximized === shown)
 
   return (
     <div
       data-dock-group={node.id}
-      className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-[var(--color-edge)] bg-[var(--color-panel)]"
+      className={cx(
+        'flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-[var(--color-edge)] bg-[var(--color-panel)]',
+        // Positioned against the workspace, which is the nearest positioned ancestor.
+        filling ? 'absolute inset-0 z-20 h-auto' : 'h-full',
+      )}
     >
       <div
         data-tabstrip={node.id}
@@ -343,6 +364,7 @@ function DockGroup({
             // The tab is the drag handle — for a tabbed panel that is what "move it by its titlebar"
             // means. A press that never moves just selects the tab.
             onMouseDown={(event) => { setActive(node.id, id); onDrag(id, event) }}
+            onDoubleClick={() => toggleMaximized(id)}
             className={cx(
               'cursor-grab whitespace-nowrap px-2.5 py-1 text-[11px] transition-colors active:cursor-grabbing',
               id === shown
@@ -356,7 +378,15 @@ function DockGroup({
         <div className="flex-1" />
         {shown && (
           <div className="flex items-center gap-0.5 pr-1">
-            <StripButton title="Pop out into a window" onClick={() => floatWidget(shown, true)}>⧉</StripButton>
+            <StripButton
+              title={isMaximized ? 'Restore the layout' : 'Fill the workspace with this panel'}
+              onClick={() => toggleMaximized(shown)}
+            >
+              {isMaximized ? '⤡' : '⤢'}
+            </StripButton>
+            {!isMaximized && (
+              <StripButton title="Pop out into a window" onClick={() => floatWidget(shown, true)}>⧉</StripButton>
+            )}
             <StripButton title="Hide this panel" onClick={() => toggleWidget(shown)}>✕</StripButton>
           </div>
         )}

@@ -13,17 +13,19 @@ from typing import Any
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from ..core.errors import NotFound, ValidationFailed
+from ..core.errors import NotFound, StudioError, ValidationFailed
 from ..core.models import Shot, Size, TemplateInstance, Vec2
+from ..core.shot_sources import capture_live_shot, check_placeable, collect_templates
 from ..core.template_capture import (
     capture_shot,
     carry_over_promotions,
     materialise,
     place_instance,
     sync_instance,
+    templates_for,
 )
 from ..core.template_store import summarize
-from ..core.templates import ShotTemplate, TemplateSummary
+from ..core.templates import ShotTemplate, TemplateSummary, referenced_shot
 from .deps import ProjectDep, ShotDep, StateDep
 
 logger = logging.getLogger(__name__)
@@ -52,7 +54,10 @@ class PromotionRequest(BaseModel):
 
 
 class PlaceInstanceRequest(BaseModel):
-    template_id: str
+    #: A library template to place. Leave unset when placing a shot instead.
+    template_id: str = ""
+    #: Another shot in this project, placed as one node that stands for everything inside it.
+    source_shot_id: str = ""
     name: str | None = None
     ui_pos: Vec2 | None = None
 
@@ -252,8 +257,21 @@ def _find_instance(project, instance_id: str) -> tuple[Shot, TemplateInstance]:
 def place(
     state: StateDep, project: ProjectDep, shot: ShotDep, body: PlaceInstanceRequest
 ) -> TemplateInstance:
-    """Place a template on this shot's canvas as one node."""
-    template = state.templates.get(body.template_id)
+    """Place a template — or another shot — on this shot's canvas as one node.
+
+    A placed shot is the same node in every respect the user can see: the same ports to wire, the same
+    controls to edit, the same preview of what it produced. It differs only in being read live from the
+    shot rather than from the library, and in holding its values on the instance so two placements of one
+    shot are independent.
+    """
+    if body.source_shot_id:
+        source = check_placeable(project, shot, body.source_shot_id)
+        template = capture_live_shot(project, source, collect_templates(project, source, state.templates))
+    elif body.template_id:
+        template = state.templates.get(body.template_id)
+    else:
+        raise StudioError("Placing a node needs either a template or a shot to stand for.")
+
     instance = place_instance(
         project, shot, template, state.templates, state.store,
         name=body.name or "", ui_pos=body.ui_pos,
@@ -309,29 +327,32 @@ def placed_templates(state: StateDep, project: ProjectDep, shot: ShotDep) -> lis
     One request rather than one per instance: the canvas needs every instance's ports and controls before
     it can draw anything, and a template placed five times should not be fetched five times.
     """
-    seen: dict[str, ShotTemplate] = {}
+    # Nested shots are captured here too, so a placed shot arrives at the canvas in exactly the shape a
+    # placed template does and the node needs no second code path to draw it.
+    resolved = templates_for(project, shot, state.templates)
+
     result: list[dict] = []
     for instance in shot.instances:
-        template = seen.get(instance.template_id)
+        template = resolved.get(instance.template_id)
         if template is None:
-            try:
-                template = state.templates.get(instance.template_id)
-            except NotFound:
-                result.append(
-                    {
-                        "instance_id": instance.id,
-                        "template_id": instance.template_id,
-                        "missing": True,
-                    }
-                )
-                continue
-            seen[instance.template_id] = template
+            result.append(
+                {
+                    "instance_id": instance.id,
+                    "template_id": instance.template_id,
+                    "source_shot_id": referenced_shot(instance.template_id),
+                    "missing": True,
+                }
+            )
+            continue
+        source_shot_id = referenced_shot(template.id)
         result.append(
             {
                 "instance_id": instance.id,
                 "template_id": template.id,
+                "source_shot_id": source_shot_id,
                 "missing": False,
-                "stale": instance.template_revision != template.revision,
+                # A nested shot is read live, so it can never be behind what it points at.
+                "stale": source_shot_id is None and instance.template_revision != template.revision,
                 "summary": summarize(template).model_dump(mode="json"),
                 "ports": [p.model_dump(mode="json") for p in template.shown_ports],
                 "controls": [c.model_dump(mode="json") for c in template.shown_controls],

@@ -358,7 +358,7 @@ def create_link(
     """
     link = Link(**body.model_dump())
     # Templates are only loaded when the shot actually places one — the common link touches neither end.
-    templates = templates_for(shot, state.templates) if shot.instances else None
+    templates = templates_for(project, shot, state.templates) if shot.instances else None
     validate_new_link(project, shot, link, templates)
     shot.links.append(link)
     state.store.save(project)

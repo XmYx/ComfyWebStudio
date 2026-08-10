@@ -7,6 +7,7 @@ import type { RunMode } from '@/api/types'
 import { useStudio } from '@/store/studio'
 import { useLayout } from '@/store/layout'
 import { ShotCanvas } from '@/features/graph/ShotCanvas'
+import { ComfyPanel } from '@/features/comfy/ComfyPanel'
 import { WorkflowLibrary } from './WorkflowLibrary'
 import { AssetLibrary } from './AssetLibrary'
 import { startDrag } from '@/lib/dnd'
@@ -32,6 +33,7 @@ export function ShotsPage() {
   const selectedStepId = useStudio((s) => s.selectedStepId)
   const selectedInstanceId = useStudio((s) => s.selectedInstanceId)
   const openInstanceId = useStudio((s) => s.openInstanceId)
+  const openInstance_ = useStudio((s) => s.openInstance)
   const activeRun = useStudio((s) => s.activeRun)
   const seedFromResults = useStudio((s) => s.seedFromResults)
   // The transport is shared, so a floating Monitor widget follows the same playhead as the timeline.
@@ -87,6 +89,18 @@ export function ShotsPage() {
     () => new Map((placedList ?? []).map((entry) => [entry.instance_id, entry])),
     [placedList],
   )
+
+  // Looking inside a placed *shot* just means going to that shot. Unlike a template it is already a real
+  // shot with a real canvas, so there is no editing session to open — and edits made there are meant to
+  // reach every node standing for it, which is what editing the shot directly does.
+  const drilledIntoShot = openInstanceId
+    ? placedById.get(openInstanceId)?.source_shot_id ?? null
+    : null
+  useEffect(() => {
+    if (!drilledIntoShot) return
+    openInstance_(null)
+    setShot(drilledIntoShot)
+  }, [drilledIntoShot, openInstance_, setShot])
 
   // Only fetched when a Monitor is actually on screen — it is off by default.
   const monitorVisible = useLayout((s) => s.widgets.monitor.visible)
@@ -302,7 +316,7 @@ export function ShotsPage() {
       )}
 
       <div className="min-h-0 flex-1">
-        {openInstance && shot ? (
+        {openInstance && shot && !drilledIntoShot ? (
           // Drilled into a placed template: the canvas edits the template itself until the user leaves.
           <TemplateEditor
             project={project}
@@ -368,6 +382,7 @@ export function ShotsPage() {
           workflows: <WorkflowLibrary project={project} shot={shot} onChanged={invalidate} />,
           assets: <AssetLibrary project={project} onChanged={invalidate} />,
           canvas: canvasPanel,
+          comfy: <ComfyPanel />,
           // The timeline is a centre widget too, so floating one of the two shows both at once.
           timeline: <TimelinePage embedded />,
           inspector: inspectorPanel,

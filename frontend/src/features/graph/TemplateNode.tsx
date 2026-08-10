@@ -70,6 +70,8 @@ export function TemplateNode({ id, data, selected }: NodeProps) {
   const inputs = ports.filter((p) => p.direction === 'in')
   const outputs = ports.filter((p) => p.direction === 'out')
   const title = instance.name || placed?.summary?.name || 'Template'
+  // A nested shot is read live, so it has no revision to fall behind and never offers "update".
+  const nested = Boolean(placed?.source_shot_id)
 
   const sized = instance.ui_size?.w > 0 && instance.ui_size?.h > 0
   const patchControl = useControlPatch(instance.id, onControlChange)
@@ -87,7 +89,9 @@ export function TemplateNode({ id, data, selected }: NodeProps) {
       <div className="w-56 rounded-lg border border-[var(--color-bad)] bg-[var(--color-panel)] p-2.5 shadow-lg">
         <div className="text-xs font-semibold">{title}</div>
         <div className="mt-1 text-[10px] leading-snug text-[var(--color-bad)]">
-          Its template is no longer in the library. Save a shot over it to restore it, or delete this node.
+          {placed.source_shot_id
+            ? 'The shot this stands for is no longer in this project. Delete this node.'
+            : 'Its template is no longer in the library. Save a shot over it to restore it, or delete this node.'}
         </div>
       </div>
     )
@@ -115,13 +119,19 @@ export function TemplateNode({ id, data, selected }: NodeProps) {
       />
 
       <div className="flex shrink-0 items-center gap-1.5 border-b border-[var(--color-edge)] bg-[var(--color-panel-2)] px-2.5 py-1.5">
-        <span className="text-[10px] text-[var(--color-ink-dim)]" title="A placed shot template">▣</span>
+        <span
+          className="text-[10px] text-[var(--color-ink-dim)]"
+          title={nested ? 'Another shot, placed as one node' : 'A placed shot template'}
+        >
+          {nested ? '⧉' : '▣'}
+        </span>
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-semibold">{title}</div>
           <div className="truncate text-[10px] text-[var(--color-ink-dim)]">
             {placed?.summary
-              ? `${placed.summary.step_count} step${placed.summary.step_count === 1 ? '' : 's'}`
-              : 'template'}
+              ? `${nested ? 'shot' : 'template'} · ${placed.summary.step_count} step` +
+                `${placed.summary.step_count === 1 ? '' : 's'}`
+              : nested ? 'shot' : 'template'}
           </div>
         </div>
         {placed?.stale && (
