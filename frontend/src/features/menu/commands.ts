@@ -554,7 +554,7 @@ export const COMMANDS: Command[] = [
   {
     id: 'help.docs',
     label: 'Documentation',
-    run: () => window.open('https://github.com/magix/ComfyWebStudio#readme', '_blank', 'noopener'),
+    run: () => window.open('https://github.com/XmYx/ComfyWebStudio#readme', '_blank', 'noopener'),
   },
   {
     id: 'help.comfy',
