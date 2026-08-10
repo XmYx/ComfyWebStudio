@@ -170,21 +170,32 @@ async function whenCanvasReady(timeoutMs = 30000) {
   return false;
 }
 
+/** True when ComfyUI is showing the workflow at `path`, with its graph actually on the canvas. */
+function isShowing(path) {
+  const active = app.extensionManager?.workflow?.activeWorkflow?.path;
+  return active === path && canvasNodeCount() > 0;
+}
+
 /**
  * Opens a workflow that ComfyUI already has saved, by path.
  *
  * This is what makes the tab a *named* workflow: Ctrl+S saves it in place instead of prompting for a name
  * and a folder, and the file it saves to is the same one the framework reads back.
  *
- * Two traps, both of which produced an empty canvas in practice:
+ * Three traps, each of which produced "it opened the wrong thing" in practice:
  *
  *   1. A workflow from the directory listing is *metadata only*. `openWorkflow` switches to it happily and
  *      shows you nothing; reading the file is a separate `load()` step.
  *   2. We run from the extension `setup()` hook, which is early enough that the canvas may not be ready to
- *      receive a graph — the open silently does nothing even though the tab gets the right name. So rather
- *      than trusting one attempt, re-assert until the canvas really has the nodes.
+ *      receive a graph — the open silently does nothing even though the tab gets the right name.
+ *   3. ComfyUI restores its own persisted session during boot, and that restore lands *after* we open.
+ *      It re-activates whatever the user last had open, so our workflow ends up in the tab strip while a
+ *      different one is on screen.
+ *
+ * Hence: re-assert until the workflow we asked for is genuinely the active one, and then confirm it stays
+ * that way — a single successful check can still be undone a moment later by (3).
  */
-async function openSavedWorkflow(path, { attempts = 8, delayMs = 400 } = {}) {
+async function openSavedWorkflow(path, { timeoutMs = 15000, delayMs = 400, settleMs = 700 } = {}) {
   const store = app.extensionManager?.workflow;
   if (!path || !store?.getWorkflowByPath) return false;
 
@@ -194,7 +205,8 @@ async function openSavedWorkflow(path, { attempts = 8, delayMs = 400 } = {}) {
     const workflow = store.getWorkflowByPath(path);
     if (!workflow) return false;
 
-    for (let attempt = 0; attempt < attempts; attempt++) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
       if (!workflow.isLoaded) await workflow.load();
 
       // force, because re-asserting an already-active workflow is otherwise a no-op — which is precisely
@@ -203,10 +215,18 @@ async function openSavedWorkflow(path, { attempts = 8, delayMs = 400 } = {}) {
       await store.openWorkflow(workflow, { force: true });
       await sleep(delayMs);
 
-      if (canvasNodeCount() > 0) return true;
+      if (isShowing(path)) {
+        // Let the boot sequence finish and check again; if something stole the canvas back, go round.
+        await sleep(settleMs);
+        if (isShowing(path)) return true;
+      }
     }
 
-    console.warn(`[WebStudio] ${path} stayed empty after ${attempts} attempts, falling back to the graph`);
+    const active = app.extensionManager?.workflow?.activeWorkflow?.path;
+    console.warn(
+      `[WebStudio] could not get ${path} onto the canvas (showing ${active ?? "nothing"}); ` +
+        "falling back to loading the graph",
+    );
     return false;
   } catch (err) {
     console.warn("[WebStudio] could not open the saved workflow, falling back", err);

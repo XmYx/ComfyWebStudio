@@ -43,25 +43,40 @@ def _api(url: str, path: str, payload=None, method="GET"):
 
 
 def fingerprint(url: str, project_id: str, workflow_id: str) -> dict:
-    """What a sync would change: the graph hash and the discovered ports."""
+    """What a sync would change: the graph hash, the discovered ports, and when it last synced."""
     workflow = _api(url, f"/api/projects/{project_id}/workflows/{workflow_id}")
     return {
         "hash": workflow["hash"],
         "ports": sorted(p["key"] for p in workflow["ports"]),
         "params": sorted(p["key"] for p in workflow["params"]),
+        "last_synced": workflow.get("last_synced"),
     }
 
 
 def open_in_comfy(context, url: str, project_id: str, workflow_id: str):
-    """Open a workflow in its own ComfyUI tab and wait until its graph is really on the canvas."""
+    """Open a workflow in its own ComfyUI tab and wait until *that* workflow is really on the canvas.
+
+    Waiting for a non-empty canvas is not enough: ComfyUI restores its own last-open workflow during boot,
+    so there is a window where the canvas has nodes belonging to something else entirely.
+    """
     payload = _api(url, f"/api/projects/{project_id}/workflows/{workflow_id}/open-in-comfy", {}, "POST")
     page = context.new_page()
+    page.bring_to_front()  # a background tab has rAF paused, and ComfyUI's boot stalls with it
     page.goto(payload["url"], wait_until="domcontentloaded")
-    page.wait_for_function("() => window.app?.extensionManager?.workflow !== undefined", timeout=90000)
     page.wait_for_function(
-        "() => (window.app?.canvas?.graph?._nodes?.length ?? 0) > 0", timeout=90000
+        "() => window.app?.extensionManager?.workflow !== undefined", timeout=90000, polling=250
     )
-    page.wait_for_timeout(1500)
+    page.wait_for_function(
+        """(expected) => {
+            const store = window.app?.extensionManager?.workflow
+            return store?.activeWorkflow?.path === expected
+                && (window.app?.canvas?.graph?._nodes?.length ?? 0) > 0
+        }""",
+        arg=payload["comfy_path"],
+        timeout=90000,
+        polling=250,
+    )
+    page.wait_for_timeout(1000)
     return page, payload
 
 
@@ -125,11 +140,14 @@ def main() -> int:
 
             check(after_second == before_second, "saving from tab A left workflow B completely untouched")
             check(
-                after_first["ports"] == before_first["ports"],
-                "and workflow A still has its own ports",
+                after_first["last_synced"] != before_first["last_synced"],
+                "workflow A is the one that received the sync",
             )
+            # Deliberately not comparing A's ports before and after: a save-back re-discovers them from
+            # ComfyUI's own graphToPrompt output, which can legitimately differ from what the importer
+            # derived. What must never happen is a port that only B had turning up in A.
             check(
-                not set(after_first["ports"]) & set(before_second["ports"]) - set(before_first["ports"]),
+                not set(after_first["ports"]) & (set(before_second["ports"]) - set(before_first["ports"])),
                 "no port leaked from B into A",
             )
 

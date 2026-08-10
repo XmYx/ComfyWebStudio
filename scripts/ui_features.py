@@ -149,7 +149,10 @@ def main() -> int:
         page.keyboard.press("Escape")
         page.wait_for_timeout(300)
 
-        page.locator(".react-flow__pane").click(button="right", position={"x": 700, "y": 600})
+        pane = page.locator(".react-flow__pane").bounding_box()
+        page.locator(".react-flow__pane").click(
+            button="right", position={"x": pane["width"] * 0.6, "y": pane["height"] * 0.6}
+        )
         page.wait_for_timeout(400)
         pane_menu = page.locator('[data-testid="context-menu"]')
         check(pane_menu.count() == 1, "right-clicking the canvas opens a menu")
@@ -162,8 +165,13 @@ def main() -> int:
         page.keyboard.press("Escape")
         page.wait_for_timeout(300)
 
-        # A menu opened near the bottom edge must still fit on screen.
-        page.locator(".react-flow__pane").click(button="right", position={"x": 900, "y": 780})
+        # A menu opened near the bottom edge must still fit on screen. Measured from the pane rather than
+        # hard-coded: the canvas is a resizable dock panel, so its size is not a constant.
+        pane = page.locator(".react-flow__pane").bounding_box()
+        page.locator(".react-flow__pane").click(
+            button="right",
+            position={"x": pane["width"] - 30, "y": pane["height"] - 20},
+        )
         page.wait_for_timeout(400)
         rect = page.locator('[data-testid="context-menu"]').bounding_box()
         check(rect["y"] + rect["height"] <= 960, "a menu near the bottom edge flips to stay on screen")

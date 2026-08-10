@@ -16,12 +16,15 @@ cd frontend && npm run typecheck && npx vitest run
 | `tests/test_api.py` | the whole API surface, bridge, timeline, render | fake ComfyUI |
 | `tests/nodepack/` | node registration, tensor round-trips, path safety | ComfyUI's own venv |
 | `frontend/src/lib/*.test.ts` | kind compatibility, formatting | nothing |
+| `frontend/src/store/dockTree.test.ts` | the layout tree: splitting, tabbing, collapsing, sizing, hiding | nothing |
 | `tests/test_menu_features.py` | version log, diffing, element restore, plugins, node size | fake ComfyUI |
 | `scripts/ui_smoke.py` | the browser: canvas edges, previews, timeline, settings | a running app |
 | `scripts/ui_menus.py` | the menus: shortcuts, undo/redo, panel toggles, dialogs | a running app |
 | `scripts/ui_features.py` | node resize, context menus, history panel and element restore | a running app |
 | `scripts/ui_dismiss.py` | menus close on a click elsewhere, including surfaces that swallow mousedown | a running app |
+| `scripts/ui_dock.py` | panels dock beside/above/below each other, splitters resize, rim docking | a running app |
 | `scripts/ui_open_in_comfy.py` | opening a workflow lands on a *named, saved* ComfyUI workflow | app + real ComfyUI |
+| `scripts/ui_bridge_binding.py` | each ComfyUI workflow syncs back only to its own step | app + real ComfyUI |
 
 The fake ComfyUI (`tests/fixtures/fake_comfy.py`) replays ComfyUI 0.24.1's real event ordering, including
 the detail the runner depends on: `execution_success` arrives *before* history is written, and the

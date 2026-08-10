@@ -434,19 +434,22 @@ export const COMMANDS: Command[] = [
   },
 
   // -- View / Window ---------------------------------------------------------------------------------
+  // Shortcuts for the two panels worth a dedicated key. They drive the same widget the Window menu and
+  // the dock do — an independent "show the left side" flag would have nothing to point at now that a
+  // panel's home is wherever the user dragged it.
   {
     id: 'window.toggleLeft',
     label: 'Show Workflows Panel',
     shortcut: 'Mod+1',
-    checked: () => useLayout.getState().showLeftPanel,
-    run: () => useLayout.getState().toggleLeftPanel(),
+    checked: () => useLayout.getState().widgets.workflows.visible,
+    run: () => useLayout.getState().toggleWidget('workflows'),
   },
   {
     id: 'window.toggleInspector',
     label: 'Show Inspector',
     shortcut: 'Mod+2',
-    checked: () => useLayout.getState().showInspector,
-    run: () => useLayout.getState().toggleInspector(),
+    checked: () => useLayout.getState().widgets.inspector.visible,
+    run: () => useLayout.getState().toggleWidget('inspector'),
   },
   {
     id: 'window.compact',

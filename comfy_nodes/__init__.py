@@ -26,8 +26,12 @@ try:
 
     from .ws_nodes.routes import register_routes
 
-    if PromptServer.instance is not None:
-        register_routes(PromptServer.instance)
+    # getattr, not PromptServer.instance: ComfyUI 0.31 dropped the class-level default, so the attribute
+    # only exists once a server has actually been constructed. Importing the pack without one — tests,
+    # tooling, `comfy node` commands — must not blow up.
+    server = getattr(PromptServer, "instance", None)
+    if server is not None:
+        register_routes(server)
         logger.info("WebStudio node pack %s (protocol %d) loaded", PACK_VERSION, PROTOCOL_VERSION)
 except ImportError:
     # Imported outside a ComfyUI process (tests, tooling). Nodes still work; routes simply are not attached.

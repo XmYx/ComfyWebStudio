@@ -8,6 +8,10 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { Clip, Step } from '@/api/types'
+import {
+  activateTab, dockAt, dockAtEdge, ensurePlaced, group, groupOf, placedWidgets, removeWidget,
+  resizeSplit, split, type DockNode, type DropPosition,
+} from './dockTree'
 
 export type DialogId =
   | 'shortcuts' | 'about' | 'plugins' | 'newProject' | 'openProject'
@@ -38,37 +42,40 @@ export interface Clipboard {
 export type WidgetId =
   | 'shots' | 'workflows' | 'assets' | 'canvas' | 'inspector' | 'timeline' | 'monitor' | 'renders'
 
-export type DockSlot = 'left' | 'right' | 'top' | 'bottom' | 'centre'
-
-/** Every slot, in the order the workspace lays them out. */
-export const DOCK_SLOTS: DockSlot[] = ['top', 'left', 'centre', 'right', 'bottom']
-
 export interface WidgetState {
-  /** Where it lives when docked. */
-  slot: DockSlot
-  /** Hidden widgets keep their slot, so showing one again puts it back where it was. */
+  /** Hidden widgets keep their place in the dock tree, so showing one puts it back where it was. */
   visible: boolean
   /** Popped out of the dock into a window of its own. */
   floating: boolean
   /** Window geometry, in viewport pixels. Only meaningful while floating. */
   rect: { x: number; y: number; w: number; h: number }
-  /** Ordering within a dock slot, low first. Also the tab order. */
-  order: number
   /** Widgets that scroll their own content — a canvas must not be put in a scroll box. */
   noScroll?: boolean
 }
 
 /** The layout the app opens with, and what "Reset layout" goes back to. */
 export const DEFAULT_WIDGETS: Record<WidgetId, WidgetState> = {
-  shots: { slot: 'left', visible: true, floating: false, rect: { x: 80, y: 90, w: 320, h: 320 }, order: 0 },
-  workflows: { slot: 'left', visible: true, floating: false, rect: { x: 120, y: 130, w: 340, h: 420 }, order: 1 },
-  assets: { slot: 'left', visible: true, floating: false, rect: { x: 160, y: 170, w: 340, h: 420 }, order: 2 },
-  canvas: { slot: 'centre', visible: true, floating: false, rect: { x: 200, y: 120, w: 900, h: 600 }, order: 0, noScroll: true },
-  timeline: { slot: 'centre', visible: false, floating: false, rect: { x: 220, y: 260, w: 1000, h: 460 }, order: 1, noScroll: true },
-  inspector: { slot: 'right', visible: true, floating: false, rect: { x: 640, y: 120, w: 360, h: 560 }, order: 0 },
-  monitor: { slot: 'right', visible: false, floating: false, rect: { x: 700, y: 160, w: 420, h: 340 }, order: 1 },
-  renders: { slot: 'right', visible: false, floating: false, rect: { x: 740, y: 200, w: 340, h: 300 }, order: 2 },
+  shots: { visible: true, floating: false, rect: { x: 80, y: 90, w: 320, h: 320 } },
+  workflows: { visible: true, floating: false, rect: { x: 120, y: 130, w: 340, h: 420 } },
+  assets: { visible: true, floating: false, rect: { x: 160, y: 170, w: 340, h: 420 } },
+  canvas: { visible: true, floating: false, rect: { x: 200, y: 120, w: 900, h: 600 }, noScroll: true },
+  timeline: { visible: false, floating: false, rect: { x: 220, y: 260, w: 1000, h: 460 }, noScroll: true },
+  inspector: { visible: true, floating: false, rect: { x: 640, y: 120, w: 360, h: 560 } },
+  monitor: { visible: false, floating: false, rect: { x: 700, y: 160, w: 420, h: 340 } },
+  renders: { visible: false, floating: false, rect: { x: 740, y: 200, w: 340, h: 300 } },
 }
+
+/** Panels on the left, the canvas and timeline in the middle, the inspector stack on the right. */
+export const defaultTree = (): DockNode =>
+  split(
+    'row',
+    [
+      group(['shots', 'workflows', 'assets'], 'shots'),
+      group(['canvas', 'timeline'], 'canvas'),
+      group(['inspector', 'monitor', 'renders'], 'inspector'),
+    ],
+    [0.2, 0.55, 0.25],
+  )
 
 export const WIDGET_LABELS: Record<WidgetId, string> = {
   shots: 'Shots',
@@ -82,29 +89,29 @@ export const WIDGET_LABELS: Record<WidgetId, string> = {
 }
 
 interface LayoutState {
-  showLeftPanel: boolean
-  showInspector: boolean
   compactMode: boolean
 
   widgets: Record<WidgetId, WidgetState>
-  /** The widget on top in each slot. The rest of that slot's widgets are tabs behind it. */
-  active: Record<DockSlot, WidgetId | null>
+  /** How the docked panels are arranged: nested rows and columns of tab groups. */
+  tree: DockNode
 
   dialog: DialogId | null
   clipboard: Clipboard | null
   canvas: CanvasApi | null
 
-  toggleLeftPanel: () => void
-  toggleInspector: () => void
   toggleCompact: () => void
   resetLayout: () => void
 
   setWidget: (id: WidgetId, patch: Partial<WidgetState>) => void
   toggleWidget: (id: WidgetId) => void
   floatWidget: (id: WidgetId, floating: boolean) => void
-  /** Move a widget into a slot — the drop half of a dock drag. Docks it if it was floating. */
-  dockWidget: (id: WidgetId, slot: DockSlot) => void
-  setActive: (slot: DockSlot, id: WidgetId) => void
+  /** Drop a widget onto a group: tabbed into it, or split off one of its edges. */
+  dockWidget: (id: WidgetId, groupId: string, position: DropPosition) => void
+  /** Drop a widget against an outer edge of the workspace, spanning it. */
+  dockWidgetToEdge: (id: WidgetId, edge: Exclude<DropPosition, 'centre'>) => void
+  setActive: (groupId: string, id: WidgetId) => void
+  /** Drag a splitter: `fraction` is the new share of the child before the boundary. */
+  resizeDock: (splitId: string, index: number, fraction: number) => void
 
   openDialog: (id: DialogId) => void
   closeDialog: () => void
@@ -113,89 +120,69 @@ interface LayoutState {
   setCanvas: (api: CanvasApi | null) => void
 }
 
-const DEFAULTS = { showLeftPanel: true, showInspector: true, compactMode: false }
+const DEFAULTS = { compactMode: false }
 
 const clone = (widgets: Record<WidgetId, WidgetState>) =>
   Object.fromEntries(
     Object.entries(widgets).map(([id, widget]) => [id, { ...widget, rect: { ...widget.rect } }]),
   ) as Record<WidgetId, WidgetState>
 
-/** The frontmost visible widget of each slot, given a set of widgets. */
-function activeForAll(
-  widgets: Record<WidgetId, WidgetState>,
-  prefer: Partial<Record<DockSlot, WidgetId | null>> = {},
-): Record<DockSlot, WidgetId | null> {
-  const result = {} as Record<DockSlot, WidgetId | null>
-  for (const slot of DOCK_SLOTS) {
-    const inSlot = (Object.keys(widgets) as WidgetId[])
-      .filter((id) => widgets[id].slot === slot && widgets[id].visible && !widgets[id].floating)
-      .sort((a, b) => widgets[a].order - widgets[b].order)
-    const preferred = prefer[slot]
-    result[slot] = preferred && inSlot.includes(preferred) ? preferred : (inSlot[0] ?? null)
-  }
-  return result
+/** Bring a widget to the front of whichever group holds it. */
+function activateIn(tree: DockNode, id: WidgetId): DockNode {
+  const home = groupOf(tree, id)
+  return home ? activateTab(tree, home.id, id) : tree
 }
-
-const DEFAULT_ACTIVE = activeForAll(DEFAULT_WIDGETS)
 
 export const useLayout = create<LayoutState>()(
   persist(
     (set) => ({
       ...DEFAULTS,
       widgets: clone(DEFAULT_WIDGETS),
-      active: { ...DEFAULT_ACTIVE },
+      tree: defaultTree(),
       dialog: null,
       clipboard: null,
       canvas: null,
 
-      toggleLeftPanel: () => set((s) => ({ showLeftPanel: !s.showLeftPanel })),
-      toggleInspector: () => set((s) => ({ showInspector: !s.showInspector })),
       toggleCompact: () => set((s) => ({ compactMode: !s.compactMode })),
-      resetLayout: () =>
-        set({ ...DEFAULTS, widgets: clone(DEFAULT_WIDGETS), active: { ...DEFAULT_ACTIVE } }),
+      resetLayout: () => set({ ...DEFAULTS, widgets: clone(DEFAULT_WIDGETS), tree: defaultTree() }),
 
       setWidget: (id, patch) =>
-        set((s) => {
-          const widgets = { ...s.widgets, [id]: { ...s.widgets[id], ...patch } }
-          return { widgets, active: activeForAll(widgets, s.active) }
-        }),
+        set((s) => ({ widgets: { ...s.widgets, [id]: { ...s.widgets[id], ...patch } } })),
 
       toggleWidget: (id) =>
         set((s) => {
-          const widgets = { ...s.widgets, [id]: { ...s.widgets[id], visible: !s.widgets[id].visible } }
-          // Showing a widget also brings it to the front of its slot, or it would appear to do nothing.
-          const prefer = widgets[id].visible
-            ? { ...s.active, [widgets[id].slot]: id }
-            : s.active
-          return { widgets, active: activeForAll(widgets, prefer) }
+          const visible = !s.widgets[id].visible
+          const widgets = { ...s.widgets, [id]: { ...s.widgets[id], visible } }
+          // A widget shown again has to be somewhere — one dragged out and hidden has no place left.
+          const tree = visible && !widgets[id].floating ? ensurePlaced(s.tree, id) : s.tree
+          // And it has to be the front tab, or showing it would appear to do nothing.
+          return { widgets, tree: visible ? activateIn(tree, id) : tree }
         }),
 
       floatWidget: (id, floating) =>
         set((s) => {
           const widgets = { ...s.widgets, [id]: { ...s.widgets[id], floating, visible: true } }
-          // Whatever it leaves behind picks a new front tab; docking it back brings it to the front.
-          const prefer = floating ? s.active : { ...s.active, [widgets[id].slot]: id }
-          return { widgets, active: activeForAll(widgets, prefer) }
+          // Floating takes it out of the tree entirely; docking it again gives it a home and the focus.
+          const tree = floating ? removeWidget(s.tree, id) : activateIn(ensurePlaced(s.tree, id), id)
+          return { widgets, tree }
         }),
 
-      dockWidget: (id, slot) =>
-        set((s) => {
-          // Dropped widgets land last in the slot, which is where a tab you just dragged in belongs.
-          const order =
-            Math.max(
-              -1,
-              ...(Object.keys(s.widgets) as WidgetId[])
-                .filter((other) => other !== id && s.widgets[other].slot === slot)
-                .map((other) => s.widgets[other].order),
-            ) + 1
-          const widgets = {
-            ...s.widgets,
-            [id]: { ...s.widgets[id], slot, order, floating: false, visible: true },
-          }
-          return { widgets, active: activeForAll(widgets, { ...s.active, [slot]: id }) }
-        }),
+      dockWidget: (id, groupId, position) =>
+        set((s) => ({
+          widgets: { ...s.widgets, [id]: { ...s.widgets[id], floating: false, visible: true } },
+          tree: dockAt(s.tree, id, groupId, position),
+        })),
 
-      setActive: (slot, id) => set((s) => ({ active: { ...s.active, [slot]: id } })),
+      dockWidgetToEdge: (id, edge) =>
+        set((s) => ({
+          widgets: { ...s.widgets, [id]: { ...s.widgets[id], floating: false, visible: true } },
+          tree: dockAtEdge(s.tree, id, edge),
+        })),
+
+      setActive: (groupId, id) => set((s) => ({ tree: activateTab(s.tree, groupId, id) })),
+
+      resizeDock: (splitId, index, fraction) =>
+        set((s) => ({ tree: resizeSplit(s.tree, splitId, index, fraction) })),
 
       openDialog: (dialog) => set({ dialog }),
       closeDialog: () => set({ dialog: null }),
@@ -205,28 +192,30 @@ export const useLayout = create<LayoutState>()(
     }),
     {
       name: 'comfywebstudio.layout',
-      version: 3,
+      // 4: the five fixed dock slots became a tree, so anything older has no layout to restore.
+      version: 4,
       // Only the panel preferences are worth remembering; a stale dialog or a dangling canvas handle
       // from a previous session would be actively wrong.
       partialize: (state) => ({
-        showLeftPanel: state.showLeftPanel,
-        showInspector: state.showInspector,
         compactMode: state.compactMode,
         widgets: state.widgets,
-        active: state.active,
+        tree: state.tree,
       }),
-      // A stored layout from before a widget existed would leave it undefined and crash the renderer, so
-      // whatever is on disk is merged over the current defaults rather than replacing them. The active
-      // tabs are then recomputed, because a stored one may name a widget that is no longer where it was.
+      /**
+       * A stored layout is not trustworthy: it may predate a widget existing, or still place one that has
+       * since been removed. Widgets are merged over the current defaults so none can be undefined, and any
+       * widget the stored tree does not mention is added back — otherwise a panel added in a new version
+       * would be permanently unreachable for anyone with a saved layout.
+       */
       merge: (persisted, current) => {
         const saved = (persisted ?? {}) as Partial<LayoutState>
         const widgets = { ...clone(DEFAULT_WIDGETS), ...(saved.widgets ?? {}) }
-        return {
-          ...current,
-          ...saved,
-          widgets,
-          active: activeForAll(widgets, saved.active ?? {}),
+        let tree = saved.tree ?? defaultTree()
+        const placed = new Set(placedWidgets(tree))
+        for (const id of Object.keys(widgets) as WidgetId[]) {
+          if (!placed.has(id) && !widgets[id].floating) tree = ensurePlaced(tree, id)
         }
+        return { ...current, ...saved, widgets, tree }
       },
     },
   ),

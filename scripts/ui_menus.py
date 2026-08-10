@@ -148,16 +148,17 @@ def main() -> int:
         page.wait_for_timeout(1500)
 
         print("Window menu")
-        panels_before = page.locator("text=WORKFLOWS").count()
+        # The panel's own tab, which exists whether or not it is the one in front. Counting every match
+        # for "workflows" would also pick up the panel heading, and showing a panel brings it to the
+        # front — so the count legitimately differs before and after.
+        workflows_tab = page.get_by_role("button", name="Workflows", exact=True)
+        check(workflows_tab.count() == 1, "the workflows panel is docked to begin with")
         page.keyboard.press("Control+1")
         page.wait_for_timeout(500)
-        check(
-            page.locator("text=WORKFLOWS").count() != panels_before,
-            "Ctrl+1 toggles the workflows panel",
-        )
+        check(workflows_tab.count() == 0, "Ctrl+1 hides the workflows panel")
         page.keyboard.press("Control+1")
         page.wait_for_timeout(400)
-        check(page.locator("text=WORKFLOWS").count() == panels_before, "toggling back restores it")
+        check(workflows_tab.count() == 1, "toggling back restores it")
 
         page.locator("button:text-is('Window')").click()
         page.wait_for_timeout(200)
