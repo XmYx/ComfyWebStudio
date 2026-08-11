@@ -180,27 +180,31 @@ class TimelineRenderer:
 
     # -- audio -------------------------------------------------------------------------------------
 
-    def _audio_clips(self, timeline: Timeline, resolver: TimelineResolver) -> list[tuple[Any, Any]]:
+    def _audio_clips(self, timeline: Timeline, resolver: TimelineResolver) -> list[tuple[Any, Any, Any]]:
+        """Every audible clip, with the track it belongs to — the track carries half the gain and pan."""
+        audio_tracks = [t for t in timeline.tracks if t.kind == "audio"]
+        # Solo wins over mute: the moment anything is soloed, everything else is silent regardless.
+        soloed = [t for t in audio_tracks if t.solo]
+        audible = soloed or [t for t in audio_tracks if not t.muted]
+
         clips = []
-        for track in timeline.tracks:
-            if track.kind != "audio" or track.muted:
-                continue
+        for track in audible:
             for clip in track.clips:
                 if not clip.enabled:
                     continue
                 resolved = resolver.resolve(clip)
                 if resolved.usable and resolved.paths:
-                    clips.append((clip, resolved))
+                    clips.append((clip, resolved, track))
         return clips
 
     def _mix_audio(self, audio_clips, duration: float, rate: int) -> np.ndarray:
-        """Sum every audio clip into one stereo buffer, at its timeline position and volume."""
+        """Sum every audio clip into one stereo buffer, at its position, gain and stereo placement."""
         import av
 
         total_samples = max(1, int(duration * rate))
         mix = np.zeros((total_samples, 2), dtype=np.float32)
 
-        for clip, resolved in audio_clips:
+        for clip, resolved, track in audio_clips:
             try:
                 samples = _decode_audio(av, resolved.paths[0], rate)
             except Exception as exc:  # noqa: BLE001 - one bad clip should not fail the render
@@ -217,13 +221,25 @@ class TimelineRenderer:
             end = min(total_samples, offset + length)
             if end <= offset:
                 continue
-            mix[offset:end] += samples[: end - offset] * clip.volume
+            gain = max(0.0, clip.volume) * max(0.0, track.volume)
+            mix[offset:end] += samples[: end - offset] * gain * _pan_gains(clip.pan + track.pan)
 
         # Normalise only if we actually clipped, so a quiet mix is not pumped up unexpectedly.
         peak = float(np.max(np.abs(mix))) if mix.size else 0.0
         if peak > 1.0:
             mix /= peak
         return mix
+
+
+def _pan_gains(pan: float) -> np.ndarray:
+    """Left/right gains for a stereo position, using the constant-power law.
+
+    A linear pan dips ~3 dB in the middle, which is audible as a hole when a clip sweeps across. Taking
+    the sine and cosine of the position instead keeps the total power flat wherever it sits.
+    """
+    position = (max(-1.0, min(1.0, pan)) + 1.0) / 2.0  # -1..1 -> 0..1
+    angle = position * (math.pi / 2.0)
+    return np.array([math.cos(angle), math.sin(angle)], dtype=np.float32) * math.sqrt(2.0)
 
 
 def _decode_audio(av_module, path: Path, target_rate: int) -> np.ndarray:

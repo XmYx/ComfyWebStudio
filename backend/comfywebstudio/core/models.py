@@ -453,7 +453,17 @@ class Clip(Base):
     transition_in: Transition = Field(default_factory=Transition)
     transition_out: Transition = Field(default_factory=Transition)
     opacity: float = 1.0
+    #: Audio gain, 1.0 being the clip's own level. Multiplied by its track's.
     volume: float = 1.0
+    #: Stereo placement, -1 hard left to +1 hard right. Applied with an equal-power law, so panning
+    #: a clip does not make it quieter the way a naive linear pan does.
+    pan: float = 0.0
+    #: Clips that move and trim together share this.
+    #:
+    #: A video and the sound that came with it are one thing to the person cutting, so they behave as
+    #: one until deliberately untied — which is what makes it safe to place them automatically. Stored
+    #: as a group rather than a pointer to a partner, so untying is simply clearing it.
+    link_id: str | None = None
     #: Text tracks render this instead of media.
     text: str = ""
     text_style: dict[str, Any] = Field(default_factory=dict)
@@ -469,7 +479,13 @@ class Track(Base):
     kind: TrackKind = "video"
     name: str = "Track"
     muted: bool = False
+    #: Soloing any track silences every track that is not soloed — the standard mixer behaviour, and the
+    #: reason solo has to be checked before mute rather than alongside it.
+    solo: bool = False
     locked: bool = False
+    #: Applied on top of each clip's own gain and pan.
+    volume: float = 1.0
+    pan: float = 0.0
     clips: list[Clip] = Field(default_factory=list)
 
     def clip(self, clip_id: str) -> Clip | None:

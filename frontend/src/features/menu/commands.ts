@@ -11,7 +11,9 @@ import type { QueryClient } from '@tanstack/react-query'
 
 import { api, ApiError } from '@/api/client'
 import type { Clip, Project, RenderRequest, Shot, Step } from '@/api/types'
-import { DEFAULT_WIDGETS, WIDGET_LABELS, useLayout, type WidgetId } from '@/store/layout'
+import {
+  DEFAULT_WIDGETS, WIDGET_LABELS, selectWidgets, useLayout, type WidgetId,
+} from '@/store/layout'
 import { useStudio } from '@/store/studio'
 
 export interface CommandContext {
@@ -441,14 +443,14 @@ export const COMMANDS: Command[] = [
     id: 'window.toggleLeft',
     label: 'Show Workflows Panel',
     shortcut: 'Mod+1',
-    checked: () => useLayout.getState().widgets.workflows.visible,
+    checked: () => selectWidgets(useLayout.getState()).workflows.visible,
     run: () => useLayout.getState().toggleWidget('workflows'),
   },
   {
     id: 'window.toggleInspector',
     label: 'Show Inspector',
     shortcut: 'Mod+2',
-    checked: () => useLayout.getState().widgets.inspector.visible,
+    checked: () => selectWidgets(useLayout.getState()).inspector.visible,
     run: () => useLayout.getState().toggleWidget('inspector'),
   },
   {
@@ -500,17 +502,17 @@ export const COMMANDS: Command[] = [
     id: `window.widget.${id}`,
     label: WIDGET_LABELS[id],
     enabled: hasProject,
-    checked: () => useLayout.getState().widgets[id].visible,
+    checked: () => selectWidgets(useLayout.getState())[id].visible,
     run: () => useLayout.getState().toggleWidget(id),
   })),
   ...(Object.keys(DEFAULT_WIDGETS) as WidgetId[]).map((id) => ({
     id: `window.float.${id}`,
     label: `Float ${WIDGET_LABELS[id]}`,
     enabled: hasProject,
-    checked: () => useLayout.getState().widgets[id].floating,
+    checked: () => selectWidgets(useLayout.getState())[id].floating,
     run: () => {
       const state = useLayout.getState()
-      state.floatWidget(id, !state.widgets[id].floating)
+      state.floatWidget(id, !selectWidgets(state)[id].floating)
     },
   })),
   {

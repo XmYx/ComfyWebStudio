@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 
 from ..core.errors import NotFound, ValidationFailed
 from ..core.ids import new_id, slugify
@@ -44,7 +45,12 @@ class CreateTrackRequest(BaseModel):
 class UpdateTrackRequest(BaseModel):
     name: str | None = None
     muted: bool | None = None
+    #: Silences every track that is not soloed, for as long as anything is.
+    solo: bool | None = None
     locked: bool | None = None
+    volume: float | None = None
+    #: -1 hard left to +1 hard right.
+    pan: float | None = None
 
 
 class CreateClipRequest(BaseModel):
@@ -144,6 +150,10 @@ def update_track(
         raise NotFound(f"No track {track_id!r}")
     for field, value in body.model_dump(exclude_none=True).items():
         setattr(track, field, value)
+    # Clamped here rather than trusted from the client: a negative gain would invert the phase and a pan
+    # past the ends would push the equal-power law out of its domain.
+    track.volume = max(0.0, min(4.0, track.volume))
+    track.pan = max(-1.0, min(1.0, track.pan))
     state.store.save(project)
     return track
 
@@ -169,6 +179,15 @@ def reorder_tracks(state: StateDep, project: ProjectDep, track_ids: list[str]) -
 
 
 # -- clips ---------------------------------------------------------------------------------------------
+
+
+def _has_audio(state, project, source: ClipSource) -> bool:
+    """Whether the media behind a source carries an audio stream of its own."""
+    resolver = TimelineResolver(state.store, project)
+    artifacts, error = resolver.artifacts_for(Clip(source=source))
+    if error or not artifacts:
+        return False
+    return bool(artifacts[0].meta.get("has_audio"))
 
 
 def _default_duration(state, project, source: ClipSource | None, fallback: float) -> float:
@@ -212,6 +231,22 @@ def create_clip(
     )
     track.clips.append(clip)
     track.clips.sort(key=lambda c: c.start)
+
+    # Media that carries its own sound gets an audio clip too, tied to the picture. Placing a video and
+    # silently leaving its audio behind means finding out at the render.
+    if body.source and track.kind in {"video", "overlay"} and _has_audio(state, project, body.source):
+        audio_track = _track_for(project.timeline, "audio", "Audio")
+        if not audio_track.locked:
+            partner = Clip(
+                name=f"{body.name or 'clip'} (audio)",
+                source=body.source.model_copy(deep=True),
+                start=clip.start,
+                duration=clip.duration,
+                link_id=new_id("link"),
+            )
+            clip.link_id = partner.link_id
+            audio_track.clips = sorted([*audio_track.clips, partner], key=lambda c: c.start)
+
     state.store.save(project)
     return clip
 
@@ -229,9 +264,36 @@ def update_clip(
     if track.locked:
         raise ValidationFailed(f"Track {track.name!r} is locked.")
 
-    updated = clip.model_copy(update={k: v for k, v in body.items() if k in Clip.model_fields})
+    # Validated rather than copied over: `model_copy(update=...)` skips validation, so patching a nested
+    # field — a clip's source, its transform — stored the raw dict the browser sent and left the model
+    # holding something that only looks like a ClipSource until the project is next loaded from disk.
+    merged = {**clip.model_dump(mode="json"), **{k: v for k, v in body.items() if k in Clip.model_fields}}
+    try:
+        updated = Clip.model_validate(merged)
+    except PydanticValidationError as exc:
+        raise ValidationFailed(f"That change to the clip is not valid: {exc.errors()[0]['msg']}") from exc
+
+    # Pointing a clip at a different output is a change of material, so it takes that material's length
+    # unless the caller said otherwise. Retiming it by hand every time would be busywork.
+    if "source" in body and "duration" not in body and updated.source != clip.source:
+        updated.duration = _default_duration(state, project, updated.source, updated.duration)
+
     updated.start = max(0.0, updated.start)
     updated.duration = max(0.04, updated.duration)  # one frame at 24fps is the floor
+    updated.volume = max(0.0, min(4.0, updated.volume))
+    updated.pan = max(-1.0, min(1.0, updated.pan))
+
+    # Tied clips are one thing to the person cutting, so timing changes carry across. Done here rather
+    # than in the browser so it holds however the change arrives — a drag, the inspector, or a script.
+    moved = updated.start - clip.start
+    resized = updated.duration - clip.duration
+    if moved or resized:
+        for partner_track, partner in _linked(project.timeline, updated):
+            if partner_track.locked:
+                continue
+            partner.start = max(0.0, partner.start + moved)
+            partner.duration = max(0.04, partner.duration + resized)
+            partner_track.clips.sort(key=lambda c: c.start)
 
     track.clips = sorted(
         [updated if c.id == clip_id else c for c in track.clips], key=lambda c: c.start
@@ -245,11 +307,308 @@ def delete_clip(state: StateDep, project: ProjectDep, track_id: str, clip_id: st
     track = project.timeline.track(track_id)
     if track is None:
         raise NotFound(f"No track {track_id!r}")
-    before = len(track.clips)
-    track.clips = [c for c in track.clips if c.id != clip_id]
-    if len(track.clips) == before:
+    clip = track.clip(clip_id)
+    if clip is None:
         raise NotFound(f"No clip {clip_id!r}")
+
+    # Deleting the picture and leaving its sound playing over the next shot is never what was meant.
+    doomed = {clip.id, *(other.id for _t, other in _linked(project.timeline, clip))}
+    for other in project.timeline.tracks:
+        other.clips = [c for c in other.clips if c.id not in doomed]
     state.store.save(project)
+
+
+class TieRequest(BaseModel):
+    #: The clip to tie this one to. Both end up in the same group, along with anything either already
+    #: carried, so tying A to B when B is already tied to C leaves all three together.
+    clip_id: str
+
+
+@router.post("/clips/{clip_id}/tie")
+def tie_clips(state: StateDep, project: ProjectDep, clip_id: str, body: TieRequest) -> Timeline:
+    """Make two clips move and trim as one."""
+    _track, clip = _find_clip(project.timeline, clip_id)
+    _other_track, other = _find_clip(project.timeline, body.clip_id)
+    if clip.id == other.id:
+        raise ValidationFailed("A clip cannot be tied to itself.")
+
+    group = clip.link_id or other.link_id or new_id("link")
+    members = {clip.id, other.id}
+    for existing in (clip.link_id, other.link_id):
+        if not existing:
+            continue
+        members |= {
+            c.id for track in project.timeline.tracks for c in track.clips if c.link_id == existing
+        }
+    for track in project.timeline.tracks:
+        for candidate in track.clips:
+            if candidate.id in members:
+                candidate.link_id = group
+
+    state.store.save(project)
+    return project.timeline
+
+
+@router.post("/clips/{clip_id}/untie")
+def untie_clip(state: StateDep, project: ProjectDep, clip_id: str) -> Timeline:
+    """Break a clip out of its group, leaving the rest tied to each other."""
+    _track, clip = _find_clip(project.timeline, clip_id)
+    if not clip.link_id:
+        return project.timeline
+
+    remaining = [other for _t, other in _linked(project.timeline, clip)]
+    clip.link_id = None
+    # A group of one is not a group; drop it so the UI does not show a tie to nothing.
+    if len(remaining) == 1:
+        remaining[0].link_id = None
+
+    state.store.save(project)
+    return project.timeline
+
+
+#: What a clip made from a shot can carry, and which kind of track it belongs on.
+_VISUAL_KINDS = {"image", "video"}
+_AUDIO_KINDS = {"audio"}
+
+
+def shot_output(
+    project, shot, resolver, kinds: set[str], *, require_output: bool = True
+) -> ClipSource | None:
+    """The source for a shot's final output of one of `kinds`.
+
+    "Final" means the last step in dependency order — walking backwards is what makes the answer the
+    shot's *result* rather than whatever intermediate came first.
+
+    With ``require_output`` off, a port that has not produced anything yet still counts. That is what
+    lets a shot be cut in before it has been run: the clip points at the port, shows as pending, and
+    fills itself in the moment the shot produces something. A timeline is a plan as much as an assembly.
+    """
+    from ..core.graph import topological_order
+
+    try:
+        order = topological_order(shot)
+    except Exception:  # noqa: BLE001 - a broken shot yields nothing rather than breaking the caller
+        return None
+
+    fallback: ClipSource | None = None
+    for step_id in reversed(order):
+        step = shot.step(step_id)
+        workflow = project.workflow(step.workflow_id) if step else None
+        if step is None or workflow is None or not step.enabled:
+            continue
+        for port in workflow.outputs:
+            if port.kind not in kinds:
+                continue
+            source = ClipSource(
+                kind="step_output", shot_id=shot.id, step_id=step.id, port_key=port.key
+            )
+            artifacts, error = resolver.artifacts_for(Clip(source=source))
+            if not error and artifacts:
+                return source
+            # The last step's declared port, kept in case nothing in the shot has run.
+            if fallback is None:
+                fallback = source
+
+    return None if require_output else fallback
+
+
+def _track_for(timeline: Timeline, kind: TrackKind, name: str, track_id: str | None = None) -> Track:
+    """The track to drop onto: the one asked for, else the first of that kind, else a new one."""
+    if track_id:
+        track = timeline.track(track_id)
+        if track is None:
+            raise NotFound(f"No track {track_id!r}")
+        return track
+    existing = next((t for t in timeline.tracks if t.kind == kind), None)
+    if existing is not None:
+        return existing
+    track = Track(kind=kind, name=name)
+    timeline.tracks.append(track)
+    return track
+
+
+def _linked(timeline: Timeline, clip: Clip) -> list[tuple[Track, Clip]]:
+    """Every *other* clip tied to this one."""
+    if not clip.link_id:
+        return []
+    return [
+        (track, other)
+        for track in timeline.tracks
+        for other in track.clips
+        if other.link_id == clip.link_id and other.id != clip.id
+    ]
+
+
+def _find_clip(timeline: Timeline, clip_id: str) -> tuple[Track, Clip]:
+    for track in timeline.tracks:
+        clip = track.clip(clip_id)
+        if clip is not None:
+            return track, clip
+    raise NotFound(f"No clip {clip_id!r}")
+
+
+def _append_at(track: Track) -> float:
+    """The end of the last clip, so a dropped clip lands after what is already there."""
+    return max((clip.end for clip in track.clips), default=0.0)
+
+
+class PlaceShotRequest(BaseModel):
+    shot_id: str
+    #: Where to put it. Omitted, the first video track is used, or one is created.
+    track_id: str | None = None
+    #: Omitted, it goes after whatever is already on that track.
+    start: float | None = None
+    #: Also place the shot's audio output, on an audio track.
+    with_audio: bool = True
+    #: Allow a shot that has not been run yet, as a clip that fills in once it produces something.
+    allow_pending: bool = True
+
+
+
+class RippleDeleteRequest(BaseModel):
+    """A span to cut out of the timeline, closing the gap behind it."""
+
+    start: float
+    end: float
+    #: One track, or every track when omitted — which is what keeps picture and sound in step.
+    track_id: str | None = None
+
+
+@router.post("/ripple-delete")
+def ripple_delete(state: StateDep, project: ProjectDep, body: RippleDeleteRequest) -> Timeline:
+    """Remove a span of time and pull everything after it back.
+
+    The difference from deleting a clip: time itself is removed, so the cut closes instead of leaving a
+    hole. Clips inside the span go; clips straddling an edge are trimmed to it; clips after it move back
+    by the length removed.
+
+    Every track by default. A gap taken out of the picture but not the sound would put the two out of
+    sync from that point on, which is rarely what anybody means.
+    """
+    start = max(0.0, min(body.start, body.end))
+    end = max(body.start, body.end)
+    span = end - start
+    if span <= 0:
+        raise ValidationFailed("That is an empty span; there is nothing to remove.")
+
+    tracks = project.timeline.tracks
+    if body.track_id is not None:
+        track = project.timeline.track(body.track_id)
+        if track is None:
+            raise NotFound(f"No track {body.track_id!r}")
+        tracks = [track]
+
+    removed = 0
+    for track in tracks:
+        if track.locked:
+            continue
+        kept: list[Clip] = []
+        for clip in track.clips:
+            if clip.end <= start:
+                kept.append(clip)                      # entirely before the cut
+                continue
+            if clip.start >= end:
+                clip.start -= span                     # entirely after it
+                kept.append(clip)
+                continue
+            if clip.start >= start and clip.end <= end:
+                removed += 1                           # entirely inside it
+                continue
+
+            # Straddling an edge: keep the part outside the span. A clip covering the whole span loses
+            # the middle — the head is kept and shortened, which is what trimming to the cut means.
+            head = max(0.0, start - clip.start)
+            tail = max(0.0, clip.end - end)
+            if head > 0:
+                clip.duration = head
+                kept.append(clip)
+            elif tail > 0:
+                # Its head was inside the span, so it starts at the cut and loses what came before.
+                clip.in_point += end - clip.start
+                clip.start = start
+                clip.duration = tail
+                kept.append(clip)
+            else:
+                removed += 1
+        track.clips = sorted(kept, key=lambda c: c.start)
+
+    state.store.save(project)
+    logger.info(
+        "Rippled %.2fs out of %s (%d clip(s) removed)",
+        span, "one track" if body.track_id else "every track", removed,
+    )
+    return project.timeline
+
+
+@router.post("/from-shot", status_code=201)
+def place_shot(state: StateDep, project: ProjectDep, body: PlaceShotRequest) -> Timeline:
+    """Put one shot's output on the timeline — what dropping a shot onto it does.
+
+    Its audio comes too, on an audio track, because a shot that produced sound and picture is one thing
+    to the user and separating them by hand every time would be busywork.
+    """
+    shot = next((s for s in project.shots if s.id == body.shot_id), None)
+    if shot is None:
+        raise NotFound(f"No shot {body.shot_id!r}")
+    if shot.template_edit_id:
+        raise ValidationFailed("That is a template editing session, not a shot.")
+
+    resolver = TimelineResolver(state.store, project)
+    visual = shot_output(
+        project, shot, resolver, _VISUAL_KINDS, require_output=not body.allow_pending
+    )
+    audio = (
+        shot_output(project, shot, resolver, _AUDIO_KINDS, require_output=True)
+        if body.with_audio
+        else None
+    )
+    if visual is None and audio is None:
+        raise ValidationFailed(
+            f"{shot.name!r} has no image, video or audio output to place. "
+            "Add an output node to one of its workflows."
+        )
+
+    placed: list[Clip] = []
+    link_id = new_id("link")
+
+    if visual is not None:
+        track = _track_for(project.timeline, "video", "Shots", body.track_id)
+        if track.locked:
+            raise ValidationFailed(f"Track {track.name!r} is locked.")
+        start = _append_at(track) if body.start is None else max(0.0, body.start)
+        duration = _default_duration(state, project, visual, 3.0)
+        clip = Clip(name=shot.name, source=visual, start=start, duration=duration)
+        track.clips = sorted([*track.clips, clip], key=lambda c: c.start)
+        placed.append(clip)
+
+    # A video usually carries its own sound. Placing the picture and leaving the audio behind means
+    # finding out at the render, so the same media goes on an audio track too — tied to the picture, so
+    # the two stay together until somebody says otherwise.
+    embedded = visual if visual is not None and _has_audio(state, project, visual) else None
+    audio_source = audio or embedded
+
+    if audio_source is not None:
+        track = _track_for(project.timeline, "audio", "Audio")
+        # Lined up with the picture when there is one, so sound and image stay in sync.
+        start = placed[0].start if placed else (
+            _append_at(track) if body.start is None else max(0.0, body.start)
+        )
+        duration = _default_duration(state, project, audio_source, placed[0].duration if placed else 3.0)
+        clip = Clip(name=f"{shot.name} (audio)", source=audio_source, start=start, duration=duration)
+        track.clips = sorted([*track.clips, clip], key=lambda c: c.start)
+        placed.append(clip)
+
+    if len(placed) > 1:
+        for clip in placed:
+            clip.link_id = link_id
+
+    state.store.save(project)
+    state.events.emit(
+        "timeline.built",
+        project_id=project.id,
+        data={"shot": shot.name, "clips": len(placed)},
+    )
+    return project.timeline
 
 
 @router.post("/from-shots", status_code=201)
@@ -260,8 +619,6 @@ def build_from_shots(
 
     A shot's "final output" is the last step in dependency order that produced something.
     """
-    from ..core.graph import topological_order
-
     # An open template editing session is not a shot the user cut; it must not land in the timeline.
     shots = [
         s for s in project.shots
@@ -276,40 +633,13 @@ def build_from_shots(
     skipped: list[str] = []
 
     for shot in shots:
-        try:
-            order = topological_order(shot)
-        except Exception:  # noqa: BLE001 - a broken shot should not stop the others
+        source = shot_output(project, shot, resolver, _VISUAL_KINDS)
+        if source is None:
             skipped.append(shot.name)
             continue
-
-        placed = False
-        for step_id in reversed(order):
-            step = shot.step(step_id)
-            workflow = project.workflow(step.workflow_id) if step else None
-            if step is None or workflow is None or not step.enabled:
-                continue
-            for port in workflow.outputs:
-                if port.kind not in {"image", "video"}:
-                    continue
-                source = ClipSource(
-                    kind="step_output", shot_id=shot.id, step_id=step.id, port_key=port.key
-                )
-                artifacts, error = resolver.artifacts_for(Clip(source=source))
-                if error or not artifacts:
-                    continue
-
-                duration = _default_duration(state, project, source, 3.0)
-                track.clips.append(
-                    Clip(name=shot.name, source=source, start=cursor, duration=duration)
-                )
-                cursor += duration
-                placed = True
-                break
-            if placed:
-                break
-
-        if not placed:
-            skipped.append(shot.name)
+        duration = _default_duration(state, project, source, 3.0)
+        track.clips.append(Clip(name=shot.name, source=source, start=cursor, duration=duration))
+        cursor += duration
 
     if not track.clips:
         raise ValidationFailed(

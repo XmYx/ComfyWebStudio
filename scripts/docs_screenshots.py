@@ -137,6 +137,7 @@ def main() -> int:
 
             print("Timeline")
             reset_layout(page, args.url, pid, tab="timeline")
+            page.wait_for_timeout(1500)
             shoot(page, out, "timeline")
 
             print("Settings")

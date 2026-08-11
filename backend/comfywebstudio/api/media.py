@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from ..core.errors import NotFound, ValidationFailed
 from ..core.models import Asset, AssetSource, utcnow
+from ..media import waveform
 from ..media.probe import guess_kind, probe
 from .deps import ProjectDep, StateDep
 
@@ -53,6 +54,24 @@ def _serve(path: Path, download_name: str | None = None) -> FileResponse:
 def get_media(state: StateDep, project: ProjectDep, path: str = Query(...)) -> FileResponse:
     """Serve one project file by its stored (project-relative) path."""
     return _serve(state.store.resolve(project.id, path))
+
+
+@router.get("/waveform")
+def get_waveform(
+    state: StateDep, project: ProjectDep, path: str = Query(...), buckets: int = Query(800),
+) -> dict:
+    """Peak data for drawing one audio file as a waveform.
+
+    Separate from ``/media`` because the browser wants a *drawing*, not the audio: this is a few hundred
+    min/max pairs rather than several megabytes of samples it would have to decode itself.
+    """
+    resolved = state.store.resolve(project.id, path)
+    if not resolved.is_file():
+        raise NotFound(f"No such file: {Path(path).name}")
+    try:
+        return waveform.compute(resolved, buckets).as_dict()
+    except Exception as exc:  # noqa: BLE001 - a file with no audio is a normal thing to ask about
+        raise ValidationFailed(f"Could not read audio from {Path(path).name}: {exc}") from exc
 
 
 @router.get("/assets")

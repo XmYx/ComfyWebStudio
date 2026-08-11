@@ -281,7 +281,12 @@ export interface Clip {
   transition_in: { kind: string; duration: number }
   transition_out: { kind: string; duration: number }
   opacity: number
+  /** Audio gain, 1.0 being the clip's own level. Multiplied by its track's. */
   volume: number
+  /** Stereo placement, -1 hard left to +1 hard right. Added to its track's. */
+  pan: number
+  /** Clips sharing this move, trim and delete together — a picture and the sound that came with it. */
+  link_id: string | null
   text: string
   text_style: Record<string, unknown>
   enabled: boolean
@@ -292,7 +297,13 @@ export interface Track {
   kind: TrackKind
   name: string
   muted: boolean
+  /** Soloing any track silences every track that is not soloed. */
+  solo: boolean
   locked: boolean
+  /** Applied on top of each clip's own gain and pan. */
+  volume: number
+  /** -1 hard left to +1 hard right. */
+  pan: number
   clips: Clip[]
 }
 

@@ -19,14 +19,14 @@ import { useQuery } from '@tanstack/react-query'
 
 import { api } from '@/api/client'
 import { useStudio } from '@/store/studio'
-import { useLayout } from '@/store/layout'
+import { selectMaximized, useLayout } from '@/store/layout'
 import { Button, Callout, Empty, Panel, PanelHeader, Spinner, cx } from '@/components/ui'
 
 export function ComfyPanel() {
   const comfyUrl = useStudio((s) => s.comfyUrl)
   const comfyNonce = useStudio((s) => s.comfyNonce)
   const showInComfy = useStudio((s) => s.showInComfy)
-  const maximized = useLayout((s) => s.maximized)
+  const maximized = useLayout(selectMaximized)
   const toggleMaximized = useLayout((s) => s.toggleMaximized)
 
   const [loading, setLoading] = useState(true)

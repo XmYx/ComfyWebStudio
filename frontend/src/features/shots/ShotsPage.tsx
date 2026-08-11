@@ -5,7 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError } from '@/api/client'
 import type { RunMode } from '@/api/types'
 import { useStudio } from '@/store/studio'
-import { useLayout } from '@/store/layout'
+import { selectWidgets, useLayout } from '@/store/layout'
 import { ShotCanvas } from '@/features/graph/ShotCanvas'
 import { ComfyPanel } from '@/features/comfy/ComfyPanel'
 import { WorkflowLibrary } from './WorkflowLibrary'
@@ -43,6 +43,10 @@ export function ShotsPage() {
   const setPlaying = useStudio((s) => s.setPlaying)
   const commandContext = useCommandContext()
   const contextMenu = useContextMenu()
+
+  // The route decides which layout is on screen, so every panel action lands on the right one.
+  const setWorkspace = useLayout((s) => s.setWorkspace)
+  useEffect(() => setWorkspace('shots'), [setWorkspace])
 
   const { data: project, isLoading, error } = useQuery({
     queryKey: ['project', projectId],
@@ -103,7 +107,7 @@ export function ShotsPage() {
   }, [drilledIntoShot, openInstance_, setShot])
 
   // Only fetched when a Monitor is actually on screen — it is off by default.
-  const monitorVisible = useLayout((s) => s.widgets.monitor.visible)
+  const monitorVisible = useLayout((s) => selectWidgets(s).monitor.visible)
   const { data: resolvedTimeline } = useQuery({
     queryKey: ['timeline-resolved', projectId, project?.modified],
     queryFn: () => api.timeline.resolved(projectId!),

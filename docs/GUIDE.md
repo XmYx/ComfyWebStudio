@@ -192,8 +192,65 @@ and flag themselves when it moves on, with **update** to catch up.
 
 ![The timeline](images/timeline.png)
 
-**Build from shots** lays each shot's final output end to end. Drag a clip to move it, drag its edge to
-trim, and use the Monitor panel to watch the result.
+The timeline is a workspace of its own, with the same dockable panels as the shot editor — sources on the
+left, the monitor over the tracks, clip settings on the right — arranged and remembered separately, since
+cutting and editing want different things on screen.
+
+**Getting clips in.** **Build from shots** lays every shot's final output end to end. To place one shot,
+drag it from the Shots bin onto a lane: it lands where you drop it, and if that shot produced sound as
+well as picture the audio comes too, on an audio track, lined up with the image. Drag a clip to move it,
+drag its edge to trim.
+
+**Placing a shot you have not run.** A shot can be cut in before it has produced anything: the clip
+points at the port it *will* fill, shows as waiting, and resolves the moment the shot runs. The bin marks
+those shots **not run** so it is a choice rather than a surprise.
+
+**Sound comes with the picture.** A clip whose media carries an audio stream is placed on an audio track
+as well, the same length and lined up, and the two are **tied**: they move, trim and delete as one, and
+carry a ⛓ so it is clear why. Right-click ▸ **Untie** breaks them apart; **Tie to…** joins a loose clip to
+one that overlaps it on another track. A shot that produced a separate audio *output* is placed the same
+way.
+
+**Lengths.** A clip takes its length from its media — a five-second sound is a five-second clip. A still
+image has no length of its own, so it gets a sensible default you can drag. Pointing a clip at different
+material re-times it to that material; **Fit to source** in its right-click menu does the same on demand.
+
+**Snapping.** Edges pull to other clips, the playhead and the start, so cuts butt together exactly instead
+of leaving a frame of black nobody notices until the render. The threshold is measured on screen, so
+zooming in makes it finer rather than fighting you. **⇥ Snap** turns it off; holding <kbd>Alt</kbd> while
+dragging overrides it for that one move.
+
+**Ripple delete.** Drag across empty space on a lane to select a *span of time* — the guide shows where it
+snapped — then press <kbd>Delete</kbd>, or right-click for the menu. The span is removed and everything
+after it moves back to close the gap; clips straddling an edge are trimmed to it. It applies to every
+track by default, because taking time out of the picture but not the sound puts them out of step from
+there on. The menu offers one track alone when that is what you mean.
+
+**Which output a clip shows.** A step often produces several things — a picture and an upscale of it, a
+video and its audio — and a placed clip has to start on one of them. When there is a choice, the clip
+inspector offers it as **Output**, and says which of them the track it is on cannot show (a text output on
+a video track, say). Changing it re-resolves the clip without moving or retiming it.
+
+### Audio
+
+Audio clips are drawn as their waveform, because you cut on the silence between words and you cannot see
+silence in a coloured rectangle. Trimming redraws the shape rather than squashing it.
+
+Each audio track header carries a mixer strip:
+
+| Control | What it does |
+|---|---|
+| **S** | Solo — silences every track that is not soloed |
+| **M** | Mute. A track silenced by someone else's solo says so, rather than looking like you muted it |
+| **lvl** | Track level, multiplied by each clip's own |
+| **pan** | Stereo placement, added to each clip's own. Double-click to re-centre |
+
+Selecting an audio clip offers its own volume and pan in the inspector.
+
+**Press play and you hear it.** The preview mix follows the same rules as the render — gains multiply,
+pans add, solo silences the rest — so what you hear while cutting is what the file will contain. Panning
+uses the constant-power law, so a clip swept across the stereo field keeps its level instead of dipping in
+the middle.
 
 **Render** encodes the timeline (PyAV, so no system `ffmpeg` is needed); **Still** exports the frame at the
 playhead. A clip whose step has not run yet is flagged before the render starts rather than silently

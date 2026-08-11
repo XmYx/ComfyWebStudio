@@ -29,11 +29,15 @@ TREE_JS = """
   const show = (node) => node.type === 'group'
     ? `(${node.tabs.join(',')})`
     : `${node.direction}[${node.children.map(show).join(' ')}]`
-  return show(JSON.parse(stored).state.tree)
+  // Each route has its own layout now; this suite drives the shot editor's.
+  return show(JSON.parse(stored).state.workspaces.shots.tree)
 }
 """
 
-SIZES_JS = "() => JSON.parse(localStorage.getItem('comfywebstudio.layout')).state.tree.sizes"
+SIZES_JS = (
+    "() => JSON.parse(localStorage.getItem('comfywebstudio.layout'))"
+    ".state.workspaces.shots.tree.sizes"
+)
 
 #: The tab labels of each dock group, in layout order — the layout as rendered rather than as stored.
 GROUPS_JS = """
@@ -117,7 +121,7 @@ def main() -> int:
         drag(page, centre_of(tab), (canvas["x"] + canvas["width"] / 2, canvas["y"] + canvas["height"] * 0.9))
         tree = page.evaluate(TREE_JS)
         check(
-            tree == "row[(shots,workflows,assets) column[(canvas,timeline,comfy) (inspector)] (monitor,renders)]",
+            tree == "row[(shots,workflows,assets) column[(canvas,comfy) (inspector)] (monitor,renders)]",
             f"splits it into a column, the panel underneath ({tree})",
         )
         if shots:
@@ -154,7 +158,7 @@ def main() -> int:
         check(
             # The bottom strip held only Shots, so the column wrapping the workspace has to collapse back
             # to the row underneath it. The column made earlier, which still holds two panels, must stay.
-            tree.startswith("row[") and "column[(canvas,timeline,comfy) (inspector)]" in tree,
+            tree.startswith("row[") and "column[(canvas,comfy) (inspector)]" in tree,
             f"and the strip it vacated collapses, leaving the other split alone ({tree})",
         )
 

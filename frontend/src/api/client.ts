@@ -340,6 +340,12 @@ export const api = {
 
   // -- media ---------------------------------------------------------------------------------------
   media: {
+    /** Peak pairs for drawing one audio file, rather than the samples themselves. */
+    waveform: (projectId: string, path: string, buckets = 800) =>
+      request<{ peaks: [number, number][]; duration: number; sample_rate: number; channels: number }>(
+        `/api/projects/${projectId}/waveform?path=${encodeURIComponent(path)}&buckets=${buckets}`,
+      ),
+
     url: (projectId: string, path: string) =>
       `/api/projects/${projectId}/media?path=${encodeURIComponent(path)}`,
     assets: (projectId: string) => request<Asset[]>(`/api/projects/${projectId}/assets`),
@@ -402,6 +408,39 @@ export const api = {
       request<void>(`/api/projects/${projectId}/timeline/tracks/${trackId}/clips/${clipId}`, {
         method: 'DELETE',
       }),
+    /** Make two clips move and trim as one. */
+    tieClips: (projectId: string, clipId: string, otherClipId: string) =>
+      request<Timeline>(`/api/projects/${projectId}/timeline/clips/${clipId}/tie`, {
+        method: 'POST',
+        body: json({ clip_id: otherClipId }),
+      }),
+
+    /** Break a clip out of its group. */
+    untieClip: (projectId: string, clipId: string) =>
+      request<Timeline>(`/api/projects/${projectId}/timeline/clips/${clipId}/untie`, {
+        method: 'POST',
+      }),
+
+    /** Cut a span of time out and close the gap behind it. */
+    rippleDelete: (
+      projectId: string,
+      body: { start: number; end: number; track_id?: string },
+    ) =>
+      request<Timeline>(`/api/projects/${projectId}/timeline/ripple-delete`, {
+        method: 'POST',
+        body: json(body),
+      }),
+
+    /** Place one shot's output — what dropping a shot onto the timeline does. */
+    fromShot: (
+      projectId: string,
+      body: { shot_id: string; track_id?: string; start?: number; with_audio?: boolean },
+    ) =>
+      request<Timeline>(`/api/projects/${projectId}/timeline/from-shot`, {
+        method: 'POST',
+        body: json(body),
+      }),
+
     fromShots: (projectId: string, shotIds?: string[]) =>
       request<Timeline>(`/api/projects/${projectId}/timeline/from-shots`, {
         method: 'POST',

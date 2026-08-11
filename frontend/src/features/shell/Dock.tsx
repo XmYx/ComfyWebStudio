@@ -16,7 +16,10 @@
 
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
-import { useLayout, WIDGET_LABELS, type WidgetId, type WidgetState } from '@/store/layout'
+import {
+  selectMaximized, selectTree, selectWidgets, useLayout, WIDGET_LABELS,
+  type WidgetId, type WidgetState,
+} from '@/store/layout'
 import {
   MIN_SPLIT_FRACTION, visibleTree, type DockNode, type DropPosition,
 } from '@/store/dockTree'
@@ -59,8 +62,8 @@ interface DragState {
 }
 
 export function Dock({ render }: Props) {
-  const widgets = useLayout((s) => s.widgets)
-  const tree = useLayout((s) => s.tree)
+  const widgets = useLayout(selectWidgets)
+  const tree = useLayout(selectTree)
   const dockWidget = useLayout((s) => s.dockWidget)
   const dockWidgetToEdge = useLayout((s) => s.dockWidgetToEdge)
   const floatWidget = useLayout((s) => s.floatWidget)
@@ -324,11 +327,11 @@ function DockGroup({
   render: Props['render']
   onDrag: (id: WidgetId, event: React.MouseEvent) => void
 }) {
-  const widgets = useLayout((s) => s.widgets)
+  const widgets = useLayout(selectWidgets)
   const setActive = useLayout((s) => s.setActive)
   const toggleWidget = useLayout((s) => s.toggleWidget)
   const floatWidget = useLayout((s) => s.floatWidget)
-  const maximized = useLayout((s) => s.maximized)
+  const maximized = useLayout(selectMaximized)
   const toggleMaximized = useLayout((s) => s.toggleMaximized)
 
   /**
@@ -491,7 +494,7 @@ function FloatingWidget({
   children: ReactNode
   onDrag: (id: WidgetId, event: React.MouseEvent) => void
 }) {
-  const widget = useLayout((s) => s.widgets[id])
+  const widget = useLayout((s) => selectWidgets(s)[id])
   const setWidget = useLayout((s) => s.setWidget)
   const floatWidget = useLayout((s) => s.floatWidget)
   const toggleWidget = useLayout((s) => s.toggleWidget)

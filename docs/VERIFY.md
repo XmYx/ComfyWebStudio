@@ -25,7 +25,12 @@ cd frontend && npm run typecheck && npx vitest run
 | `tests/test_shot_sources.py` | a shot placed in a shot: live structure, instanced values, cycles refused | fake ComfyUI |
 | `scripts/ui_dock.py` | panels dock beside/above/below each other, splitters resize, rim docking | a running app |
 | `scripts/ui_nested_shots.py` | dragging a shot into a shot places it as one contained node | a running app |
+| `tests/test_audio_mix.py` | mixing: gain, equal-power pan, mute, solo, and waveform peaks | nothing |
+| `tests/test_ripple.py` | cutting a span out: clips inside, straddling, and after it | nothing |
+| `tests/test_linked_clips.py` | tied picture and sound: moving, trimming, deleting, tying, untying | nothing |
+| `frontend/src/features/timeline/snapping.test.ts` | what snaps, how far it reaches, and both clip edges | nothing |
 | `scripts/ui_comfy_panel.py` | ComfyUI embeds in a panel, maximises without reloading, workflows open into it | app + real ComfyUI |
+| `scripts/ui_timeline.py` | the timeline workspace docks, shots drop onto it, audio draws and plays | a running app |
 | `scripts/ui_open_in_comfy.py` | opening a workflow lands on a *named, saved* ComfyUI workflow | app + real ComfyUI |
 | `scripts/ui_bridge_binding.py` | each ComfyUI workflow syncs back only to its own step | app + real ComfyUI |
 
@@ -86,6 +91,23 @@ afterwards, so they are repeatable and never touch your real work.
 - [ ] With the pack removed from ComfyUI, "Open in ComfyUI" warns that syncing back will not work.
 
 ### Timeline and render
+- [ ] The timeline opens as its own workspace — sources left, monitor over the tracks, clip settings right
+      — and its panels dock, split, float and maximise independently of the shot editor's.
+- [ ] Dragging a shot from the bin onto a lane places it *where it was dropped*; its audio comes with it on
+      an audio track, lined up with the picture.
+- [ ] An audio clip is drawn as its waveform, and trimming it redraws rather than squashing the shape.
+- [ ] An audio track header has solo, mute, level and pan; soloing one silences the others and the muted
+      ones say *why* they are silent.
+- [ ] Pressing play makes sound that follows the playhead, and panning a track is audible while cutting —
+      not only in the finished render.
+- [ ] Placing a video that carries sound puts its audio on an audio track too, tied to the picture;
+      moving or trimming either moves both, and **Untie** sets them free.
+- [ ] A shot that has not run can still be placed; it shows as waiting and fills in once it does.
+- [ ] A clip arrives the length of its media, and **Fit to source** re-times one that has drifted.
+- [ ] Dragging a clip snaps its edges to neighbours and the playhead, with a guide; <kbd>Alt</kbd>
+      overrides it and **⇥ Snap** turns it off.
+- [ ] Dragging across empty space selects a span; <kbd>Delete</kbd> removes it and closes the gap on every
+      track, keeping picture and sound in step.
 - [ ] "Build from shots" lays each shot's final output end to end with thumbnails.
 - [ ] Dragging a clip moves it; dragging its right edge trims it; both persist after a reload.
 - [ ] **Still** renders a PNG of the frame at the playhead.

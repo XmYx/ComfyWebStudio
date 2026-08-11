@@ -1787,3 +1787,197 @@ async def test_a_step_with_no_value_of_its_own_needs_no_adopting(client):
     # Nothing to adopt: with no override it already reads through to the workflow's new value.
     assert result["adopted_values"] == []
     assert result["kept_values"] == []
+
+
+async def _timeline_project(client):
+    """A project with one run shot, so the timeline has something real to place."""
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Generate", generator_prompt())
+    shot = (await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Wide"})).json()
+    await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+        json={"workflow_id": workflow["id"]},
+    )
+    await run_and_wait(client, project["id"], shot["id"])
+    return project["id"], shot["id"]
+
+
+async def test_dropping_a_shot_onto_the_timeline_places_its_output(client):
+    """What a drag from the shot list onto the timeline does."""
+    project_id, shot_id = await _timeline_project(client)
+
+    response = await client.post(
+        f"/api/projects/{project_id}/timeline/from-shot", json={"shot_id": shot_id}
+    )
+    assert response.status_code == 201, response.text
+    timeline = response.json()
+
+    video = next(t for t in timeline["tracks"] if t["kind"] == "video")
+    assert [c["name"] for c in video["clips"]] == ["Wide"]
+    assert video["clips"][0]["duration"] > 0
+    assert video["clips"][0]["source"]["shot_id"] == shot_id
+
+
+async def test_a_second_drop_lands_after_the_first(client):
+    project_id, shot_id = await _timeline_project(client)
+    for _ in range(2):
+        await client.post(
+            f"/api/projects/{project_id}/timeline/from-shot", json={"shot_id": shot_id}
+        )
+
+    timeline = (await client.get(f"/api/projects/{project_id}/timeline")).json()
+    clips = next(t for t in timeline["tracks"] if t["kind"] == "video")["clips"]
+    assert len(clips) == 2
+    assert clips[1]["start"] == pytest.approx(clips[0]["start"] + clips[0]["duration"])
+
+
+async def test_dropping_at_a_position_puts_it_there(client):
+    project_id, shot_id = await _timeline_project(client)
+    await client.post(
+        f"/api/projects/{project_id}/timeline/from-shot",
+        json={"shot_id": shot_id, "start": 5.0},
+    )
+    timeline = (await client.get(f"/api/projects/{project_id}/timeline")).json()
+    clips = next(t for t in timeline["tracks"] if t["kind"] == "video")["clips"]
+    assert clips[0]["start"] == pytest.approx(5.0)
+
+
+async def test_a_shot_with_nothing_to_show_cannot_be_placed(client):
+    """No steps at all means no output port to point a clip at — not even a pending one."""
+    project = await make_project(client)
+    shot = (await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Empty"})).json()
+
+    response = await client.post(
+        f"/api/projects/{project['id']}/timeline/from-shot", json={"shot_id": shot["id"]}
+    )
+    assert response.status_code == 422
+    assert "no image, video or audio output" in response.text.lower()
+
+
+async def test_a_shot_can_be_cut_in_before_it_has_been_run(client):
+    """The timeline is a plan as much as an assembly: place it now, it fills in when it runs."""
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Generate", generator_prompt())
+    shot = (await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Later"})).json()
+    await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+        json={"workflow_id": workflow["id"]},
+    )
+
+    response = await client.post(
+        f"/api/projects/{project['id']}/timeline/from-shot", json={"shot_id": shot["id"]}
+    )
+    assert response.status_code == 201, response.text
+    clip = next(t for t in response.json()["tracks"] if t["kind"] == "video")["clips"][0]
+    assert clip["source"]["shot_id"] == shot["id"]
+
+    # It reads as pending rather than broken, so the UI can show it as waiting for its shot.
+    resolved = (await client.get(f"/api/projects/{project['id']}/timeline/resolved")).json()
+    assert resolved["clips"][0]["error"] is not None
+
+    # And once the shot runs, the same clip resolves without being touched.
+    await run_and_wait(client, project["id"], shot["id"])
+    resolved = (await client.get(f"/api/projects/{project['id']}/timeline/resolved")).json()
+    assert resolved["clips"][0]["error"] is None
+    assert resolved["clips"][0]["artifacts"]
+
+
+async def test_a_track_can_be_soloed_and_panned(client):
+    project_id, shot_id = await _timeline_project(client)
+    await client.post(f"/api/projects/{project_id}/timeline/from-shot", json={"shot_id": shot_id})
+    timeline = (await client.get(f"/api/projects/{project_id}/timeline")).json()
+    track_id = timeline["tracks"][0]["id"]
+
+    updated = (
+        await client.patch(
+            f"/api/projects/{project_id}/timeline/tracks/{track_id}",
+            json={"solo": True, "volume": 0.5, "pan": -0.5},
+        )
+    ).json()
+    assert updated["solo"] is True
+    assert updated["volume"] == pytest.approx(0.5)
+    assert updated["pan"] == pytest.approx(-0.5)
+
+
+async def test_out_of_range_mixer_values_are_clamped(client):
+    project_id, shot_id = await _timeline_project(client)
+    await client.post(f"/api/projects/{project_id}/timeline/from-shot", json={"shot_id": shot_id})
+    timeline = (await client.get(f"/api/projects/{project_id}/timeline")).json()
+    track_id = timeline["tracks"][0]["id"]
+
+    # A negative gain would invert the phase and a pan past the ends leaves the pan law's domain.
+    updated = (
+        await client.patch(
+            f"/api/projects/{project_id}/timeline/tracks/{track_id}",
+            json={"volume": -3, "pan": 9},
+        )
+    ).json()
+    assert updated["volume"] == pytest.approx(0.0)
+    assert updated["pan"] == pytest.approx(1.0)
+
+
+def multi_output_prompt() -> dict:
+    """One step producing three outputs — an image, a bigger image, and a caption."""
+    return {
+        "1": {"class_type": "WSStringInput", "inputs": {"port_name": "caption", "value": "hello"}},
+        "2": {"class_type": "EmptyImage",
+              "inputs": {"width": 32, "height": 32, "batch_size": 1, "color": 0x2C6E9B}},
+        "3": {"class_type": "WSImageOutput",
+              "inputs": {"image": ["2", 0], "port_name": "picture", "format": "png", "run_key": ""}},
+        "4": {"class_type": "WSTextOutput",
+              "inputs": {"value": ["1", 0], "port_name": "caption_out", "run_key": ""}},
+    }
+
+
+async def test_a_clip_can_be_pointed_at_a_different_output(client):
+    """A step with several outputs is placed on one of them; which one is an editing decision."""
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Multi", multi_output_prompt())
+    shot = (await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Wide"})).json()
+    await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+        json={"workflow_id": workflow["id"]},
+    )
+    await run_and_wait(client, project["id"], shot["id"])
+    await client.post(
+        f"/api/projects/{project['id']}/timeline/from-shot", json={"shot_id": shot["id"]}
+    )
+
+    timeline = (await client.get(f"/api/projects/{project['id']}/timeline")).json()
+    track = timeline["tracks"][0]
+    clip = track["clips"][0]
+    assert clip["source"]["port_key"] == "picture"
+
+    updated = (
+        await client.patch(
+            f"/api/projects/{project['id']}/timeline/tracks/{track['id']}/clips/{clip['id']}",
+            json={"source": {**clip["source"], "port_key": "caption_out"}},
+        )
+    ).json()
+    assert updated["source"]["port_key"] == "caption_out"
+    # Still a source, not the raw dict the browser sent — patching used to skip validation entirely.
+    assert set(updated["source"]) == {"kind", "shot_id", "step_id", "port_key", "asset_id"}
+
+
+async def test_a_nonsense_clip_patch_is_refused_rather_than_stored(client):
+    project = await make_project(client)
+    track = (
+        await client.post(
+            f"/api/projects/{project['id']}/timeline/tracks", json={"kind": "video", "name": "V"}
+        )
+    ).json()
+    clip = (
+        await client.post(
+            f"/api/projects/{project['id']}/timeline/tracks/{track['id']}/clips",
+            json={"name": "c", "start": 0},
+        )
+    ).json()
+
+    response = await client.patch(
+        f"/api/projects/{project['id']}/timeline/tracks/{track['id']}/clips/{clip['id']}",
+        json={"transform": {"fit": "nonsense"}},
+    )
+    assert response.status_code == 422, response.text
+
+    unchanged = (await client.get(f"/api/projects/{project['id']}/timeline")).json()
+    assert unchanged["tracks"][0]["clips"][0]["transform"]["fit"] == "contain"

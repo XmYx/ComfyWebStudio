@@ -1,9 +1,11 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { api, ApiError } from '@/api/client'
-import type { Clip, Project, RenderRequest, ResolvedTimeline, Track, TrackKind } from '@/api/types'
+import type {
+  Clip, PortKind, Project, RenderRequest, ResolvedTimeline, Track, TrackKind,
+} from '@/api/types'
 import { KIND_COLOR } from '@/lib/kinds'
 import { formatBytes, formatTimecode } from '@/lib/format'
 import { useStudio } from '@/store/studio'
@@ -15,12 +17,30 @@ import {
   Select, TextInput, cx, useToast,
 } from '@/components/ui'
 import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
+import { isOurDrag, readDrag } from '@/lib/dnd'
+import { snap, snapMove, snapTargets } from './snapping'
+import { TrackMixer } from './TrackMixer'
+import { Waveform } from './Waveform'
+import { TimelineAudio } from './TimelineAudio'
 import { useCommandContext } from '@/features/menu/useCommandContext'
 
 const MIN_PX_PER_SECOND = 8
 const MAX_PX_PER_SECOND = 400
+/**
+ * What each kind of track can actually show.
+ *
+ * Not the same question as whether two ports may be chained: a still image on a video track is normal —
+ * it is simply held for the clip's duration — whereas a string output there has nothing to display.
+ */
+const TRACK_ACCEPTS: Partial<Record<TrackKind, PortKind[]>> = {
+  video: ['image', 'video'],
+  overlay: ['image', 'video'],
+  audio: ['audio'],
+  text: ['string', 'int', 'float', 'boolean'],
+}
+
 const TRACK_HEIGHT = 56
-const HEADER_WIDTH = 140
+const HEADER_WIDTH = 210
 
 /**
  * The timeline.
@@ -35,6 +55,8 @@ export function TimelinePage({ embedded = false }: { embedded?: boolean } = {}) 
 
   const [zoom, setZoom] = useState(40)
   const [adding, setAdding] = useState(false)
+  // Snapping is on by default and held down with Alt, which is the convention everywhere else.
+  const [snapping, setSnapping] = useState(true)
   // The transport lives in the shared store so a floating Monitor widget follows the same playhead.
   const playhead = useStudio((s) => s.playhead)
   const setPlayhead = useStudio((s) => s.setPlayhead)
@@ -115,6 +137,14 @@ export function TimelinePage({ embedded = false }: { embedded?: boolean } = {}) 
       <Panel className="flex items-center gap-2 px-3 py-2">
         <Button size="sm" onClick={() => buildFromShots.mutate()}>Build from shots</Button>
         <Button size="sm" variant="ghost" onClick={() => setAdding(true)}>+ Clip</Button>
+        <Button
+          size="sm"
+          variant={snapping ? 'default' : 'ghost'}
+          title="Snap edges to other clips and the playhead — hold Alt to override"
+          onClick={() => setSnapping((on) => !on)}
+        >
+          ⇥ Snap
+        </Button>
         <Select
           className="w-32 shrink-0"
           value=""
@@ -208,6 +238,7 @@ export function TimelinePage({ embedded = false }: { embedded?: boolean } = {}) 
             selectedClip={selectedClip}
             onSelectClip={selectClip}
             onContextMenu={contextMenu.open}
+            snapping={snapping}
           />
         )}
       </Panel>
@@ -267,16 +298,63 @@ export function TimelinePage({ embedded = false }: { embedded?: boolean } = {}) 
         selectedClip={selection}
         onRender={(body) => render.mutate(body)}
       />
+      {/* Renders nothing; it is what makes the timeline audible as it plays. */}
+      <TimelineAudio project={project} resolved={resolved} />
+
       <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
     </div>
   )
+}
+
+/** Finished renders, as a panel of its own. */
+export function RendersPanel({ project }: { project: Project }) {
+  const { data: renders } = useQuery({
+    queryKey: ['renders', project.id],
+    queryFn: () => api.timeline.renders(project.id),
+  })
+
+  return (
+    <Panel className="flex h-full min-h-0 flex-col overflow-hidden">
+      <PanelHeader>Renders</PanelHeader>
+      <div className="min-h-0 flex-1 overflow-y-auto p-2">
+        {!renders?.length ? (
+          <div className="text-xs text-[var(--color-ink-dim)]">Nothing rendered yet.</div>
+        ) : (
+          renders.map((item) => (
+            <a
+              key={item.path}
+              href={api.media.url(project.id, item.path)}
+              target="_blank"
+              rel="noreferrer"
+              className="flex items-center justify-between rounded px-2 py-1 text-xs hover:bg-[var(--color-panel-2)]"
+            >
+              <span className="truncate">{item.name}</span>
+              <span className="text-[10px] text-[var(--color-ink-dim)]">{formatBytes(item.size)}</span>
+            </a>
+          ))
+        )}
+      </div>
+    </Panel>
+  )
+}
+
+/** What the lanes need to know about each clip's resolved media. */
+interface ClipStatus {
+  error: string | null
+  kind: string | null
+  thumb: string | null
+  audioPath: string | null
+  /** The media's own metadata, which is where a clip's natural length comes from. */
+  meta: Record<string, unknown>
+  /** How many artifacts the port produced — a sequence's length is its frame count. */
+  frames: number
 }
 
 // -- track area -----------------------------------------------------------------------------------------
 
 function TrackArea({
   project, resolved, zoom, duration, playhead, onScrub, onChanged, selectedClip, onSelectClip,
-  onContextMenu,
+  onContextMenu, snapping,
 }: {
   project: Project
   resolved: ResolvedTimeline | undefined
@@ -288,12 +366,146 @@ function TrackArea({
   selectedClip: { trackId: string; clipId: string } | null
   onSelectClip: (selection: { trackId: string; clipId: string } | null) => void
   onContextMenu: (event: React.MouseEvent, items: MenuItem[]) => void
+  snapping: boolean
 }) {
+  const toast = useToast()
+  //: Where the drag in progress has snapped to, drawn as a guide so the alignment is visible.
+  const [snapGuide, setSnapGuide] = useState<number | null>(null)
+  //: A span of *time* selected by dragging across empty space, which ripple delete then removes.
+  const [range, setRange] = useState<{ from: number; to: number } | null>(null)
+
+  /**
+   * Dragging across empty lane space selects a span of time.
+   *
+   * Distinct from selecting a clip: what is selected here is the gap itself, which is the thing a ripple
+   * delete acts on. It snaps to the same targets as a clip drag, so a span can be taken out exactly
+   * between two cuts.
+   */
+  const beginRange = (event: React.MouseEvent) => {
+    if (event.button !== 0) return
+    const lane = event.currentTarget as HTMLElement
+    const box = lane.getBoundingClientRect()
+    const targets = snapTargets(project.timeline, playhead)
+    const at = (clientX: number) =>
+      snap(Math.max(0, (clientX - box.left) / zoom), targets, zoom, snapping).time
+
+    const anchor = at(event.clientX)
+    setRange({ from: anchor, to: anchor })
+
+    const move = (e: MouseEvent) => {
+      const now = at(e.clientX)
+      setRange({ from: Math.min(anchor, now), to: Math.max(anchor, now) })
+    }
+    const up = (e: MouseEvent) => {
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+      const now = at(e.clientX)
+      // A click, not a drag: clear rather than leaving a zero-width selection nobody can see.
+      if (Math.abs(now - anchor) * zoom < 3) setRange(null)
+    }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
+  }
+
+  useEffect(() => {
+    if (!range || range.to <= range.from) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Delete' && event.key !== 'Backspace') return
+      // Not while typing in the inspector: Backspace there means backspace.
+      const target = event.target as HTMLElement | null
+      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return
+      event.preventDefault()
+      void rippleDelete()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  })
+
+  const rippleDelete = async (trackId?: string) => {
+    if (!range || range.to <= range.from) return
+    try {
+      await api.timeline.rippleDelete(project.id, {
+        start: range.from, end: range.to, track_id: trackId,
+      })
+      setRange(null)
+      onChanged()
+    } catch (error) {
+      toast.push('bad', (error as ApiError).message)
+    }
+  }
+  //: The lane a drag is currently over, so it can be highlighted as a target.
+  const [dropTrack, setDropTrack] = useState<string | null>(null)
+
+  /**
+   * What this clip could sensibly be tied to: clips on *other* tracks that overlap it in time.
+   *
+   * Overlap is the honest test — two clips that never share a moment have no reason to move together,
+   * and offering every clip in the project would make the menu useless.
+   */
+  const tieCandidates = (clip: Clip) =>
+    project.timeline.tracks.flatMap((other) =>
+      other.clips
+        .filter(
+          (candidate) =>
+            candidate.id !== clip.id &&
+            !candidate.link_id &&
+            !other.clips.includes(clip) &&
+            candidate.start < clip.start + clip.duration &&
+            candidate.start + candidate.duration > clip.start,
+        )
+        .map((candidate) => ({ track: other, clip: candidate })),
+    )
+
+  /** The media's own length, when it has one — an image has none, so it keeps whatever it was given. */
+  const sourceLength = (clip: Clip): number | null => {
+    const status = clipStatus.get(clip.id)
+    const meta = status?.meta ?? {}
+    if (typeof meta.duration === 'number' && meta.duration > 0) return meta.duration
+    if ((status?.frames ?? 0) > 1) return (status!.frames as number) / Math.max(1, project.timeline.fps)
+    return null
+  }
+
   const clipMenu = (track: Track, clip: Clip): MenuItem[] => [
     { type: 'header', label: clip.name || 'Clip' },
     { type: 'command', id: 'edit.copy' },
     { type: 'command', id: 'edit.cut' },
     { type: 'command', id: 'edit.paste' },
+    ...(clip.link_id
+      ? ([{
+          type: 'action' as const,
+          label: 'Untie from its picture / sound',
+          onSelect: async () => {
+            await api.timeline.untieClip(project.id, clip.id)
+            onChanged()
+          },
+        }] satisfies MenuItem[])
+      : tieCandidates(clip).length
+        ? ([{
+            type: 'submenu' as const,
+            label: 'Tie to…',
+            items: tieCandidates(clip).map((other) => ({
+              type: 'action' as const,
+              label: `${other.clip.name || other.clip.id} (${other.track.name})`,
+              onSelect: async () => {
+                await api.timeline.tieClips(project.id, clip.id, other.clip.id)
+                onChanged()
+              },
+            })),
+          }] satisfies MenuItem[])
+        : []),
+    ...(sourceLength(clip) !== null
+      ? ([{
+          type: 'action' as const,
+          label: `Fit to source (${sourceLength(clip)!.toFixed(2)}s)`,
+          disabled: Math.abs(sourceLength(clip)! - clip.duration) < 0.01,
+          onSelect: async () => {
+            await api.timeline.updateClip(project.id, track.id, clip.id, {
+              duration: sourceLength(clip)!,
+            })
+            onChanged()
+          },
+        }] satisfies MenuItem[])
+      : []),
     { type: 'separator' },
     // The command reads the current selection, and right-clicking a clip selects it.
     { type: 'command', id: 'render.clip' },
@@ -388,6 +600,26 @@ function TrackArea({
   ]
 
   const laneMenu = (track: Track): MenuItem[] => [
+    ...(range && range.to > range.from
+      ? ([
+          {
+            type: 'header' as const,
+            label: `${(range.to - range.from).toFixed(2)}s selected`,
+          },
+          {
+            type: 'action' as const,
+            label: 'Ripple delete (every track)',
+            onSelect: () => void rippleDelete(),
+          },
+          {
+            type: 'action' as const,
+            label: `Ripple delete on ${track.name}`,
+            onSelect: () => void rippleDelete(track.id),
+          },
+          { type: 'action' as const, label: 'Clear selection', onSelect: () => setRange(null) },
+          { type: 'separator' as const },
+        ] satisfies MenuItem[])
+      : []),
     { type: 'header', label: track.name },
     { type: 'command', id: 'edit.paste' },
     ...trackMenu(track).slice(1),
@@ -396,12 +628,16 @@ function TrackArea({
   const width = duration * zoom
 
   const clipStatus = useMemo(() => {
-    const map = new Map<string, { error: string | null; kind: string | null; thumb: string | null }>()
+    const map = new Map<string, ClipStatus>()
     for (const entry of resolved?.clips ?? []) {
       map.set(entry.clip_id, {
         error: entry.error,
         kind: entry.kind,
         thumb: entry.artifacts[0]?.thumb ?? null,
+        // The file itself, which is what a waveform is drawn from — a thumbnail cannot show sound.
+        audioPath: entry.artifacts[0]?.path ?? null,
+        meta: entry.artifacts[0]?.meta ?? {},
+        frames: entry.artifacts.length,
       })
     }
     return map
@@ -435,6 +671,33 @@ function TrackArea({
     window.addEventListener('mouseup', up)
   }
 
+  /**
+   * Dropping a shot from the source list onto a lane.
+   *
+   * It lands where it was released rather than at the end, because the position is the whole reason to
+   * drag it rather than press the button in the list. The backend places the shot's audio too, so a shot
+   * with sound arrives complete rather than needing the audio found and placed by hand.
+   */
+  const dropShot = async (event: React.DragEvent, track: Track) => {
+    setDropTrack(null)
+    const payload = readDrag(event)
+    if (!payload || payload.kind !== 'shot' || track.locked) return
+    event.preventDefault()
+
+    const box = event.currentTarget.getBoundingClientRect()
+    const at = Math.max(0, (event.clientX - box.left) / zoom)
+    try {
+      await api.timeline.fromShot(project.id, {
+        shot_id: payload.id,
+        track_id: track.kind === 'video' ? track.id : undefined,
+        start: at,
+      })
+      onChanged()
+    } catch (error) {
+      toast.push('bad', (error as ApiError).message)
+    }
+  }
+
   return (
     <div className="flex min-h-0 flex-1">
       {/* Track headers stay pinned while the lanes scroll. */}
@@ -462,9 +725,21 @@ function TrackArea({
             {project.timeline.tracks.map((track) => (
               <div
                 key={track.id}
-                className="relative border-b border-[var(--color-edge)]"
+                className={cx(
+                  'relative border-b border-[var(--color-edge)]',
+                  dropTrack === track.id && 'bg-[var(--color-accent)]/15',
+                )}
                 style={{ height: TRACK_HEIGHT }}
                 onContextMenu={(event) => onContextMenu(event, laneMenu(track))}
+                onDragOver={(event) => {
+                  if (!isOurDrag(event) || track.locked) return
+                  event.preventDefault()
+                  event.dataTransfer.dropEffect = 'copy'
+                  setDropTrack(track.id)
+                }}
+                onDragLeave={() => setDropTrack(null)}
+                onDrop={(event) => void dropShot(event, track)}
+                onMouseDown={beginRange}
               >
                 {track.clips.map((clip) => (
                   <ClipBlock
@@ -475,6 +750,9 @@ function TrackArea({
                     zoom={zoom}
                     status={clipStatus.get(clip.id)}
                     selected={selectedClip?.clipId === clip.id}
+                    snapping={snapping}
+                    playhead={playhead}
+                    onSnapGuide={setSnapGuide}
                     onSelect={() => onSelectClip({ trackId: track.id, clipId: clip.id })}
                     onChanged={onChanged}
                     onContextMenu={(event) => {
@@ -485,6 +763,22 @@ function TrackArea({
                 ))}
               </div>
             ))}
+
+            {/* The span selected in empty space, and the ripple that removes it. */}
+            {range && (
+              <div
+                className="pointer-events-none absolute inset-y-0 border-x border-[var(--color-warn)] bg-[var(--color-warn)]/20"
+                style={{ left: range.from * zoom, width: Math.max(1, (range.to - range.from) * zoom) }}
+              />
+            )}
+
+            {/* Where a drag has snapped to, so the alignment can be seen as it happens. */}
+            {snapGuide !== null && (
+              <div
+                className="pointer-events-none absolute inset-y-0 w-px bg-[var(--color-warn)]"
+                style={{ left: snapGuide * zoom }}
+              />
+            )}
 
             <div
               className="pointer-events-none absolute inset-y-0 w-px bg-[var(--color-accent)]"
@@ -542,15 +836,52 @@ function Ruler({
 function TrackHeader({
   project, track, onChanged,
 }: { project: Project; track: Track; onChanged: () => void }) {
+  // An audio track silenced by someone else's solo has to look different from one you muted yourself.
+  const silencedBySolo =
+    !track.solo &&
+    project.timeline.tracks.some((other) => other.kind === 'audio' && other.solo)
+
+  // An audio track carries a mixer strip, which does not fit beside the name — so it goes under it.
+  if (track.kind === 'audio') {
+    return (
+      <div
+        className="flex flex-col justify-center gap-1 border-b border-[var(--color-edge)] px-2"
+        style={{ height: TRACK_HEIGHT }}
+      >
+        <div className="flex items-center gap-1">
+          <span className="min-w-0 flex-1 truncate text-xs">{track.name}</span>
+          <button
+            title="Delete track"
+            className="px-1 text-[10px] text-[var(--color-ink-dim)] hover:text-[var(--color-bad)]"
+            onClick={async () => {
+              if (!confirm(`Delete track “${track.name}” and its clips?`)) return
+              await api.timeline.removeTrack(project.id, track.id)
+              onChanged()
+            }}
+          >
+            ✕
+          </button>
+        </div>
+        <TrackMixer
+          project={project}
+          track={track}
+          silencedBySolo={silencedBySolo}
+          onChanged={onChanged}
+        />
+      </div>
+    )
+  }
+
   return (
     <div
       className="flex items-center gap-1 border-b border-[var(--color-edge)] px-2"
       style={{ height: TRACK_HEIGHT }}
     >
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1 overflow-hidden">
         <div className="truncate text-xs">{track.name}</div>
-        <div className="text-[10px] text-[var(--color-ink-dim)]">{track.kind}</div>
+        <div className="truncate text-[10px] text-[var(--color-ink-dim)]">{track.kind}</div>
       </div>
+      {(
       <button
         title={track.muted ? 'Unmute' : 'Mute'}
         className={cx('px-1 text-xs', track.muted ? 'text-[var(--color-bad)]' : 'text-[var(--color-ink-dim)]')}
@@ -561,6 +892,7 @@ function TrackHeader({
       >
         {track.muted ? '🔇' : '🔊'}
       </button>
+      )}
       <button
         title="Delete track"
         className="px-1 text-xs text-[var(--color-ink-dim)] hover:text-[var(--color-bad)]"
@@ -577,14 +909,18 @@ function TrackHeader({
 }
 
 function ClipBlock({
-  project, track, clip, zoom, status, selected, onSelect, onChanged, onContextMenu,
+  project, track, clip, zoom, status, selected, snapping, playhead, onSnapGuide,
+  onSelect, onChanged, onContextMenu,
 }: {
   project: Project
   track: Track
   clip: Clip
   zoom: number
-  status: { error: string | null; kind: string | null; thumb: string | null } | undefined
+  status: ClipStatus | undefined
   selected: boolean
+  snapping: boolean
+  playhead: number
+  onSnapGuide: (time: number | null) => void
   onSelect: () => void
   onChanged: () => void
   onContextMenu: (event: React.MouseEvent) => void
@@ -595,18 +931,53 @@ function ClipBlock({
     event.stopPropagation()
     if (track.locked) return
     dragState.current = { mode, x: event.clientX, start: clip.start, duration: clip.duration }
+    const targets = snapTargets(project.timeline, playhead, clip.id)
+
+    /** Where this drag would put the clip, snapped. Alt holds it exactly where the pointer is. */
+    const resolve = (move: MouseEvent) => {
+      const state = dragState.current!
+      const delta = (move.clientX - state.x) / zoom
+      const on = snapping && !move.altKey
+      if (state.mode === 'move') {
+        const wanted = Math.max(0, state.start + delta)
+        const result = snapMove(wanted, state.duration, targets, zoom, on)
+        return { start: Math.max(0, result.time), duration: state.duration, guide: result.target }
+      }
+      const wantedEnd = state.start + Math.max(0.04, state.duration + delta)
+      const result = snap(wantedEnd, targets, zoom, on)
+      return {
+        start: state.start,
+        duration: Math.max(0.04, result.time - state.start),
+        guide: result.target,
+      }
+    }
+
+    // Tied clips move with it as you drag, not only once the server has been told — otherwise the
+    // partner sits still and then jumps, which reads as a glitch rather than as a tie.
+    const partners = clip.link_id
+      ? project.timeline.tracks.flatMap((other) =>
+          other.clips
+            .filter((c) => c.link_id === clip.link_id && c.id !== clip.id)
+            .map((c) => ({ id: c.id, start: c.start, duration: c.duration })),
+        )
+      : []
 
     const onMove = (move: MouseEvent) => {
-      const state = dragState.current
-      if (!state) return
-      const delta = (move.clientX - state.x) / zoom
+      if (!dragState.current) return
       const element = document.getElementById(`clip-${clip.id}`)
       if (!element) return
-      if (state.mode === 'move') {
-        element.style.left = `${Math.max(0, state.start + delta) * zoom}px`
-      } else {
-        element.style.width = `${Math.max(0.04, state.duration + delta) * zoom}px`
+      const state = dragState.current
+      const { start, duration, guide } = resolve(move)
+      element.style.left = `${start * zoom}px`
+      element.style.width = `${duration * zoom}px`
+
+      for (const partner of partners) {
+        const node = document.getElementById(`clip-${partner.id}`)
+        if (!node) continue
+        node.style.left = `${Math.max(0, partner.start + (start - state.start)) * zoom}px`
+        node.style.width = `${Math.max(0.04, partner.duration + (duration - state.duration)) * zoom}px`
       }
+      onSnapGuide(guide ? guide.time : null)
     }
 
     const onUp = async (up: MouseEvent) => {
@@ -614,15 +985,13 @@ function ClipBlock({
       window.removeEventListener('mouseup', onUp)
       const state = dragState.current
       dragState.current = null
+      onSnapGuide(null)
       if (!state) return
 
-      const delta = (up.clientX - state.x) / zoom
-      if (Math.abs(delta) < 0.01) return
+      if (Math.abs(up.clientX - state.x) < 2) return
+      const { start, duration } = resolve(up)
       // Persist once, on release — dragging fires far too often to PATCH every frame.
-      const patch =
-        state.mode === 'move'
-          ? { start: Math.max(0, state.start + delta) }
-          : { duration: Math.max(0.04, state.duration + delta) }
+      const patch = state.mode === 'move' ? { start } : { duration }
       await api.timeline.updateClip(project.id, track.id, clip.id, patch)
       onChanged()
     }
@@ -652,15 +1021,28 @@ function ClipBlock({
       }}
       title={status?.error ?? `${clip.name || clip.id} · ${clip.duration.toFixed(2)}s`}
     >
-      {status?.thumb && (
+      {/* Audio is drawn as its own shape; a thumbnail would say nothing about where the sound is. */}
+      {track.kind === 'audio' && status?.audioPath ? (
+        <Waveform
+          projectId={project.id}
+          path={status.audioPath}
+          inPoint={clip.in_point}
+          duration={clip.duration}
+          className="absolute inset-0 h-full w-full text-[var(--color-accent)]"
+        />
+      ) : status?.thumb ? (
         <img
           src={api.media.url(project.id, status.thumb)}
           alt=""
           className="h-full w-10 shrink-0 object-cover opacity-80"
         />
-      )}
-      <span className="truncate px-1.5 text-[10px]">
-        {status?.error ? '⚠ ' : ''}{clip.name || clip.text || clip.source.port_key || 'clip'}
+      ) : null}
+      <span className="relative truncate px-1.5 text-[10px]">
+        {status?.error ? '⚠ ' : ''}
+        {clip.link_id && (
+          <span title="Tied to another clip — they move and trim together" className="opacity-70">⛓ </span>
+        )}
+        {clip.name || clip.text || clip.source.port_key || 'clip'}
       </span>
       <div
         onMouseDown={(e) => beginDrag(e, 'trim')}
@@ -672,7 +1054,7 @@ function ClipBlock({
 
 // -- clip inspector -------------------------------------------------------------------------------------
 
-function ClipInspector({ project, onChanged }: { project: Project; onChanged: () => void }) {
+export function ClipInspector({ project, onChanged }: { project: Project; onChanged: () => void }) {
   const selection = useStudio((s) => s.selectedClip)
   const selectClip = useStudio((s) => s.selectClip)
 
@@ -695,6 +1077,22 @@ function ClipInspector({ project, onChanged }: { project: Project; onChanged: ()
     onChanged()
   }
 
+  /**
+   * The other outputs of the step this clip came from.
+   *
+   * A step can produce several — an image and the caption that made it, a video and its audio — and the
+   * clip was placed on whichever one was found first. Which of them the timeline should show is an
+   * editing decision, so it belongs here rather than being fixed when the clip was created.
+   */
+  const sourceStep = clip.source.kind === 'step_output'
+    ? project.shots
+        .find((shot) => shot.id === clip.source.shot_id)
+        ?.steps.find((step) => step.id === clip.source.step_id)
+    : undefined
+  const outputs = sourceStep
+    ? (project.workflows[sourceStep.workflow_id]?.ports ?? []).filter((p) => p.direction === 'out')
+    : []
+
   return (
     <Panel className="max-h-52 overflow-y-auto">
       <PanelHeader
@@ -716,6 +1114,31 @@ function ClipInspector({ project, onChanged }: { project: Project; onChanged: ()
       </PanelHeader>
 
       <div className="grid grid-cols-4 gap-3 p-3">
+        {/* Only worth showing when there is a choice to make. */}
+        {outputs.length > 1 && (
+          <div className="col-span-4">
+            <Field
+              label="Output"
+              hint={`${sourceStep?.name ?? 'this step'} produces ${outputs.length}`}
+            >
+              <Select
+                value={clip.source.port_key ?? ''}
+                onChange={(e) =>
+                  patch({ source: { ...clip.source, port_key: e.target.value } })
+                }
+              >
+                {outputs.map((port) => (
+                  <option key={port.key} value={port.key}>
+                    {port.label || port.key} ({port.kind})
+                    {(TRACK_ACCEPTS[track.kind] ?? []).includes(port.kind)
+                      ? ''
+                      : ` — a ${track.kind} track cannot show this`}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+        )}
         <Field label="Start (s)">
           <TextInput
             type="number" step={0.1} value={clip.start}
@@ -728,6 +1151,32 @@ function ClipInspector({ project, onChanged }: { project: Project; onChanged: ()
             onChange={(e) => patch({ duration: Math.max(0.04, Number(e.target.value)) })}
           />
         </Field>
+        {/* Audio clips have no picture to fade or fit, so they get the controls they do have. */}
+        {track.kind === 'audio' ? (
+          <>
+            <Field label="Volume" hint={`${Math.round(clip.volume * 100)}%`}>
+              <input
+                type="range" min={0} max={2} step={0.01} value={clip.volume}
+                onChange={(e) => patch({ volume: Number(e.target.value) })}
+                className="w-full accent-[var(--color-accent)]"
+              />
+            </Field>
+            <Field
+              label="Pan"
+              hint={clip.pan === 0
+                ? 'centre'
+                : `${Math.abs(Math.round(clip.pan * 100))}% ${clip.pan < 0 ? 'left' : 'right'}`}
+            >
+              <input
+                type="range" min={-1} max={1} step={0.01} value={clip.pan}
+                onChange={(e) => patch({ pan: Number(e.target.value) })}
+                onDoubleClick={() => patch({ pan: 0 })}
+                className="w-full accent-[var(--color-accent)]"
+              />
+            </Field>
+          </>
+        ) : (
+          <>
         <Field label="Opacity">
           <TextInput
             type="number" step={0.05} min={0} max={1} value={clip.opacity}
@@ -745,6 +1194,8 @@ function ClipInspector({ project, onChanged }: { project: Project; onChanged: ()
             <option value="none">None</option>
           </Select>
         </Field>
+          </>
+        )}
 
         {track.kind === 'text' && (
           <div className="col-span-4">
@@ -752,15 +1203,6 @@ function ClipInspector({ project, onChanged }: { project: Project; onChanged: ()
               <TextInput value={clip.text} onChange={(e) => patch({ text: e.target.value })} />
             </Field>
           </div>
-        )}
-
-        {track.kind === 'audio' && (
-          <Field label="Volume">
-            <TextInput
-              type="number" step={0.05} min={0} max={2} value={clip.volume}
-              onChange={(e) => patch({ volume: Number(e.target.value) })}
-            />
-          </Field>
         )}
 
         <Field label="Fade in (s)">

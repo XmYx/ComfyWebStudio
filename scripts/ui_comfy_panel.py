@@ -29,7 +29,10 @@ PROMPT = {
           "inputs": {"image": ["2", 0], "port_name": "image", "format": "png", "run_key": ""}},
 }
 
-MAXIMIZED = "() => JSON.parse(localStorage.getItem('comfywebstudio.layout')).state.maximized"
+MAXIMIZED = (
+    "() => JSON.parse(localStorage.getItem('comfywebstudio.layout'))"
+    ".state.workspaces.shots.maximized"
+)
 
 #: Read inside the frame: what ComfyUI has open, and whether the canvas really holds that file's graph.
 SAVED_STATE = """() => {

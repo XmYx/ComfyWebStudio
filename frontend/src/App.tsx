@@ -9,7 +9,7 @@ import { MenuBar } from '@/features/menu/MenuBar'
 import { AppDialogs } from '@/features/menu/Dialogs'
 import { ProjectsPage } from '@/features/projects/ProjectsPage'
 import { ShotsPage } from '@/features/shots/ShotsPage'
-import { TimelinePage } from '@/features/timeline/TimelinePage'
+import { TimelineWorkspace } from '@/features/timeline/TimelineWorkspace'
 import { SettingsPage } from '@/features/settings/SettingsPage'
 import { useToast } from '@/components/ui'
 
@@ -147,7 +147,7 @@ export default function App() {
           />
           <Route
             path="/p/:projectId/timeline"
-            element={<ProjectShell><TimelinePage /></ProjectShell>}
+            element={<ProjectShell><TimelineWorkspace /></ProjectShell>}
           />
           <Route path="/p/:projectId" element={<RedirectToShots />} />
           <Route path="*" element={<Navigate to="/projects" replace />} />
