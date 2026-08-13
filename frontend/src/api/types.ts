@@ -354,6 +354,8 @@ export interface Project {
   shots: Shot[]
   timeline: Timeline
   assets: Record<string, Asset>
+  /** Storyboards belong to the project, so they export, import and version with it. */
+  storyboards: Storyboard[]
 }
 
 export interface ProjectSummary {
@@ -430,6 +432,15 @@ export interface AppSettings {
     autoplay_video: boolean
   }
   ui: { theme: string; timeline_snap: boolean; timeline_snap_frames: number }
+  /** Which models the storyboard tools reach for. Writing and looking are chosen separately. */
+  story: {
+    provider_id: string | null
+    write_model: string
+    vision_provider_id: string | null
+    vision_model: string
+    temperature: number
+    default_frames: number
+  }
 }
 
 export interface BindableWidget {
@@ -498,4 +509,296 @@ export interface Version {
   scopes: string[]
   targets: string[]
   changes: VersionChange[]
+}
+
+// -- storyboards ------------------------------------------------------------------------------------
+
+export interface StoryboardCharacter {
+  id: string
+  name: string
+  /** Who they are — the part that belongs in the script. */
+  description: string
+  /** What they look like — the part that belongs in an image prompt. */
+  appearance: string
+  reference_asset_ids: string[]
+}
+
+export type FrameStatus = 'draft' | 'imaged' | 'described' | 'shot'
+
+export interface StoryboardFrame {
+  id: string
+  order: number
+  title: string
+  /** What happens, in prose. */
+  action: string
+  camera: string
+  /** What the still should look like. */
+  image_prompt: string
+  /** How it should move. */
+  shot_prompt: string
+  character_ids: string[]
+  asset_id: string | null
+  shot_id: string | null
+  status: FrameStatus
+  notes: string
+}
+
+export interface StoryboardBinding {
+  image_workflow_id: string | null
+  image_prompt_param: string
+  image_reference_params: string[]
+  video_workflow_id: string | null
+  video_prompt_param: string
+  video_image_port: string
+  video_reference_params: string[]
+}
+
+export interface Storyboard {
+  id: string
+  name: string
+  premise: string
+  style: string
+  aspect: string
+  frames: StoryboardFrame[]
+  characters: StoryboardCharacter[]
+  binding: StoryboardBinding
+  /** How this board's flow differs from the defaults. Null means it follows them exactly. */
+  pipeline: PipelineOverlay | null
+  fields: Record<string, string>
+  created: string
+  modified: string
+}
+
+// -- the flow itself ----------------------------------------------------------------------------------
+
+export type StageKind = 'llm' | 'comfy' | 'capture' | 'shot'
+export type StageScope = 'board' | 'frame'
+export type FieldType =
+  | 'string' | 'text' | 'integer' | 'number' | 'boolean' | 'string_list' | 'object_list'
+
+/** One thing a stage asks the model for, and where the answer goes. */
+export interface OutputField {
+  key: string
+  type: FieldType
+  description: string
+  required: boolean
+  fields: OutputField[]
+  /** `frame.image_prompt`, `board.fields.mood`, … Empty means propose only. */
+  writes: string
+}
+
+export interface StageModel {
+  role: 'write' | 'vision'
+  /** Empty follows the model chosen in Settings. */
+  model: string
+  /** Null follows the temperature in Settings. */
+  temperature: number | null
+  attach_image: boolean
+}
+
+export interface StageRetry {
+  when_empty: string[]
+  prompt: string
+  temperature_delta: number
+}
+
+export interface Stage {
+  id: string
+  kind: StageKind
+  scope: StageScope
+  name: string
+  description: string
+  enabled: boolean
+  system: string
+  prompt: string
+  model: StageModel
+  outputs: OutputField[]
+  retry: StageRetry | null
+  slot: string
+  reroll_seed: boolean
+  only_if_missing: boolean
+  sets_status: FrameStatus | null
+  builtin_id: string | null
+  builtin_revision: number
+}
+
+/** A stage as the panel sees it: the record, plus what it needs to draw the row. */
+export interface StageView extends Stage {
+  /** True when this layer has its own copy rather than tracking the defaults. */
+  edited: boolean
+  /** True when the built-in it was edited against has since moved on. */
+  stale: boolean
+  writable: string[]
+}
+
+export interface Pipeline {
+  id: string
+  name: string
+  revision: number
+  stages: Stage[]
+}
+
+export interface PipelineOverlay {
+  stages: Record<string, Stage>
+  order: string[]
+  removed: string[]
+  revision: number
+  modified: string
+}
+
+export interface PipelineView {
+  pipeline: Pipeline
+  stages: StageView[]
+  /** Every token a template may use, already rendered — so the palette shows values, not just names. */
+  tokens: Record<string, string>
+}
+
+export interface AppPipelineView {
+  pipeline: Pipeline
+  stages: StageView[]
+  builtin: Pipeline
+  kinds: StageKind[]
+}
+
+/** What one execution of one stage sent, and what came back. */
+export interface StageRun {
+  id: string
+  board_id: string
+  pipeline_run_id: string | null
+  stage_id: string
+  stage_name: string
+  kind: StageKind
+  scope: StageScope
+  frame_id: string | null
+  status: 'running' | 'success' | 'error' | 'skipped'
+  retry: boolean
+  system: string
+  prompt: string
+  provider_id: string
+  model: string
+  temperature: number | null
+  image_count: number
+  schema_sent: Record<string, unknown> | null
+  /** Tokens the template used that had no value. Left verbatim in the prompt, and named here. */
+  unknown_tokens: string[]
+  reply: string
+  payload: Record<string, unknown> | null
+  writes: StageWrite[]
+  run_id: string | null
+  step_ids: Record<string, string>
+  error: string | null
+  truncated: boolean
+  started: string
+  finished: string | null
+  duration_ms: number
+}
+
+export interface StageWrite {
+  target: string
+  frame_id: string | null
+  before: string
+  after: string
+  applied: boolean
+  reason: string
+}
+
+/** A list entry: everything but the long text, so a history stays cheap to fetch. */
+export type StageRunPreview =
+  Omit<StageRun, 'system' | 'prompt' | 'reply' | 'payload'> & {
+    prompt_preview: string
+    reply_preview: string
+  }
+
+export interface PipelineRun {
+  id: string
+  project_id: string
+  board_id: string
+  status: 'running' | 'success' | 'error' | 'cancelled'
+  stage_ids: string[]
+  frame_ids: string[]
+  stage_id: string
+  done: string[]
+  error: string | null
+  started: string
+  finished: string | null
+}
+
+export interface StageRunResult {
+  stage_id: string
+  status: string
+  run_id: string | null
+  step_ids: Record<string, string>
+  detail: Record<string, unknown>
+  runs: StageRun[]
+}
+
+/**
+ * One frame's current picture, and the step that draws it.
+ *
+ * `source` says which of the two it is: a still the step drew, or the asset the frame points at (kept from
+ * an earlier draw, or a photograph dropped in). The step id is what live progress events are keyed by.
+ */
+export interface FrameStill {
+  step_id: string | null
+  status: RunStatus | null
+  run_id: string | null
+  image: string | null
+  thumb: string | null
+  source: 'still' | 'asset' | null
+  /** Nothing new to keep: the frame's asset already holds the picture on screen. */
+  kept: boolean
+}
+
+export interface BoardStills {
+  shot_id: string | null
+  workflow: string | null
+  frames: Record<string, FrameStill>
+}
+
+export interface DrawResult {
+  run_id: string
+  shot_id: string
+  /** `frame id -> step id`, for the frames this run is drawing. */
+  steps: Record<string, string>
+  workflow: string
+  /** False when the drawing workflow exposes no seed, so a reroll may come back looking the same. */
+  seeded: boolean
+}
+
+/** What the bound workflows offer, and what is missing for what the board is trying to do. */
+export interface BoardSurfaces {
+  image: WorkflowSurface | null
+  video: WorkflowSurface | null
+  spare_video_image_ports: Array<{ key: string; label: string }>
+  characters_with_references: string[]
+  warnings: string[]
+}
+
+export interface WorkflowSurface {
+  workflow_id: string
+  name: string
+  text_params: Array<{ key: string; label: string }>
+  image_ports: Array<{ key: string; label: string }>
+  image_outputs: Array<{ key: string; label: string }>
+  video_outputs: Array<{ key: string; label: string }>
+}
+
+export interface LlmProviderConfig {
+  id: string
+  name: string
+  kind: string
+  base_url: string
+  api_key: string
+  headers: Record<string, string>
+  vision_models: string[]
+  enabled: boolean
+  timeout_s: number
+}
+
+export interface LlmModel {
+  name: string
+  /** Whether it can be given images. Detected where the provider can be asked. */
+  vision: boolean
+  size: string
+  family: string
 }

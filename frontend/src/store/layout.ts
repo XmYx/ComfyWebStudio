@@ -41,7 +41,7 @@ export interface Clipboard {
  */
 export type WidgetId =
   | 'shots' | 'workflows' | 'assets' | 'canvas' | 'inspector' | 'timeline' | 'monitor' | 'renders'
-  | 'comfy'
+  | 'comfy' | 'storyboard' | 'characters' | 'pipeline'
 
 export interface WidgetState {
   /** Hidden widgets keep their place in the dock tree, so showing one puts it back where it was. */
@@ -66,6 +66,9 @@ export const DEFAULT_WIDGETS: Record<WidgetId, WidgetState> = {
   renders: { visible: false, floating: false, rect: { x: 740, y: 200, w: 340, h: 300 } },
   // Off by default: it loads a whole second application, and nobody wants that until they ask for it.
   comfy: { visible: false, floating: false, rect: { x: 240, y: 140, w: 1100, h: 700 }, noScroll: true },
+  storyboard: { visible: false, floating: false, rect: { x: 200, y: 120, w: 640, h: 700 } },
+  characters: { visible: false, floating: false, rect: { x: 260, y: 160, w: 360, h: 520 } },
+  pipeline: { visible: false, floating: false, rect: { x: 300, y: 140, w: 480, h: 640 } },
 }
 
 /**
@@ -76,7 +79,7 @@ export const DEFAULT_WIDGETS: Record<WidgetId, WidgetState> = {
  * panel can be docked left while editing and along the bottom while cutting without either fighting the
  * other. Which one is showing follows the route.
  */
-export type WorkspaceId = 'shots' | 'timeline'
+export type WorkspaceId = 'shots' | 'timeline' | 'storyboard'
 
 export interface Workspace {
   widgets: Record<WidgetId, WidgetState>
@@ -109,10 +112,23 @@ const timelineTree = (): DockNode =>
     [0.18, 0.57, 0.25],
   )
 
+/** The premise and the flow on the left, the frames in the middle, the people on the right. */
+const storyboardTree = (): DockNode =>
+  split(
+    'row',
+    [
+      group(['inspector', 'pipeline'], 'inspector'),
+      group(['storyboard'], 'storyboard'),
+      group(['characters', 'assets'], 'characters'),
+    ],
+    [0.28, 0.44, 0.28],
+  )
+
 /** Which panels each workspace opens with. Anything not listed is hidden there. */
 const SHOWN: Record<WorkspaceId, WidgetId[]> = {
   shots: ['shots', 'workflows', 'assets', 'canvas', 'inspector'],
   timeline: ['shots', 'assets', 'timeline', 'monitor', 'inspector', 'renders'],
+  storyboard: ['inspector', 'pipeline', 'storyboard', 'characters', 'assets'],
 }
 
 function defaultWorkspace(id: WorkspaceId): Workspace {
@@ -122,7 +138,7 @@ function defaultWorkspace(id: WorkspaceId): Workspace {
   }
   return {
     widgets,
-    tree: id === 'timeline' ? timelineTree() : shotsTree(),
+    tree: id === 'timeline' ? timelineTree() : id === 'storyboard' ? storyboardTree() : shotsTree(),
     maximized: null,
   }
 }
@@ -130,6 +146,7 @@ function defaultWorkspace(id: WorkspaceId): Workspace {
 export const defaultWorkspaces = (): Record<WorkspaceId, Workspace> => ({
   shots: defaultWorkspace('shots'),
   timeline: defaultWorkspace('timeline'),
+  storyboard: defaultWorkspace('storyboard'),
 })
 
 export const WIDGET_LABELS: Record<WidgetId, string> = {
@@ -142,6 +159,9 @@ export const WIDGET_LABELS: Record<WidgetId, string> = {
   monitor: 'Monitor',
   renders: 'Renders',
   comfy: 'ComfyUI',
+  storyboard: 'Frames',
+  characters: 'Characters',
+  pipeline: 'Flow',
 }
 
 interface LayoutState {
@@ -324,7 +344,8 @@ export const useLayout = create<LayoutState>()(
     {
       name: 'comfywebstudio.layout',
       // 5: one layout became one per workspace, so anything older has nothing to restore into.
-      version: 5,
+      // 6: a third workspace, so a stored pair has nothing to restore the new one from.
+      version: 6,
       // Only the panel preferences are worth remembering; a stale dialog or a dangling canvas handle
       // from a previous session would be actively wrong. Which workspace was last on screen is not
       // remembered either — the route decides that.

@@ -9,10 +9,16 @@ import {
   Select, Spinner, TextInput, cx, useToast,
 } from '@/components/ui'
 
-type Section = 'backends' | 'paths' | 'execution' | 'render' | 'preview' | 'ui'
+type Section =
+  | 'backends' | 'models' | 'flow' | 'paths' | 'execution' | 'render' | 'preview' | 'ui'
+
+import { LlmSettings } from './LlmSettings'
+import { PipelineSettings } from './PipelineSettings'
 
 const SECTIONS: Array<[Section, string]> = [
   ['backends', 'ComfyUI backends'],
+  ['models', 'Language models'],
+  ['flow', 'Storyboard flow'],
   ['paths', 'Paths'],
   ['execution', 'Execution'],
   ['render', 'Render'],
@@ -62,6 +68,13 @@ export function SettingsPage() {
 
       <div className="min-h-0 overflow-y-auto">
         {section === 'backends' && <BackendsSection settings={settings} />}
+        {section === 'models' && (
+          <LlmSettings
+            settings={settings}
+            onChanged={() => queryClient.invalidateQueries({ queryKey: ['settings'] })}
+          />
+        )}
+        {section === 'flow' && <PipelineSettings />}
         {section === 'paths' && <PathsSection settings={settings} onSave={save.mutate} />}
         {section === 'execution' && <ExecutionSection settings={settings} onSave={save.mutate} />}
         {section === 'render' && <RenderSection settings={settings} onSave={save.mutate} />}

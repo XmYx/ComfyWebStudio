@@ -33,6 +33,11 @@ cd frontend && npm run typecheck && npx vitest run
 | `scripts/ui_timeline.py` | the timeline workspace docks, shots drop onto it, audio draws and plays | a running app |
 | `scripts/ui_open_in_comfy.py` | opening a workflow lands on a *named, saved* ComfyUI workflow | app + real ComfyUI |
 | `scripts/ui_bridge_binding.py` | each ComfyUI workflow syncs back only to its own step | app + real ComfyUI |
+| `tests/test_storyboard.py` | writing, describing, characters, stills, frames→shots, reference-input flagging, schema-constrained decoding | a scripted model |
+| `scripts/ui_storyboard.py` | the model pickers offer only models that can see, frames render and edits persist, drawing puts the pictures on the frames and varying one leaves the rest alone, a frame becomes a wired shot, and the Flow panel edits, resets and records | app + real ComfyUI |
+| `tests/test_pipeline.py` | the prompt renderer — tokens, optional blocks, literal JSON left alone, unknown tokens reported — and schema generation from output fields | nothing |
+| `tests/test_pipeline_builtin.py` | the built-in steps reproduce the prompts and schemas they replaced, and overlay resolution: board over app over built-in | nothing |
+| `tests/test_pipeline_api.py` | editing a step reaches the model, the transcript records what was sent, the whole flow runs in order, custom fields land | a scripted model |
 
 The fake ComfyUI (`tests/fixtures/fake_comfy.py`) replays ComfyUI 0.24.1's real event ordering, including
 the detail the runner depends on: `execution_success` arrives *before* history is written, and the
@@ -177,6 +182,77 @@ afterwards, so they are repeatable and never touch your real work.
 - [ ] Right-clicking a shot offers its own version history, including edits to the steps inside it.
 - [ ] History survives restarting the server.
 
+### Bindings and staying in step with ComfyUI
+- [ ] Choosing the text-to-image workflow, its prompt, the image-to-video workflow, *its* prompt and the
+      starting image one after another keeps all five — none reverts to blank.
+- [ ] The **Its prompt** pickers list only text parameters; a seed or a width is not offered.
+- [ ] With no motion prompt parameter chosen, the setup panel warns, and **Make the shot** on a frame that
+      has a motion prompt is refused rather than building a shot that ignores it.
+- [ ] A frame with no motion prompt still builds a shot when no prompt parameter is chosen — there is
+      nothing to lose.
+- [ ] Change a checkpoint in ComfyUI and press <kbd>Ctrl</kbd>+<kbd>S</kbd> there, then place that workflow
+      on a shot canvas: the step runs the *new* checkpoint without anything being re-imported.
+- [ ] The same holds for a storyboard: drawing and making shots re-read the bound workflow first.
+- [ ] With ComfyUI stopped, placing a step still works and uses the stored copy.
+- [ ] A value set by hand on a step survives that re-read; one that merely matched the old default follows
+      the new one.
+
+### The storyboard flow
+*Needs a language model. Ollama on `127.0.0.1:11434` is the quick path.*
+
+- [ ] **Flow** lists every step in order, saying which asks a model and which runs a workflow.
+- [ ] Opening a step shows its system prompt, its prompt and its output fields — the real ones, not a
+      summary.
+- [ ] The token palette lists tokens *with their current values*; typing `{frame.nonsense}` is flagged.
+- [ ] Editing a system prompt and running the step sends the edited text — check **What was sent**, not
+      just that it saved.
+- [ ] An edited step is marked *edited*; the others still say they follow the defaults.
+- [ ] **Reset to default** restores the built-in wording and clears the mark.
+- [ ] Adding an output field with *somewhere of my own* puts the answer on the frame and makes
+      `{frame.fields.<name>}` available to later steps.
+- [ ] A field name that would not work as a token is refused, with a reason.
+- [ ] Pointing an output at something structural (`frame.asset_id`) is refused.
+- [ ] A board-scoped step cannot be pointed at a frame field.
+- [ ] **Run the flow** runs the steps in order and *waits for the drawing* before the looking step — the
+      looking step's transcript entry should say it saw an image.
+- [ ] A step that fails stops the flow, and the reason is on both the flow and the transcript entry.
+- [ ] A second **Run the flow** on the same board is refused while one is running.
+- [ ] **Settings ▸ Storyboard flow** changes the default for boards that have not overridden that step,
+      and does *not* touch one that has.
+- [ ] Changing a language model on the Settings page does not wipe the flow edits.
+- [ ] The transcript survives a reload, and **Clear** empties it.
+
+### Storyboards
+
+- [ ] **Settings ▸ Language models** with nothing configured offers one-click Ollama, and finds its models.
+- [ ] The **Looks at the frames** list contains only models the provider reports as vision-capable — not
+      every installed model, and not one merely *named* like a vision model.
+- [ ] With no vision model installed, the panel says so and points at the library below.
+- [ ] **Pull** on a library entry shows live progress, and on completion the row flips to *installed*, the
+      model appears in the pickers, and a vision one appears in the vision picker.
+- [ ] A name typed into the free-text field pulls too; a name that does not exist reports Ollama's own error
+      rather than hanging.
+- [ ] **Write** on a premise returns the asked-for number of frames, each with action, camera, image prompt
+      and shot prompt as *prose* — never a nested object, never a field name echoed as its own value.
+- [ ] **Suggest** names the characters in the premise; attaching one to a frame carries its appearance.
+- [ ] **Draw all** renders every frame, and each picture appears on its frame as that frame finishes —
+      without anything being kept first. A bar above the strip counts the frames off; **Stop** cancels.
+- [ ] Each frame shows its own percentage while it is drawing, and a failed frame says why on the card.
+- [ ] **Redraw** on one frame runs only that frame; the other frames keep the pictures they had.
+- [ ] **↻ Vary** on a frame comes back *different*. With a drawing workflow that exposes no `WS Seed Input`,
+      it says so rather than pretending.
+- [ ] Dragging an image from **Assets** onto a frame's thumbnail makes it that frame's picture; **Redraw**
+      then takes it back to a drawn still. Neither has to be cleared first.
+- [ ] **Keep** puts the still in the asset library, and goes quiet once there is nothing new to keep.
+- [ ] **Describe** rewrites the prompts from what is *actually* in the generated frame. The motion prompt
+      describes motion and is never blank.
+- [ ] **Make the shot** creates a shot from the picture the frame is *showing* — vary a frame, then make its
+      shot, and it is the variation that is wired in — with the shot prompt on the text input of the chosen
+      image-to-video workflow. A still nobody kept is kept on the way through.
+- [ ] Choosing reference inputs on a workflow that has none is *flagged*, not dropped: the assignment
+      survives, and applies once a workflow that takes them is selected.
+- [ ] Pull progress is visible from the Settings page — i.e. the event stream is connected outside a project.
+
 ### Settings
 - [ ] **Test** reports ComfyUI version, GPU and node-pack status.
 - [ ] For a local backend without the pack, **Install** creates the symlink and says a restart is needed.
@@ -195,3 +271,18 @@ afterwards, so they are repeatable and never touch your real work.
   for it. Run results are never affected by a restore — they live in `runs/` and are append-only.
 - **Plugins contain content, not code.** A plugin can carry workflows and shot templates; it deliberately
   cannot execute anything, so installing one someone sent you is safe.
+- **Small vision models drift.** Answers are constrained to a JSON schema, which fixes the *shape* — the
+  right keys, strings where sentences were asked for. It cannot make a 3B model observant. Every described
+  field is editable, `describe` can be re-run, and its prompt can be rewritten in the Flow panel.
+- **The flow is a sequence, not a graph.** Steps run in order, each either once or once per frame. There is
+  no branching and no looping; the one conditional the built-ins need — asking again for a field that came
+  back blank — is a property of the step rather than a control structure.
+- **A step's order is not validated.** Describing before anything has been drawn is a mistake the app lets
+  you make and then reports, in the same spirit as a workflow bound to the wrong parameter.
+- **Syncing from ComfyUI is best effort.** A workflow is re-read before it is placed or used, but an
+  unreachable ComfyUI is not a refusal — the stored copy is used and the work proceeds. It also only
+  applies to workflows we know a path for: one imported by dropping a `.json` in has no file to re-read.
+- **The transcript is capped** at 200 exchanges per board, with each prompt and reply cut at 8 KB. It lives
+  in `<project>/stage_runs/` and is excluded from an export unless run history is included.
+- **Pulling models is Ollama-only.** An OpenAI-compatible server serves whatever it was started with, so
+  the app says that rather than pretending the button will work.

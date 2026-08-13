@@ -21,6 +21,7 @@ from .execution.events import EventBus
 from .execution.orchestrator import Orchestrator
 from .media.store import MediaStore
 from .media.transfer import MediaTransfer
+from .pipeline.driver import PipelineRunner
 from .settings import AppSettings, load_settings, save_settings
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,8 @@ class AppState:
         self.orchestrator = Orchestrator(
             self.store, self.media, self.settings, self.events, self.backends.get, self.templates
         )
+        #: Drives a storyboard's whole flow in the background, since part of it waits on ComfyUI.
+        self.pipelines = PipelineRunner(self)
         #: Tokens handed to the ComfyUI bridge extension, mapped to the step they may write to.
         self.bridge_tokens: dict[str, dict[str, str]] = {}
 
@@ -134,9 +137,20 @@ class AppState:
                 logger.warning("Backend %s not available at startup: %s", config.name, exc)
 
     async def shutdown(self) -> None:
+        await self.pipelines.shutdown()
         await self.orchestrator.shutdown()
         await self.backends.close()
         await self.events.close()
+
+    async def sync_workflow(self, project, workflow, *, backend_id: str | None = None) -> bool:
+        """Bring our copy of a workflow up to date with ComfyUI's before it is used.
+
+        Lives here so that both a request handler and the background pipeline can ask for it without the
+        pipeline having to import the API layer. Best effort — see `api.workflows.sync_workflow`.
+        """
+        from .api.workflows import sync_workflow
+
+        return await sync_workflow(self, project, workflow, backend_id=backend_id)
 
     def save_settings(self) -> None:
         save_settings(self.settings)

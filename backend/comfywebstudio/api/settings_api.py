@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..core.errors import NotFound, ValidationFailed
 from ..core.ids import new_id
+from ..core.pipeline import Stage
+from ..pipeline import sinks
+from ..pipeline.builtin import builtin_pipeline
+from ..pipeline.resolve import overlay_with, overlay_without, resolve, stage_is_stale
 from ..settings import (
     AppSettings,
     ComfyBackendConfig,
     ExecutionSettings,
+    LlmProviderConfig,
     PreviewSettings,
     RenderSettings,
+    StorySettings,
     UISettings,
     corrupt_settings_notices,
 )
@@ -37,6 +44,7 @@ class UpdateSettingsRequest(BaseModel):
     render: RenderSettings | None = None
     preview: PreviewSettings | None = None
     ui: UISettings | None = None
+    story: StorySettings | None = None
     default_backend_id: str | None = None
 
 
@@ -78,9 +86,16 @@ def update_settings(state: StateDep, body: UpdateSettingsRequest) -> AppSettings
             raise ValidationFailed(f"Cannot use {candidate} as the projects directory: {exc}") from exc
         settings.projects_dir = candidate
 
+    # A whole sub-model is replaced, not merged — which is a trap for exactly one field. The storyboard
+    # pipeline lives on `story` but is edited through its own routes, so a client PATCHing story to change
+    # a model would wipe every prompt edit on the install. Carrying it over means the client cannot lose
+    # what it never knew it was holding.
+    if body.story is not None and body.story.pipeline is None:
+        body.story.pipeline = settings.story.pipeline
+
     # Assign the validated sub-models themselves, not their dumped dicts, so the settings object keeps
     # its types and re-serialises correctly.
-    for field in ("cors_origins", "execution", "render", "preview", "ui", "default_backend_id"):
+    for field in ("cors_origins", "execution", "render", "preview", "ui", "story", "default_backend_id"):
         value = getattr(body, field)
         if value is not None:
             setattr(settings, field, value)
@@ -211,3 +226,212 @@ def _validate_backend(config: ComfyBackendConfig) -> None:
                 f"{root} does not look like a ComfyUI installation (no main.py). Leave the path empty "
                 "to talk to it over HTTP only."
             )
+
+
+# -- language models -------------------------------------------------------------------------------------
+
+
+class LlmProviderRequest(BaseModel):
+    name: str = "Ollama"
+    kind: str = "ollama"
+    base_url: str = "http://127.0.0.1:11434"
+    api_key: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
+    vision_models: list[str] = Field(default_factory=list)
+    enabled: bool = True
+    timeout_s: float = 300.0
+
+
+@router.get("/llm-providers")
+def list_llm_providers(state: StateDep) -> list[LlmProviderConfig]:
+    return state.settings.llm_providers
+
+
+@router.post("/llm-providers", status_code=201)
+def add_llm_provider(state: StateDep, body: LlmProviderRequest) -> LlmProviderConfig:
+    config = LlmProviderConfig(id=new_id("llm", 6), **body.model_dump())
+    state.settings.llm_providers.append(config)
+    # The first one added becomes the one the storyboard tools use, so a fresh install works after one
+    # form rather than after a form and a separate choice.
+    if state.settings.story.provider_id is None:
+        state.settings.story.provider_id = config.id
+    state.save_settings()
+    return config
+
+
+@router.patch("/llm-providers/{provider_id}")
+def update_llm_provider(
+    state: StateDep, provider_id: str, body: LlmProviderRequest
+) -> LlmProviderConfig:
+    if not any(p.id == provider_id for p in state.settings.llm_providers):
+        raise NotFound(f"No language-model provider {provider_id!r}")
+    updated = LlmProviderConfig(id=provider_id, **body.model_dump())
+    state.settings.llm_providers = [
+        updated if p.id == provider_id else p for p in state.settings.llm_providers
+    ]
+    state.save_settings()
+    return updated
+
+
+@router.delete("/llm-providers/{provider_id}", status_code=204)
+def delete_llm_provider(state: StateDep, provider_id: str) -> None:
+    remaining = [p for p in state.settings.llm_providers if p.id != provider_id]
+    if len(remaining) == len(state.settings.llm_providers):
+        raise NotFound(f"No language-model provider {provider_id!r}")
+    state.settings.llm_providers = remaining
+    story = state.settings.story
+    if story.provider_id == provider_id:
+        story.provider_id = remaining[0].id if remaining else None
+    if story.vision_provider_id == provider_id:
+        story.vision_provider_id = None
+    state.save_settings()
+
+
+@router.get("/llm-providers/{provider_id}/models")
+async def list_llm_models(state: StateDep, provider_id: str) -> dict:
+    """What this provider can run, and which of those can be given an image.
+
+    The vision flag is what the storyboard's describe step depends on, so it is reported per model rather
+    than left to the user to remember — sending a picture to a text-only model produces a confident
+    description of nothing.
+    """
+    from ..llm.provider import LlmError, create_provider
+
+    config = next((p for p in state.settings.llm_providers if p.id == provider_id), None)
+    if config is None:
+        raise NotFound(f"No language-model provider {provider_id!r}")
+
+    provider = create_provider(config)
+    try:
+        models = await provider.models()
+    except LlmError as exc:
+        raise ValidationFailed(str(exc)) from exc
+    finally:
+        await provider.close()
+
+    return {
+        "provider_id": provider_id,
+        "models": [m.as_dict() for m in models],
+        "vision_available": any(m.vision for m in models),
+    }
+
+
+# -- the storyboard flow, for everyone using this install ------------------------------------------------
+
+
+@router.get("/pipeline")
+def get_app_pipeline(state: StateDep) -> dict:
+    """The defaults every storyboard starts from, and what the built-ins say."""
+    pipeline = resolve(state.settings, None)
+    edited = (state.settings.story.pipeline.stages if state.settings.story.pipeline else {}) or {}
+    return {
+        "pipeline": pipeline.model_dump(mode="json"),
+        "stages": [
+            {
+                **stage.model_dump(mode="json"),
+                "edited": stage.id in edited,
+                "stale": stage_is_stale(stage),
+                "writable": sinks.destinations(scope=stage.scope),
+            }
+            for stage in pipeline.stages
+        ],
+        "builtin": builtin_pipeline().model_dump(mode="json"),
+        "kinds": sorted({s.kind for s in builtin_pipeline().stages} | {Stage().kind}),
+    }
+
+
+@router.put("/pipeline/stages/{stage_id}")
+def put_app_stage(state: StateDep, stage_id: str, body: Stage) -> dict:
+    """Change a stage for every storyboard that has not overridden it itself."""
+    if body.id != stage_id:
+        raise ValidationFailed(f"That is step {body.id!r}, but the address says {stage_id!r}.")
+    for output in body.outputs:
+        sinks.check(output.writes, scope=body.scope)
+
+    state.settings.story.pipeline = overlay_with(state.settings.story.pipeline, body)
+    state.save_settings()
+    state.events.emit("settings.changed", data={"scope": "pipeline"})
+    return get_app_pipeline(state)
+
+
+@router.delete("/pipeline/stages/{stage_id}")
+def reset_app_stage(state: StateDep, stage_id: str) -> dict:
+    state.settings.story.pipeline = overlay_without(state.settings.story.pipeline, stage_id)
+    state.save_settings()
+    state.events.emit("settings.changed", data={"scope": "pipeline"})
+    return get_app_pipeline(state)
+
+
+@router.delete("/pipeline")
+def reset_app_pipeline(state: StateDep) -> dict:
+    """Back to the built-ins, for everyone. Boards keep whatever they overrode themselves."""
+    state.settings.story.pipeline = None
+    state.save_settings()
+    state.events.emit("settings.changed", data={"scope": "pipeline"})
+    return get_app_pipeline(state)
+
+
+@router.get("/llm-library")
+def llm_library() -> list[dict]:
+    """Models worth suggesting, for the ones you have not got yet.
+
+    A maintained shelf rather than a catalogue: Ollama publishes no API for browsing its library, so this
+    is a hand-picked list — which is exactly why the UI also accepts any name typed in.
+    """
+    from ..llm.provider import MODEL_LIBRARY
+
+    return [entry.as_dict() for entry in MODEL_LIBRARY]
+
+
+class PullModelRequest(BaseModel):
+    model: str
+
+
+@router.post("/llm-providers/{provider_id}/pull", status_code=202)
+async def pull_llm_model(state: StateDep, provider_id: str, body: PullModelRequest) -> dict:
+    """Start downloading a model, and report progress on the event bus.
+
+    Returns immediately: a six-gigabyte download is not something to hold a request open for. Progress
+    arrives as ``llm.pull`` events, the same way a run or a render reports itself.
+    """
+    from ..llm.provider import LlmError, create_provider
+
+    config = next((p for p in state.settings.llm_providers if p.id == provider_id), None)
+    if config is None:
+        raise NotFound(f"No language-model provider {provider_id!r}")
+    model = body.model.strip()
+    if not model:
+        raise ValidationFailed("Which model?")
+
+    provider = create_provider(config)
+
+    async def run() -> None:
+        def report(status: str, fraction: float, done: int, total: int) -> None:
+            state.events.emit(
+                "llm.pull",
+                data={
+                    "provider_id": provider_id, "model": model, "status": status,
+                    "progress": round(fraction, 4), "done": done, "total": total,
+                },
+            )
+
+        try:
+            await provider.pull(model, on_progress=report)
+            state.events.emit(
+                "llm.pull",
+                data={"provider_id": provider_id, "model": model, "status": "ready",
+                      "progress": 1.0, "done": 0, "total": 0, "finished": True},
+            )
+            logger.info("Pulled language model %s", model)
+        except LlmError as exc:
+            state.events.emit(
+                "llm.pull",
+                data={"provider_id": provider_id, "model": model, "status": "failed",
+                      "error": str(exc), "finished": True},
+            )
+            logger.warning("Could not pull %s: %s", model, exc)
+        finally:
+            await provider.close()
+
+    asyncio.create_task(run(), name=f"llm-pull:{model}")
+    return {"started": True, "model": model}

@@ -22,6 +22,7 @@ from ..core.models import (
 )
 from ..core.template_capture import templates_for
 from .deps import ProjectDep, ShotDep, StateDep, find_step
+from .workflows import sync_workflow
 
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["shots"])
 
@@ -137,6 +138,12 @@ def delete_shot(state: StateDep, project: ProjectDep, shot_id: str) -> None:
     for track in project.timeline.tracks:
         track.clips = [c for c in track.clips if c.source.shot_id != shot_id]
 
+    # And the storyboard frame that made it, for the same reason: left pointing at a shot that is gone, it
+    # refuses to build another one and reports itself as finished.
+    for board in project.storyboards:
+        if board.forget_shot(shot_id):
+            board.touch()
+
     state.store.save(project)
     state.events.emit("project.changed", project_id=project.id, data={"action": "shot_deleted"})
 
@@ -183,12 +190,17 @@ def duplicate_shot(state: StateDep, project: ProjectDep, shot: ShotDep) -> Shot:
 
 
 @router.post("/shots/{shot_id}/steps", status_code=201)
-def create_step(
+async def create_step(
     state: StateDep, project: ProjectDep, shot: ShotDep, body: CreateStepRequest
 ) -> Step:
     workflow = project.workflow(body.workflow_id)
     if workflow is None:
         raise NotFound(f"No workflow {body.workflow_id!r} in this project")
+
+    # Placing a workflow is the moment its defaults start mattering, so this is the moment to check they
+    # are still the ones ComfyUI has. Saving there tells nobody, and a step placed against a stale copy
+    # runs last month's checkpoint without anything saying so. Best effort: unreachable is not a refusal.
+    await sync_workflow(state, project, workflow)
 
     step = Step(
         name=body.name or workflow.name,

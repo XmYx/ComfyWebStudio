@@ -23,10 +23,11 @@ Everything below is the app as it actually behaves; the screenshots are generate
 5. [Running things](#running-things)
 6. [Editing a workflow in ComfyUI](#editing-a-workflow-in-comfyui)
 7. [Reusing work](#reusing-work)
-8. [Timeline and rendering](#timeline-and-rendering)
-9. [Projects, plugins and history](#projects-plugins-and-history)
-10. [Settings](#settings)
-11. [When something looks wrong](#when-something-looks-wrong)
+8. [Storyboards](#storyboards)
+9. [Timeline and rendering](#timeline-and-rendering)
+10. [Projects, plugins and history](#projects-plugins-and-history)
+11. [Settings](#settings)
+12. [When something looks wrong](#when-something-looks-wrong)
 
 ---
 
@@ -188,6 +189,145 @@ and flag themselves when it moves on, with **update** to catch up.
 
 ---
 
+## Storyboards
+
+![The storyboard workspace](images/storyboard.png)
+
+A storyboard turns a premise into a sequence of frames, draws each one, and then turns the frames into
+shots. It is the fast way from *an idea* to *a folder of shots wired to a workflow* — the parts you would
+otherwise do by hand, repeatedly, at four in the morning.
+
+It needs a language model. Point it at one first, under **Settings ▸ Language models**; see
+[Settings](#settings) below.
+
+**1. Write.** Type a premise, say how many shots, press **Write**. Each frame comes back with four things
+kept deliberately separate, because they are read by different things:
+
+| Field | Who reads it | What it is |
+|---|---|---|
+| **Action** | you | what happens, in prose |
+| **Camera** | you | the framing, in shorthand |
+| **Image prompt** | the text-to-image workflow | one frozen moment, never motion |
+| **Shot prompt** | the image-to-video workflow | motion only, never the scene again |
+
+Everything is editable. The model writes a first draft, not a contract — rewrite any field, reorder frames
+by dragging, add or delete them.
+
+**2. Characters.** **Suggest** reads the premise and names whoever recurs, each with an *appearance* written
+for an image generator so the same face survives from frame to frame. Give a character a reference image and
+it can be fed to workflows that accept one. Characters are attached per frame, so only the ones actually in
+a shot are sent.
+
+**3. Draw.** Pick a text-to-image template and which of its inputs is the prompt, then **Draw all** renders
+every frame. Each picture appears on its frame as that frame finishes — nothing to press first — with a
+percentage across the thumbnail while it is being drawn and a bar above the strip for the board as a whole:
+how many of the frames are done, and **Stop** if it is going wrong.
+
+Drawing is the part you go round twice. Per frame:
+
+| Button | What it does |
+|---|---|
+| **Redraw** | draws this frame again, alone, from its prompt — rewrite the prompt and press it |
+| **↻ Vary** | the same prompt, a new seed: a different take on the frame that is already there |
+| **Keep** | promotes the picture into the project's asset library, so it can be used anywhere else |
+| **Look** | see step 4 |
+| **Make the shot** | see step 5 |
+
+**↻ Vary** needs the workflow's seed exposed as a ComfyWebStudio input (`WS Seed Input`); without one there
+is nothing to vary, and the app says so rather than handing back the same picture and calling it a reroll.
+
+A workflow is re-read from ComfyUI each time it is used, so the checkpoint, sampler and LoRA it draws with
+are the ones ComfyUI has *now* — pressing <kbd>Ctrl</kbd>+<kbd>S</kbd> there is enough, and nothing needs
+re-importing. If ComfyUI is unreachable at that moment the copy already stored is used and the run goes
+ahead; only a value you never chose here can change underneath you, because a value you *did* set stays.
+
+You can also drag an image from the **Assets** panel onto a frame's thumbnail — a photograph, a plate, a
+frame grabbed from something else are all perfectly good starting images, and a frame is not obliged to draw
+its own. Whichever picture is newer, drawn or dropped, is the one the frame shows and the one everything
+downstream uses. Neither has to be cleared to use the other.
+
+**4. Describe.** This is the step that earns its keep. A vision model *looks* at the frame that was actually
+generated — not the one that was asked for — and rewrites the image and shot prompts from what is really
+there. The generator makes its own choices about faces, clothing and light; describing the real frame is
+what stops the motion prompt talking about a picture nobody will see.
+
+**5. Make shots.** Pick an image-to-video workflow and which inputs take the image and the prompt, and each
+frame becomes a shot: the still and the motion prompt arrive as **nodes on the shot's canvas**, wired into
+the inputs you chose. They are ordinary value nodes, so you can read them at a glance, edit either without
+opening the workflow, and wire the same prompt into a second step rather than retyping it.
+
+Deleting a shot releases the frame that made it, so **Make the shot** offers itself again. Whatever picture the frame is showing is what gets wired in — a frame drawn and
+varied four times animates the fourth — and it is kept as an asset on the way through, so there is no
+bookkeeping step to remember.
+
+### Reference images
+
+Some workflows take extra reference images — a character sheet, a style plate. Choose those inputs on the
+setup panel and the storyboard fills them in per frame from the characters attached to it.
+
+If the workflow you picked has no such inputs, the panel says so rather than silently dropping them: the
+assignment is kept, flagged, and applied the moment you select a workflow that can take them. Nothing is
+lost by setting it up first.
+
+### Changing how it works
+
+![The flow](images/storyboard-flow.png)
+
+Everything above is a **step**, and the **Flow** panel is the list of them. Nothing about the built-in six
+is privileged: you can read what each one asks, change the wording, add your own, turn one off, or run one
+on its own.
+
+| | |
+|---|---|
+| **Run** | runs that step alone — the same as the buttons on the frames, from the other direction |
+| **Skip** | leaves the step out, here and when the whole flow runs |
+| **Run the flow** | runs them in order, waiting for the drawing to finish before looking at it |
+
+Clicking a step's name opens it.
+
+![A step, opened up](images/storyboard-stage.png)
+
+**The prompts are text with `{tokens}` in them.** The palette at the bottom lists every token with *what it
+is currently worth*, because the question when writing a prompt is rarely whether `board.premise` exists and
+usually what is in it. A token that will not resolve is called out as you type, and if you send it anyway it
+arrives at the model verbatim rather than vanishing — a typo should be visible, not silently delete an
+instruction.
+
+`[[double brackets]]` mark a piece that disappears when the tokens inside it are empty, which is how
+`[[ASPECT: {board.aspect}]]` leaves no dangling heading on a board that has no aspect set.
+
+**What to ask for** is the shape of the answer. Each row is one field — its name, its type, whether the
+model must answer it, and where the answer goes. The JSON Schema that constrains the model is generated
+from this, so a model cannot reply with the wrong keys or hand back an object where a sentence was asked
+for. Pick *somewhere of my own* as the destination to invent a field: name it `wardrobe` and it lands on the
+frame and becomes `{frame.fields.wardrobe}` for every later step to use.
+
+Two other things worth knowing:
+
+- **Temperature** left blank follows Settings; filled in, that step alone uses it.
+- **If a field comes back empty** is a follow-up question asked only about the parts that came back blank. A
+  schema can insist a field is *there*; it cannot insist it says anything, and smaller models will satisfy
+  it with `""` and move on.
+
+**Steps are edited per storyboard, over a shared default.** Change a prompt here and only this board sees
+it; the rest keep following **Settings ▸ Storyboard flow**, and pick up any improvement made there.
+**Reset to default** puts one step back. If the built-in changes in a later version, a step you edited says
+so rather than being quietly overwritten.
+
+### Seeing what was actually sent
+
+The **What was sent** tab is the transcript: every exchange, with the rendered system prompt, the rendered
+prompt, the raw reply, and where each part of the answer landed.
+
+It is there because *"the model ignored my instruction"* and *"my instruction never reached the model"* look
+identical from the outside. One is a prompt to rewrite and the other is a token you mistyped, and the only
+way to tell them apart is to read what was sent. A drawing step records the prompts it put into the
+workflow, for the same reason.
+
+The last 200 exchanges per board are kept, and they travel with an export only if you include run history.
+
+---
+
 ## Timeline and rendering
 
 ![The timeline](images/timeline.png)
@@ -278,6 +418,29 @@ producing a gap.
 the fast path (files are linked, never copied); a remote one uploads and downloads over HTTP instead. The
 same project runs against either.
 
+**Language models** — what the [storyboard](#storyboards) uses.
+
+![Language models](images/llm-settings.png)
+
+Ollama on this machine is one click. Anything speaking the OpenAI chat API — vLLM, llama.cpp, LM Studio —
+works too; give it a base URL.
+
+Two models are chosen separately, because they are two different jobs:
+
+- **Writes the shots** — turns a premise into a sequence.
+- **Looks at the frames** — reads a generated still. This list only offers models that can *actually* see:
+  the capability is read from the provider, never guessed from the name, because a text-only model handed
+  an image will not complain — it will confidently describe nothing at all.
+
+If nothing installed can see, **Get another model** pulls one without leaving the app. The shelf is short and
+opinionated (`qwen2.5vl` is the usual choice; `moondream` runs on very little), and any other name can be
+typed in. Progress reports itself the same way a render does, and the model is selectable the moment it lands.
+
+**Storyboard flow** — the steps every new storyboard starts with, and the wording they use. The same editor
+the [Flow panel](#changing-how-it-works) uses, one layer down: change a prompt here and every board that has
+not overridden that step picks it up. A board that *has* keeps its own version, because improving the house
+prompt should not undo somebody's careful rewrite.
+
 Also here: where projects and assets live, execution limits and caching, render defaults, preview quality,
 and the theme.
 
@@ -293,6 +456,16 @@ and the theme.
 | A parameter you changed in ComfyUI is not showing | That step has a value of its own, which wins. Clear it on the step to follow ComfyUI again. |
 | **Open in ComfyUI** warns about syncing | ComfyUI is reachable but the node pack is not answering, so saving there will not come back. |
 | A link disappeared after a sync | The port it used no longer exists in the workflow. The toast says which. |
+| **Looks at the frames** is empty | Nothing installed can see. Pull a vision model from Settings ▸ Language models. |
+| *"Could not reach Ollama"* | It is not running, or not on the URL configured. `ollama serve` and try **Test**. |
+| A described frame reads oddly | Small vision models drift. Every field is editable, and **Describe** can be run again. If it is consistently wrong, edit that step's prompt in the **Flow** panel. |
+| A step did not do what its prompt says | Open **Flow ▸ What was sent** and read the prompt that actually went. An unresolved `{token}` arrives verbatim, which is usually the answer. |
+| A step says its **default moved on** | The built-in wording changed in a newer version and yours did not. Reset it to take the new one, or leave it — nothing overwrites your version. |
+| *"no parameter … is set to receive it"* on **Make the shot** | The frame has a motion prompt and the image-to-video workflow has nowhere to put it. Pick one under **Its prompt**; the setup panel warns about this before you get that far. |
+| A step is running an old checkpoint or sampler | It should not: a workflow is re-read from ComfyUI whenever it is placed or used. If ComfyUI was unreachable at that moment the stored copy is used instead — **Sync from ComfyUI** in the workflow library forces it. |
+| The storyboard flags a reference input | The workflow you chose has no input for it. The assignment is kept; pick a workflow that takes one. |
+| **↻ Vary** returns the same picture | The drawing workflow exposes no seed, so there is nothing to vary. Add a `WS Seed Input` to it in ComfyUI. |
+| A frame still shows an older picture | The picture shown is whichever is newer, drawn or dropped in. **Redraw** it, or drop the image you want onto it. |
 
 `docs/VERIFY.md` lists every automated suite and a manual checklist; `docs/ARCHITECTURE.md` explains how
 the pieces fit together.

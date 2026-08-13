@@ -81,7 +81,37 @@ def build_demo(url: str) -> tuple[str, str, str]:
     # A second shot, so nesting and the timeline have something to show.
     reuse = _api(url, f"/api/projects/{pid}/shots", {"name": "Reuse"}, "POST")
     _api(url, f"/api/projects/{pid}/timeline/from-shots", None, "POST")
+
+    # A storyboard, written out by hand rather than by a model: the guide's screenshot should look the
+    # same on every machine, and not every machine has Ollama running.
+    board = _api(url, f"/api/projects/{pid}/storyboards",
+                 {"name": "Nightfall", "premise": PREMISE, "style": "muted, hand-painted, cool light"},
+                 "POST")
+    for spec in STORY_FRAMES:
+        frame = _api(url, f"/api/projects/{pid}/storyboards/{board['id']}/frames", None, "POST")
+        _api(url, f"/api/projects/{pid}/storyboards/{board['id']}/frames/{frame['id']}", spec, "PATCH")
     return pid, shot["id"], reuse["id"]
+
+
+PREMISE = (
+    "A lighthouse keeper works her last night on the rock. Out at sea, a light she does not recognise "
+    "answers hers, three times, and then stops."
+)
+
+STORY_FRAMES = [
+    {"title": "The last climb", "action": "She carries the lamp oil up the stair for the final time.",
+     "camera": "Low, following her boots.",
+     "image_prompt": "A woman climbing a narrow spiral stair with an oil can, lantern light on wet stone",
+     "shot_prompt": "the camera climbs with her; the lantern swings"},
+    {"title": "The beam", "action": "The light turns and reaches out across the water.",
+     "camera": "Wide, static.",
+     "image_prompt": "A lighthouse beam sweeping over a dark sea, cold blue night, low horizon",
+     "shot_prompt": "the beam sweeps left to right; the sea moves beneath it"},
+    {"title": "The answer", "action": "Far out, a second light blinks three times.",
+     "camera": "Close on her face, then her eyeline.",
+     "image_prompt": "A woman's face lit from one side at a window, dark sea behind her",
+     "shot_prompt": "she turns towards the window; slow push in"},
+]
 
 
 def shoot(page, out: Path, name: str) -> None:
@@ -140,10 +170,30 @@ def main() -> int:
             page.wait_for_timeout(1500)
             shoot(page, out, "timeline")
 
+            print("Storyboard")
+            reset_layout(page, args.url, pid, tab="storyboard")
+            page.wait_for_timeout(1800)
+            shoot(page, out, "storyboard")
+
+            print("The flow")
+            page.locator("button:text-is('Flow')").first.click()
+            page.wait_for_timeout(1000)
+            shoot(page, out, "storyboard-flow")
+
+            print("A step, opened up")
+            page.get_by_text("Look at the frame", exact=True).first.click()
+            page.wait_for_timeout(900)
+            shoot(page, out, "storyboard-stage")
+
             print("Settings")
             page.goto(f"{args.url}/settings", wait_until="networkidle")
             page.wait_for_timeout(1500)
             shoot(page, out, "settings")
+
+            print("Language models")
+            page.get_by_role("button", name="Language models").click()
+            page.wait_for_timeout(1500)
+            shoot(page, out, "llm-settings")
 
             print("Nested shot")
             reset_layout(page, args.url, pid)

@@ -133,6 +133,26 @@ class Orchestrator:
         task.cancel()
         return True
 
+    async def wait(self, run_id: str) -> Run | None:
+        """Block until this run reaches a terminal state, and hand back what it reached.
+
+        There is no completion callback anywhere in this codebase, and this is why there does not need to
+        be one: whatever wants to act on a finished run can simply await it. By the time this returns the
+        run's history has been written, so a caller reading artifacts off disk will see them.
+
+        Two details it has to get right. A run that has already finished has **removed its own task** —
+        ``_drive`` pops it in a ``finally``, before the ``run.finished`` event goes out — so an absent
+        task means finished, not unknown, and the run is still in ``_runs`` to be handed back.
+
+        And it waits rather than awaiting the task outright, so a run that was cancelled comes back *as a
+        cancelled run* instead of raising into the caller. A waiter that receives someone else's
+        ``CancelledError`` looks cancelled itself, which is a hard thing to reason about; a status is not.
+        """
+        task = self._tasks.get(run_id)
+        if task is not None:
+            await asyncio.wait([task])
+        return self._runs.get(run_id)
+
     async def shutdown(self) -> None:
         for task in list(self._tasks.values()):
             task.cancel()

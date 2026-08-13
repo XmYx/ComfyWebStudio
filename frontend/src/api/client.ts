@@ -11,6 +11,10 @@ import type {
   Run, RunMode, Shot, ShotTemplate, Step, StepRun,
   TemplateInstance, TemplateSummary, Timeline, Track, TrackKind, ValueNode, ValueNodeKind,
   Vec2, Version, WorkflowRef,
+  BoardStills, BoardSurfaces, DrawResult, LlmModel, LlmProviderConfig, Storyboard,
+  StoryboardCharacter, StoryboardFrame,
+  AppPipelineView, Pipeline, PipelineRun, PipelineView, Stage, StageRun, StageRunPreview,
+  StageRunResult,
 } from './types'
 
 export class ApiError extends Error {
@@ -306,6 +310,182 @@ export const api = {
       request<PlacedTemplate[]>(`/api/projects/${projectId}/shots/${shotId}/placed`),
   },
 
+  /** Storyboards: writing them, drawing them, and turning them into shots. */
+  storyboards: {
+    list: (projectId: string) =>
+      request<Storyboard[]>(`/api/projects/${projectId}/storyboards`),
+    create: (projectId: string, body: { name?: string; premise?: string; style?: string }) =>
+      request<Storyboard>(`/api/projects/${projectId}/storyboards`, {
+        method: 'POST', body: json(body),
+      }),
+    get: (projectId: string, boardId: string) =>
+      request<Storyboard>(`/api/projects/${projectId}/storyboards/${boardId}`),
+    update: (
+      projectId: string,
+      boardId: string,
+      // `binding` is a partial too: the server merges the fields it is actually given, so a caller
+      // changing one of them need not — and should not — send a copy of the rest.
+      body: Partial<Pick<Storyboard, 'name' | 'premise' | 'style' | 'aspect'>> & {
+        binding?: Partial<Storyboard['binding']>
+      },
+    ) =>
+      request<Storyboard>(`/api/projects/${projectId}/storyboards/${boardId}`, {
+        method: 'PATCH', body: json(body),
+      }),
+    remove: (projectId: string, boardId: string) =>
+      request<void>(`/api/projects/${projectId}/storyboards/${boardId}`, { method: 'DELETE' }),
+
+    /** Break the premise into shots. */
+    write: (projectId: string, boardId: string, body: { frames?: number; append?: boolean }) =>
+      request<Storyboard>(`/api/projects/${projectId}/storyboards/${boardId}/write`, {
+        method: 'POST', body: json(body),
+      }),
+    suggestCharacters: (projectId: string, boardId: string) =>
+      request<StoryboardCharacter[]>(
+        `/api/projects/${projectId}/storyboards/${boardId}/characters/suggest`,
+        { method: 'POST' },
+      ),
+    surfaces: (projectId: string, boardId: string) =>
+      request<BoardSurfaces>(`/api/projects/${projectId}/storyboards/${boardId}/surfaces`),
+
+    /** Make sure every frame has a step that would draw it. */
+    buildStills: (projectId: string, boardId: string) =>
+      request<{ shot_id: string; steps: Record<string, string | null>; workflow: string }>(
+        `/api/projects/${projectId}/storyboards/${boardId}/stills`, { method: 'POST' },
+      ),
+    /** Every frame's current picture and the step that draws it — what the strip shows without capturing. */
+    stills: (projectId: string, boardId: string) =>
+      request<BoardStills>(`/api/projects/${projectId}/storyboards/${boardId}/stills`),
+    /**
+     * Draw frames and run them. No `frame_ids` means the whole board; `reroll` asks for a different
+     * picture rather than the same one again.
+     */
+    draw: (
+      projectId: string, boardId: string, body: { frame_ids?: string[]; reroll?: boolean } = {},
+    ) =>
+      request<DrawResult>(`/api/projects/${projectId}/storyboards/${boardId}/draw`, {
+        method: 'POST', body: json(body),
+      }),
+
+    addFrame: (projectId: string, boardId: string) =>
+      request<StoryboardFrame>(`/api/projects/${projectId}/storyboards/${boardId}/frames`, {
+        method: 'POST',
+      }),
+    updateFrame: (
+      projectId: string, boardId: string, frameId: string, body: Partial<StoryboardFrame>,
+    ) =>
+      request<StoryboardFrame>(
+        `/api/projects/${projectId}/storyboards/${boardId}/frames/${frameId}`,
+        { method: 'PATCH', body: json(body) },
+      ),
+    removeFrame: (projectId: string, boardId: string, frameId: string) =>
+      request<void>(`/api/projects/${projectId}/storyboards/${boardId}/frames/${frameId}`, {
+        method: 'DELETE',
+      }),
+    captureFrame: (projectId: string, boardId: string, frameId: string) =>
+      request<{ asset_id: string; frame: StoryboardFrame }>(
+        `/api/projects/${projectId}/storyboards/${boardId}/frames/${frameId}/capture`,
+        { method: 'POST' },
+      ),
+    describeFrame: (projectId: string, boardId: string, frameId: string) =>
+      request<StoryboardFrame>(
+        `/api/projects/${projectId}/storyboards/${boardId}/frames/${frameId}/describe`,
+        { method: 'POST' },
+      ),
+    buildShot: (projectId: string, boardId: string, frameId: string) =>
+      request<Shot>(`/api/projects/${projectId}/storyboards/${boardId}/frames/${frameId}/shot`, {
+        method: 'POST',
+      }),
+
+    // -- the flow itself, and what it did ------------------------------------------------------------
+
+    /** The steps this board runs, with the tokens their templates may use. */
+    pipeline: (projectId: string, boardId: string) =>
+      request<PipelineView>(`/api/projects/${projectId}/storyboards/${boardId}/pipeline`),
+    builtinPipeline: (projectId: string, boardId: string) =>
+      request<Pipeline>(`/api/projects/${projectId}/storyboards/${boardId}/pipeline/builtin`),
+    /** Change one step for this board; every other one goes on tracking the defaults. */
+    saveStage: (projectId: string, boardId: string, stage: Stage) =>
+      request<PipelineView>(
+        `/api/projects/${projectId}/storyboards/${boardId}/pipeline/stages/${stage.id}`,
+        { method: 'PUT', body: json(stage) },
+      ),
+    resetStage: (projectId: string, boardId: string, stageId: string) =>
+      request<PipelineView>(
+        `/api/projects/${projectId}/storyboards/${boardId}/pipeline/stages/${stageId}`,
+        { method: 'DELETE' },
+      ),
+    resetPipeline: (projectId: string, boardId: string) =>
+      request<PipelineView>(`/api/projects/${projectId}/storyboards/${boardId}/pipeline`, {
+        method: 'DELETE',
+      }),
+    runStage: (
+      projectId: string,
+      boardId: string,
+      stageId: string,
+      body: { frame_ids?: string[]; options?: Record<string, unknown> } = {},
+    ) =>
+      request<StageRunResult>(
+        `/api/projects/${projectId}/storyboards/${boardId}/pipeline/stages/${stageId}/run`,
+        { method: 'POST', body: json(body) },
+      ),
+
+    runPipeline: (
+      projectId: string, boardId: string, body: { stage_ids?: string[]; frame_ids?: string[] } = {},
+    ) =>
+      request<PipelineRun>(`/api/projects/${projectId}/storyboards/${boardId}/pipeline/run`, {
+        method: 'POST', body: json(body),
+      }),
+    activePipelineRun: (projectId: string, boardId: string) =>
+      request<PipelineRun | null>(
+        `/api/projects/${projectId}/storyboards/${boardId}/pipeline/run`,
+      ),
+    cancelPipeline: (projectId: string, boardId: string) =>
+      request<{ cancelled: boolean }>(
+        `/api/projects/${projectId}/storyboards/${boardId}/pipeline/cancel`, { method: 'POST' },
+      ),
+
+    /** The transcript, newest first. Previews only — fetch one by id for the whole exchange. */
+    stageRuns: (
+      projectId: string,
+      boardId: string,
+      params: { stage_id?: string; frame_id?: string; limit?: number } = {},
+    ) => {
+      const query = new URLSearchParams(
+        Object.entries(params).filter(([, v]) => v != null).map(([k, v]) => [k, String(v)]),
+      ).toString()
+      return request<StageRunPreview[]>(
+        `/api/projects/${projectId}/storyboards/${boardId}/stage-runs${query ? `?${query}` : ''}`,
+      )
+    },
+    stageRun: (projectId: string, boardId: string, stageRunId: string) =>
+      request<StageRun>(
+        `/api/projects/${projectId}/storyboards/${boardId}/stage-runs/${stageRunId}`,
+      ),
+    clearStageRuns: (projectId: string, boardId: string) =>
+      request<void>(`/api/projects/${projectId}/storyboards/${boardId}/stage-runs`, {
+        method: 'DELETE',
+      }),
+
+    addCharacter: (projectId: string, boardId: string, body: Partial<StoryboardCharacter>) =>
+      request<StoryboardCharacter>(
+        `/api/projects/${projectId}/storyboards/${boardId}/characters`,
+        { method: 'POST', body: json(body) },
+      ),
+    updateCharacter: (
+      projectId: string, boardId: string, characterId: string, body: Partial<StoryboardCharacter>,
+    ) =>
+      request<StoryboardCharacter>(
+        `/api/projects/${projectId}/storyboards/${boardId}/characters/${characterId}`,
+        { method: 'PATCH', body: json(body) },
+      ),
+    removeCharacter: (projectId: string, boardId: string, characterId: string) =>
+      request<void>(
+        `/api/projects/${projectId}/storyboards/${boardId}/characters/${characterId}`,
+        { method: 'DELETE' },
+      ),
+  },
+
   links: {
     create: (projectId: string, shotId: string, link: Omit<Link, 'id'>) =>
       request<Link>(`/api/projects/${projectId}/shots/${shotId}/links`, {
@@ -533,6 +713,45 @@ export const api = {
       '/api/settings/notices',
     ),
     backends: () => request<BackendConfig[]>('/api/settings/backends'),
+
+    /** The configured language-model endpoints. */
+    llmProviders: () => request<LlmProviderConfig[]>('/api/settings/llm-providers'),
+    addLlmProvider: (body: Partial<LlmProviderConfig>) =>
+      request<LlmProviderConfig>('/api/settings/llm-providers', {
+        method: 'POST', body: json(body),
+      }),
+    updateLlmProvider: (id: string, body: Partial<LlmProviderConfig>) =>
+      request<LlmProviderConfig>(`/api/settings/llm-providers/${id}`, {
+        method: 'PATCH', body: json(body),
+      }),
+    removeLlmProvider: (id: string) =>
+      request<void>(`/api/settings/llm-providers/${id}`, { method: 'DELETE' }),
+    /** Models worth suggesting, for the ones you have not got yet. */
+    llmLibrary: () =>
+      request<Array<{ name: string; size: string; vision: boolean; note: string }>>(
+        '/api/settings/llm-library',
+      ),
+
+    /** The storyboard flow every board starts from, for this whole install. */
+    pipeline: () => request<AppPipelineView>('/api/settings/pipeline'),
+    saveStage: (stage: Stage) =>
+      request<AppPipelineView>(`/api/settings/pipeline/stages/${stage.id}`, {
+        method: 'PUT', body: json(stage),
+      }),
+    resetStage: (stageId: string) =>
+      request<AppPipelineView>(`/api/settings/pipeline/stages/${stageId}`, { method: 'DELETE' }),
+    resetPipeline: () => request<AppPipelineView>('/api/settings/pipeline', { method: 'DELETE' }),
+    /** Start downloading a model; progress arrives as `llm.pull` events. */
+    pullLlmModel: (providerId: string, model: string) =>
+      request<{ started: boolean; model: string }>(
+        `/api/settings/llm-providers/${providerId}/pull`,
+        { method: 'POST', body: json({ model }) },
+      ),
+    /** What a provider can run, and which of those can be given an image. */
+    llmModels: (id: string) =>
+      request<{ provider_id: string; models: LlmModel[]; vision_available: boolean }>(
+        `/api/settings/llm-providers/${id}/models`,
+      ),
     addBackend: (body: Partial<BackendConfig>) =>
       request<BackendConfig>('/api/settings/backends', { method: 'POST', body: json(body) }),
     updateBackend: (id: string, body: Partial<BackendConfig>) =>

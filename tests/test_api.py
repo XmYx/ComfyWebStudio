@@ -1981,3 +1981,129 @@ async def test_a_nonsense_clip_patch_is_refused_rather_than_stored(client):
 
     unchanged = (await client.get(f"/api/projects/{project['id']}/timeline")).json()
     assert unchanged["tracks"][0]["clips"][0]["transform"]["fit"] == "contain"
+
+
+# -- a workflow is re-read from ComfyUI before it is used ------------------------------------------------
+
+
+def _comfy_graph_with_prompt(default: str) -> dict:
+    """The same little graph, with a chosen default sitting on its string input."""
+    return {
+        "nodes": [
+            {"id": 1, "type": "WSStringInput", "widgets_values": ["prompt", default]},
+            {"id": 2, "type": "EmptyImage", "widgets_values": [64, 64],
+             "outputs": [{"name": "IMAGE", "type": "IMAGE"}]},
+            {"id": 3, "type": "WSImageOutput", "widgets_values": ["image", "png", ""],
+             "inputs": [{"name": "image", "type": "IMAGE", "link": 1}]},
+        ],
+        "links": [[1, 2, 0, 3, 0, "IMAGE"]],
+    }
+
+
+async def test_placing_a_step_re_reads_the_workflow_from_comfyui(client, fake_comfy):
+    """The regression: a step placed today ran the graph as it was on the day it was imported.
+
+    ComfyUI's Ctrl+S writes its own directory and tells nobody, so choosing a different checkpoint there
+    left our copy — and therefore every step placed afterwards — on the old one, with nothing saying so.
+    """
+    project = await make_project(client)
+    workflow = await _import_from_comfy(
+        client, fake_comfy, project["id"], _comfy_graph_with_prompt("as imported")
+    )
+    assert [p["default"] for p in workflow["params"] if p["key"] == "prompt"] == ["as imported"]
+
+    # The user changes it in ComfyUI and presses Ctrl+S. Nothing tells us.
+    (fake_comfy.root / "user" / "default" / "workflows" / "edited.json").write_text(
+        json.dumps(_comfy_graph_with_prompt("chosen in comfyui"))
+    )
+
+    shot = (
+        await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Shot"})
+    ).json()
+    placed = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+        json={"workflow_id": workflow["id"]},
+    )
+    assert placed.status_code == 201, placed.text
+
+    after = (await client.get(f"/api/projects/{project['id']}/workflows")).json()[0]
+    assert [p["default"] for p in after["params"] if p["key"] == "prompt"] == ["chosen in comfyui"]
+
+
+async def test_placing_a_step_still_works_when_comfyui_is_down(client, fake_comfy):
+    # Syncing is a courtesy, not a precondition. An unreachable ComfyUI must not stop someone building.
+    project = await make_project(client)
+    workflow = await _import_from_comfy(
+        client, fake_comfy, project["id"], _comfy_graph_with_prompt("as imported")
+    )
+    await fake_comfy.stop()
+
+    shot = (
+        await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Shot"})
+    ).json()
+    placed = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+        json={"workflow_id": workflow["id"]},
+    )
+    assert placed.status_code == 201, placed.text
+
+
+async def test_a_step_that_never_set_a_value_follows_the_new_default(client, fake_comfy):
+    project = await make_project(client)
+    workflow = await _import_from_comfy(
+        client, fake_comfy, project["id"], _comfy_graph_with_prompt("as imported")
+    )
+    shot = (
+        await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Shot"})
+    ).json()
+    step = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+            json={"workflow_id": workflow["id"]},
+        )
+    ).json()
+    assert step["param_overrides"] == {}
+
+    (fake_comfy.root / "user" / "default" / "workflows" / "edited.json").write_text(
+        json.dumps(_comfy_graph_with_prompt("chosen in comfyui"))
+    )
+    # Placing a second step is what notices; the first one has no value of its own, so it follows too.
+    await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+        json={"workflow_id": workflow["id"]},
+    )
+
+    after = (await client.get(f"/api/projects/{project['id']}/workflows")).json()[0]
+    assert [p["default"] for p in after["params"] if p["key"] == "prompt"] == ["chosen in comfyui"]
+
+
+async def test_a_value_somebody_set_by_hand_survives_the_re_read(client, fake_comfy):
+    # Two steps sharing a workflow are meant to be able to differ; a re-read must not flatten that.
+    project = await make_project(client)
+    workflow = await _import_from_comfy(
+        client, fake_comfy, project["id"], _comfy_graph_with_prompt("as imported")
+    )
+    shot = (
+        await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Shot"})
+    ).json()
+    step = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+            json={"workflow_id": workflow["id"]},
+        )
+    ).json()
+    await client.patch(
+        f"/api/projects/{project['id']}/steps/{step['id']}",
+        json={"param_overrides": {"prompt": "mine, deliberately"}},
+    )
+
+    (fake_comfy.root / "user" / "default" / "workflows" / "edited.json").write_text(
+        json.dumps(_comfy_graph_with_prompt("chosen in comfyui"))
+    )
+    await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+        json={"workflow_id": workflow["id"]},
+    )
+
+    kept = (await client.get(f"/api/projects/{project['id']}/shots/{shot['id']}")).json()
+    assert kept["steps"][0]["param_overrides"]["prompt"] == "mine, deliberately"

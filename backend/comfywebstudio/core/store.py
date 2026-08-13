@@ -118,7 +118,7 @@ class ProjectStore:
 
         directory = self._allocate_dir(project)
         self._dir_cache[project.id] = directory
-        for sub in ("workflows", "runs", "assets", "thumbs", "renders", "history"):
+        for sub in ("workflows", "runs", "assets", "thumbs", "renders", "history", "stage_runs"):
             (directory / sub).mkdir(parents=True, exist_ok=True)
         self.save(project)
         logger.info("Created project %s at %s", project.id, directory)
@@ -158,7 +158,7 @@ class ProjectStore:
                 directory = self._allocate_dir(project)
                 self._dir_cache[project.id] = directory
 
-        for sub in ("workflows", "runs", "assets", "thumbs", "renders", "history"):
+        for sub in ("workflows", "runs", "assets", "thumbs", "renders", "history", "stage_runs"):
             (directory / sub).mkdir(parents=True, exist_ok=True)
 
         path = directory / PROJECT_FILE
@@ -285,6 +285,92 @@ class ProjectStore:
                 latest[step_run.step_id] = {"run_id": run.id, "step_run": step_run}
         return latest
 
+    # -- the storyboard transcript -----------------------------------------------------------------
+    #
+    # One file per stage execution, under a directory per board. Not in `project.json`, because `save`
+    # snapshots a version of that on every write and a growing transcript would multiply the version log
+    # by the size of every prompt ever rendered. Per board, because reading one board's transcript should
+    # not mean reading every board's.
+
+    #: Kept per board. Old prompts stop being interesting long before this, but a hard cap is what stops
+    #: a stage in a loop filling a disk.
+    STAGE_RUN_LIMIT = 200
+
+    def stage_runs_dir(self, project_id: str, board_id: str) -> Path:
+        path = self.project_dir(project_id) / "stage_runs" / safe_component(board_id, "board")
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def save_stage_run(self, project_id: str, stage_run) -> Path:
+        directory = self.stage_runs_dir(project_id, stage_run.board_id)
+        path = directory / f"{safe_component(stage_run.id, 'run')}.json"
+        _atomic_write_json(path, stage_run.model_dump(mode="json"))
+        return path
+
+    def load_stage_run(self, project_id: str, board_id: str, stage_run_id: str):
+        from .pipeline import StageRun
+
+        path = self.stage_runs_dir(project_id, board_id) / f"{safe_component(stage_run_id, 'run')}.json"
+        if not path.is_file():
+            raise NotFound(f"No stage run {stage_run_id!r}")
+        return StageRun.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+    def list_stage_runs(
+        self,
+        project_id: str,
+        board_id: str,
+        *,
+        stage_id: str | None = None,
+        frame_id: str | None = None,
+        limit: int = 50,
+    ) -> list[Any]:
+        """Most recent first. Filters are applied after reading, so `limit` is a result count."""
+        from .pipeline import StageRun
+
+        directory = self.project_dir(project_id) / "stage_runs" / safe_component(board_id, "board")
+        if not directory.is_dir():
+            return []
+
+        found: list[Any] = []
+        for path in sorted(directory.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                record = StageRun.model_validate(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                logger.warning("Skipping unreadable stage run %s: %s", path.name, exc)
+                continue
+            if stage_id is not None and record.stage_id != stage_id:
+                continue
+            if frame_id is not None and record.frame_id != frame_id:
+                continue
+            found.append(record)
+            if len(found) >= limit:
+                break
+        return found
+
+    def prune_stage_runs(self, project_id: str, board_id: str, *, keep: int | None = None) -> int:
+        """Drop the oldest records beyond the cap. Best effort — never worth failing a stage over."""
+        keep = self.STAGE_RUN_LIMIT if keep is None else keep
+        directory = self.project_dir(project_id) / "stage_runs" / safe_component(board_id, "board")
+        if not directory.is_dir():
+            return 0
+        try:
+            paths = sorted(directory.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError as exc:  # pragma: no cover - a vanished directory races with a delete
+            logger.debug("Could not list stage runs to prune: %s", exc)
+            return 0
+
+        dropped = 0
+        for path in paths[keep:]:
+            try:
+                path.unlink()
+                dropped += 1
+            except OSError as exc:  # pragma: no cover
+                logger.debug("Could not prune %s: %s", path.name, exc)
+        return dropped
+
+    def clear_stage_runs(self, project_id: str, board_id: str) -> int:
+        return self.prune_stage_runs(project_id, board_id, keep=0)
+
     # -- media paths -------------------------------------------------------------------------------
 
     def assets_dir(self, project_id: str) -> Path:
@@ -355,7 +441,9 @@ class ProjectStore:
         if not include_renders:
             skip_dirs.add("renders")
         if not include_runs:
-            skip_dirs.add("runs")
+            # The storyboard transcript is a run log too — full of prompts and raw model replies, and
+            # every bit as much "what happened here" as a run is.
+            skip_dirs |= {"runs", "stage_runs"}
         if not include_history:
             # Version history is usually much larger than the project itself and rarely wanted by whoever
             # receives the export, so it is opt-in.

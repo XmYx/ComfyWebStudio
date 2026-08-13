@@ -23,6 +23,7 @@ export function Header() {
 
   const tabs = projectId
     ? [
+        { to: `/p/${projectId}/storyboard`, label: 'Storyboard' },
         { to: `/p/${projectId}/shots`, label: 'Shots' },
         { to: `/p/${projectId}/timeline`, label: 'Timeline' },
       ]

@@ -16,6 +16,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from .core.pipeline import PipelineOverlay
+
 APP_NAME = "ComfyWebStudio"
 ENV_PREFIX = "CWS_"
 
@@ -57,6 +59,57 @@ class ComfyBackendConfig(BaseModel):
         if not self.uses_shared_filesystem:
             return None
         return Path(self.comfy_root) / which  # type: ignore[arg-type]
+
+
+class LlmProviderConfig(BaseModel):
+    """One configured language-model endpoint.
+
+    Deliberately the same shape as a ComfyUI backend: a kind, a URL and a name. Everything here runs on
+    your own machine or your own server unless you point it somewhere else.
+    """
+
+    id: str
+    name: str = "Ollama"
+    #: ``ollama`` talks to Ollama's own API; ``openai`` to anything speaking the OpenAI chat API — vLLM,
+    #: llama.cpp, LM Studio — which is most self-hosted servers.
+    #:
+    #: Not a Literal: the provider registry is the extension point, and repeating its keys here would mean
+    #: a new adapter could be written, registered, and still refused by the settings model.
+    kind: str = "ollama"
+    base_url: str = "http://127.0.0.1:11434"
+    #: Only some hosted gateways want one; a local server usually ignores it.
+    api_key: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
+    #: For ``openai`` providers only, which models can be given images — the API cannot be asked, so this
+    #: is the only way to know. Ollama reports it per model and ignores this.
+    vision_models: list[str] = Field(default_factory=list)
+    enabled: bool = True
+    #: Generous by default: a large local model on a busy GPU can take a while to produce a storyboard.
+    timeout_s: float = 300.0
+
+    @field_validator("base_url")
+    @classmethod
+    def _strip_trailing_slash(cls, v: str) -> str:
+        return v.rstrip("/")
+
+
+class StorySettings(BaseModel):
+    """Which models the storyboard tools reach for, and how they are asked."""
+
+    provider_id: str | None = None
+    #: The model that writes: a premise becomes a sequence of shots.
+    write_model: str = ""
+    #: The model that looks: a generated frame becomes a description. Often a different one entirely.
+    vision_provider_id: str | None = None
+    vision_model: str = ""
+    #: Low, because a storyboard that changes every time it is asked is not a storyboard. A stage may
+    #: pin its own; this is what one gets when it does not.
+    temperature: float = 0.6
+    #: How many frames to ask for when the user does not say.
+    default_frames: int = 6
+    #: How the storyboard flow differs from the built-in one, for everyone using this install. None means
+    #: the built-ins, unedited. Boards layer their own edits over whatever this resolves to.
+    pipeline: PipelineOverlay | None = None
 
 
 class ExecutionSettings(BaseModel):
@@ -117,10 +170,13 @@ class AppSettings(BaseModel):
     backends: list[ComfyBackendConfig] = Field(default_factory=list)
     default_backend_id: str | None = None
 
+    llm_providers: list[LlmProviderConfig] = Field(default_factory=list)
+
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     render: RenderSettings = Field(default_factory=RenderSettings)
     preview: PreviewSettings = Field(default_factory=PreviewSettings)
     ui: UISettings = Field(default_factory=UISettings)
+    story: StorySettings = Field(default_factory=StorySettings)
 
     # -- derived paths ---------------------------------------------------------------------------------
 

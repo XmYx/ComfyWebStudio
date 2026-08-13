@@ -259,6 +259,81 @@ def _stored_graph(state, project_id: str, workflow_id: str, fmt: str) -> dict:
         return {}
 
 
+async def sync_workflow(state, project, workflow, *, backend_id: str | None = None) -> bool:
+    """Bring our copy of a workflow up to date with ComfyUI's, if it has moved on. True when it had.
+
+    Called before a workflow is *used* — placed on a canvas, or built into a shot — because ComfyUI's own
+    <kbd>Ctrl</kbd>+<kbd>S</kbd> writes its user directory and tells nobody. Without this, a step placed
+    today runs the graph as it was on the day it was imported: the checkpoint you switched last week is
+    still the old one, and nothing anywhere says so.
+
+    **Best effort, always.** ComfyUI being unreachable is not a reason to refuse to place a step, so every
+    failure here is a debug line and a ``False``. The stored copy is what gets used, exactly as before.
+
+    The comparison is the point of the fast path: reading one file and finding it unchanged costs a round
+    trip, while re-analysing a graph costs an ``/object_info`` fetch and a full conversion. Placing ten
+    steps should not pay the second cost ten times.
+    """
+    if not workflow.comfy_userdata_path:
+        return False
+
+    try:
+        backend = await state.backends.get(backend_id)
+        fresh = await read_from_comfy(backend, workflow)
+    except Exception as exc:  # noqa: BLE001 - a stored copy is still perfectly usable
+        logger.debug("Could not re-read %r from ComfyUI: %s", workflow.name, exc)
+        return False
+
+    if fresh is None or fresh == _stored_graph(state, project.id, workflow.id, "ui"):
+        return False
+
+    logger.info("%r has changed in ComfyUI; re-reading it before use", workflow.name)
+    try:
+        analysis = await analyse_workflow(state, fresh, None, backend_id)
+    except Exception as exc:  # noqa: BLE001 - mid-edit graphs are common and not our problem
+        logger.debug("ComfyUI's copy of %r could not be converted: %s", workflow.name, exc)
+        return False
+
+    _apply_analysis(state, project, workflow, analysis)
+    state.store.save(project)
+    return True
+
+
+def _apply_analysis(state, project, workflow, analysis, *, warning: str | None = None) -> set[str]:
+    """Put a fresh reading of a workflow onto it, and let its steps follow what moved.
+
+    Returns the port keys that went away. Does not save — the caller decides when, because it usually has
+    more to do first.
+    """
+    previous_defaults = {p.key: p.default for p in workflow.params}
+    # Bindings whose node survived: one pointing at a deleted node would silently write nothing.
+    raw_params = [
+        p for p in workflow.params if p.source == "raw_widget" and p.node_id in analysis.api_prompt
+    ]
+
+    previous_ports = {p.key for p in workflow.ports}
+    workflow.ports = analysis.ports
+    workflow.params = [*analysis.params, *raw_params]
+    workflow.hash = analysis.hash
+    workflow.warnings = ([warning] if warning else []) + analysis.warnings
+    workflow.missing_nodes = analysis.missing_nodes
+    workflow.last_synced = utcnow()
+
+    state.store.write_workflow(project.id, workflow.id, "api", analysis.api_prompt)
+    state.store.write_workflow(project.id, workflow.id, "ui", analysis.ui_graph)
+
+    # A step whose override merely copied the old default follows the new one; one that differs was a
+    # decision and stays. Without this a value changed in ComfyUI updates the workflow and changes nothing
+    # anybody can see — the same trap the bridge already guards against.
+    from .bridge import _adopt_new_defaults  # here, because bridge imports analyse_workflow from us
+
+    _adopt_new_defaults(project, workflow, previous_defaults)
+
+    removed = previous_ports - {p.key for p in workflow.ports}
+    drop_links_for_removed_ports(project, workflow.id, removed)
+    return removed
+
+
 @router.post("/{workflow_id}/rediscover")
 async def rediscover(
     state: StateDep,
@@ -326,23 +401,7 @@ async def rediscover(
         )
         analysis = await analyse_workflow(state, stored_ui, stored_api or None, backend_id)
 
-    # Only bindings whose node survived: one pointing at a deleted node would silently write nothing.
-    raw_params = [
-        p for p in workflow.params if p.source == "raw_widget" and p.node_id in analysis.api_prompt
-    ]
-
-    previous_ports = {p.key for p in workflow.ports}
-    workflow.ports = analysis.ports
-    workflow.params = [*analysis.params, *raw_params]
-    workflow.hash = analysis.hash
-    workflow.warnings = ([pull_warning] if pull_warning else []) + analysis.warnings
-    workflow.missing_nodes = analysis.missing_nodes
-    workflow.last_synced = utcnow()
-
-    state.store.write_workflow(project.id, workflow_id, "api", analysis.api_prompt)
-    state.store.write_workflow(project.id, workflow_id, "ui", analysis.ui_graph)
-
-    removed = previous_ports - {p.key for p in workflow.ports}
+    removed = _apply_analysis(state, project, workflow, analysis, warning=pull_warning)
     broken = drop_links_for_removed_ports(project, workflow_id, removed)
     state.store.save(project)
 

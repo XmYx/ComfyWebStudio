@@ -184,6 +184,14 @@ class FakeComfy:
                 {"port_name": ["STRING", {"default": ""}], "value": ["STRING", {"multiline": True}]},
                 ("STRING",),
             ),
+            "WSSeedInput": node(
+                "WSSeedInput",
+                {
+                    "port_name": ["STRING", {"default": ""}],
+                    "value": ["INT", {"default": 0, "min": 0, "max": 2**64 - 1}],
+                },
+                ("INT",),
+            ),
             "WSImageInput": node(
                 "WSImageInput",
                 {"port_name": ["STRING", {"default": ""}], "source": ["STRING", {"default": ""}]},

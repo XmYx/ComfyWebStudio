@@ -10,6 +10,7 @@ import { AppDialogs } from '@/features/menu/Dialogs'
 import { ProjectsPage } from '@/features/projects/ProjectsPage'
 import { ShotsPage } from '@/features/shots/ShotsPage'
 import { TimelineWorkspace } from '@/features/timeline/TimelineWorkspace'
+import { StoryboardWorkspace } from '@/features/storyboard/StoryboardWorkspace'
 import { SettingsPage } from '@/features/settings/SettingsPage'
 import { useToast } from '@/components/ui'
 
@@ -25,7 +26,6 @@ function ProjectShell({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     setProject(projectId ?? null)
-    eventStream.connect(projectId ?? null)
   }, [projectId, setProject])
 
   useStudioEvents((event) => {
@@ -72,6 +72,9 @@ function ProjectShell({ children }: { children: React.ReactNode }) {
         if (event.data.status === 'success') toast.push('ok', 'Run finished.')
         else if (event.data.status !== 'cancelled') toast.push('bad', event.data.error ?? 'Run failed.')
         queryClient.invalidateQueries({ queryKey: ['runs', projectId] })
+        // The storyboard reads its frames' pictures from the run history rather than from assets, so what
+        // a run just produced is what the strip should be showing.
+        queryClient.invalidateQueries({ queryKey: ['board-stills'] })
         break
 
       case 'run.cancelled':
@@ -131,7 +134,22 @@ function ProjectShell({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
+/**
+ * The event socket has exactly one owner, here at the root, because things worth watching happen outside
+ * a project too — pulling a model from Settings being the obvious one. It follows whatever project is
+ * open (the backend filters on it) and stays connected, unfiltered, when none is.
+ */
+function useEventStream() {
+  const projectId = useStudio((s) => s.projectId)
+  useEffect(() => {
+    eventStream.connect(projectId)
+    return () => eventStream.close()
+  }, [projectId])
+}
+
 export default function App() {
+  useEventStream()
+
   return (
     <div className="flex h-full flex-col">
       <MenuBar />
@@ -144,6 +162,10 @@ export default function App() {
           <Route
             path="/p/:projectId/shots"
             element={<ProjectShell><ShotsPage /></ProjectShell>}
+          />
+          <Route
+            path="/p/:projectId/storyboard"
+            element={<ProjectShell><StoryboardWorkspace /></ProjectShell>}
           />
           <Route
             path="/p/:projectId/timeline"

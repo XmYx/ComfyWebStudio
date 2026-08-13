@@ -9,12 +9,14 @@ is what makes export/import a file copy rather than a migration exercise.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import Field, computed_field
 
+from .base import Base, utcnow
 from .ids import new_id
+from .storyboard import Storyboard
 
 #: Bumped when ``project.json`` changes shape; ``migrations.py`` maps older files forward.
 PROJECT_SCHEMA_VERSION = 1
@@ -40,12 +42,6 @@ TERMINAL_STATUSES: frozenset[str] = frozenset({"success", "error", "cancelled", 
 FAILED_STATUSES: frozenset[str] = frozenset({"error", "cancelled"})
 
 
-def utcnow() -> datetime:
-    return datetime.now(UTC)
-
-
-class Base(BaseModel):
-    model_config = ConfigDict(extra="ignore", validate_assignment=False)
 
 
 # -- workflow description ------------------------------------------------------------------------------
@@ -574,6 +570,9 @@ class Project(Base):
     shots: list[Shot] = Field(default_factory=list)
     timeline: Timeline = Field(default_factory=Timeline)
     assets: dict[str, Asset] = Field(default_factory=dict)
+    #: Storyboards belong to the project so they travel with it — export, import and history all come
+    #: free, and the shots a board produces sit beside the board that produced them.
+    storyboards: list[Storyboard] = Field(default_factory=list)
 
     def shot(self, shot_id: str) -> Shot | None:
         return next((s for s in self.shots if s.id == shot_id), None)
