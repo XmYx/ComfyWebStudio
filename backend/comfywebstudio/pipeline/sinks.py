@@ -174,14 +174,38 @@ def frames_from(payload: Any, board: Storyboard) -> list[StoryboardFrame]:
     return frames
 
 
-def characters_from(payload: Any) -> list[StoryboardCharacter]:
-    """Turn a ``board.characters`` answer into characters, dropping any without a name."""
-    return [
-        StoryboardCharacter(
-            name=as_text(entry.get("name")),
-            description=as_text(entry.get("description")),
-            appearance=as_text(entry.get("appearance")),
+def same_person(name: str) -> str:
+    """A name reduced to what makes it the same name.
+
+    Deliberately shallow — case and spacing only. Anything cleverer starts merging "Anna" into
+    "Anna-Marie", and two characters wrongly collapsed into one is a worse failure than two rows to
+    delete. Asked twice about the same premise a model will happily volunteer the cast again, so the
+    duplicates worth catching are mostly exact ones.
+    """
+    return " ".join(name.split()).casefold()
+
+
+def characters_from(payload: Any, *, known: list[StoryboardCharacter] | None = None) -> list[StoryboardCharacter]:
+    """Turn a ``board.characters`` answer into characters — each of them new, and each of them once.
+
+    Deduplicated against the board *and against itself*: a model listing "Elara" twice in one answer used
+    to produce two rows, because the caller only ever compared the answer with what was already there.
+    """
+    seen = {same_person(c.name) for c in (known or [])}
+    people: list[StoryboardCharacter] = []
+
+    for entry in payload or []:
+        if not isinstance(entry, dict):
+            continue
+        name = as_text(entry.get("name"))
+        if not name or same_person(name) in seen:
+            continue
+        seen.add(same_person(name))
+        people.append(
+            StoryboardCharacter(
+                name=name,
+                description=as_text(entry.get("description")),
+                appearance=as_text(entry.get("appearance")),
+            )
         )
-        for entry in (payload or [])
-        if isinstance(entry, dict) and as_text(entry.get("name"))
-    ]
+    return people

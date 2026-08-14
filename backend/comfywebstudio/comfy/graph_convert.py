@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .objectinfo import ObjectInfoCache, combo_options
-from .subgraphs import SubgraphFlattener, subgraph_definitions, widget_names, widget_values_by_name
+from .subgraphs import SubgraphFlattener, subgraph_definitions, widget_names
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,20 @@ VIRTUAL_NODES = frozenset({"Reroute", "PrimitiveNode", "Note", "MarkdownNote", "
 
 #: Socket types that are values a user types, as opposed to links between nodes.
 WIDGET_TYPES = frozenset({"STRING", "INT", "FLOAT", "BOOLEAN"})
+
+#: Bumped whenever this converter's output changes.
+#:
+#: A workflow records the version that produced its stored prompt, so a fix here reaches graphs that were
+#: imported before it — otherwise nothing re-reads a ComfyUI file that has not changed, and a workflow
+#: converted by a buggy version keeps its buggy prompt until somebody deletes and re-imports it.
+#:
+#: 2: widget order taken from the schema rather than the node's converted inputs, and dynamic combos
+#:    expanded into the dotted inputs ComfyUI requires.
+CONVERTER_VERSION = 2
+
+#: Marks a prompt ComfyUI produced itself, through the bridge or an API-format export. No version of this
+#: converter improves on that, so it is never re-converted.
+EXACT = -1
 
 
 @dataclass(slots=True)
@@ -127,16 +141,109 @@ def _widget_names(schema: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
                 continue
             # A combo is a widget whichever way it is encoded; missing this silently dropped every
             # sampler, scheduler and model choice from converted graphs.
-            is_combo = combo_options(raw_type, options) is not None
-            if not is_combo and str(raw_type) not in WIDGET_TYPES:
+            listed = combo_options(raw_type, options) is not None
+            # A *dynamic* combo is one too, and it brings friends: picking a mode reveals that mode's own
+            # widgets, each taking a slot of its own and each required by name. Skipping it entirely — as
+            # this used to — lost its value and shifted everything after it.
+            dynamic = not listed and "COMBO" in str(raw_type).upper()
+            if not listed and not dynamic and str(raw_type) not in WIDGET_TYPES:
                 continue
-            ordered.append((name, options))
+            ordered.append((name, {**options, "_dynamic": dynamic} if dynamic else options))
     return ordered
+
+
+def _is_widget(raw_type: Any, options: dict[str, Any]) -> bool:
+    if options.get("forceInput"):
+        return False
+    return (
+        combo_options(raw_type, options) is not None
+        or "COMBO" in str(raw_type).upper()
+        or str(raw_type) in WIDGET_TYPES
+    )
+
+
+def _revealed_by(
+    options: dict[str, Any], chosen: Any, prefix: str
+) -> list[tuple[str, dict[str, Any]]]:
+    """The widgets a dynamic combo reveals once a mode is picked, in the order it serialises them.
+
+    Each option in the schema carries its own ``inputs`` block, so this is read rather than guessed —
+    picking ``on`` on a sampler reveals temperature, top_k, top_p and the rest.
+
+    They arrive **under the combo's own name**: ComfyUI builds their ids by joining the path with dots
+    (`_io.finalize_prefix`), so what it expects in the prompt is ``sampling_mode.temperature``, not
+    ``temperature``. Sending the bare name looks right, validates as missing, and gets the output that
+    depends on the node quietly ignored.
+    """
+    for option in options.get("options") or []:
+        if str(option.get("key")) != str(chosen):
+            continue
+        revealed: list[tuple[str, dict[str, Any]]] = []
+        for section in ("required", "optional"):
+            for name, definition in ((option.get("inputs") or {}).get(section) or {}).items():
+                if not isinstance(definition, list | tuple) or not definition:
+                    continue
+                inner = definition[1] if len(definition) > 1 and isinstance(definition[1], dict) else {}
+                if not _is_widget(definition[0], inner):
+                    continue
+                # A revealed input can itself be a dynamic combo, so it is marked the same way and
+                # expands under its own, longer, path when the walk reaches it.
+                nested = "COMBO" in str(definition[0]).upper() and combo_options(
+                    definition[0], inner
+                ) is None
+                revealed.append(
+                    (f"{prefix}.{name}", {**inner, "_dynamic": True} if nested else inner)
+                )
+        return revealed
+    return []
+
+
+def _map_positionally(
+    values: list[Any], ordered: list[tuple[str, dict[str, Any]]], control: set[str]
+) -> tuple[dict[str, Any], int]:
+    """Lay a positional ``widgets_values`` array over an ordered list of widgets.
+
+    Returns the mapping and how many of the values it accounted for — which is what tells two candidate
+    orderings apart. A ``control_after_generate`` widget occupies a slot of its own without being an
+    input, so it is stepped over.
+
+    A **dynamic combo** expands as it is read: its own slot holds the chosen mode, and that mode's widgets
+    follow immediately, so they are spliced into the walk the moment the mode is known. Skipping over them
+    instead would leave ComfyUI asking for a `temperature` nobody sent, and would shift every widget after
+    them by however many slots the mode happened to have.
+    """
+    mapped: dict[str, Any] = {}
+    queue = list(ordered)
+    index = 0
+
+    while queue and index < len(values):
+        name, options = queue.pop(0)
+        value = values[index]
+        index += 1
+        mapped[name] = value
+
+        if options.get("_dynamic"):
+            queue = _revealed_by(options, value, name) + queue
+        elif name in control and index < len(values):
+            index += 1
+
+    return mapped, index
 
 
 def _apply_widget_values(
     node: dict[str, Any], schema: dict[str, Any], inputs: dict[str, Any], result: ConversionResult
 ) -> None:
+    """Recover a node's widget values from the positional array the frontend serialised.
+
+    The order that array follows is the **schema's**, and that matters more than it sounds: a node's own
+    ``inputs`` list holds only the widgets somebody converted into link sockets, which is usually one of
+    them and sometimes none. Reading the order from there — as this used to — mapped a KSampler's seven
+    values onto its one converted widget and dropped steps, cfg, sampler and scheduler on the floor, so
+    ComfyUI refused the prompt for missing required inputs.
+
+    The node's list is still worth trying, because a dynamic combo can expand into entries the schema does
+    not mention. So both orders are laid over the values and the one that accounts for all of them wins.
+    """
     values = node.get("widgets_values")
     if values is None:
         return
@@ -146,32 +253,27 @@ def _apply_widget_values(
         inputs.update(values)
         return
 
-    control = {name for name, options in _widget_names(schema) if options.get("control_after_generate")}
+    ordered = _widget_names(schema)
+    control = {name for name, options in ordered if options.get("control_after_generate")}
 
-    # Prefer the node's own input order — it is what the frontend actually serialised.
-    if widget_names(node):
-        mapped = widget_values_by_name(node, control)
-        inputs.update(mapped)
-        consumed = len(mapped) + sum(1 for name in mapped if name in control)
-        if consumed < len(values):
-            result.warnings.append(
-                f"Node {node.get('id')} ({node.get('type')}) had {len(values) - consumed} unmapped "
-                "widget value(s); check its parameters."
-            )
-        return
+    by_schema, used_schema = _map_positionally(values, ordered, control)
+    own = widget_names(node)
+    by_node, used_node = (
+        _map_positionally(values, [(name, {}) for name in own], control) if own else ({}, 0)
+    )
 
-    # Older documents have no per-node input list; fall back to the schema's declaration order.
-    index = 0
-    for name, options in _widget_names(schema):
-        if index >= len(values):
-            break
-        inputs[name] = values[index]
-        index += 1
-        if options.get("control_after_generate") and index < len(values):
-            index += 1
+    if used_schema >= len(values):
+        chosen, consumed = by_schema, used_schema
+    elif used_node >= len(values):
+        chosen, consumed = by_node, used_node
+    else:
+        chosen, consumed = (
+            (by_schema, used_schema) if used_schema >= used_node else (by_node, used_node)
+        )
 
-    if index < len(values):
+    inputs.update(chosen)
+    if consumed < len(values):
         result.warnings.append(
-            f"Node {node.get('id')} ({node.get('type')}) had {len(values) - index} unmapped widget "
-            "value(s); check its parameters."
+            f"Node {node.get('id')} ({node.get('type')}) had {len(values) - consumed} unmapped "
+            "widget value(s); check its parameters."
         )

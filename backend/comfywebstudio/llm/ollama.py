@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from .provider import LlmError, LlmProvider, ModelInfo, Reply, register
+from .provider import LlmError, LlmProvider, LoadedModel, ModelInfo, Reply, register
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +151,52 @@ class OllamaProvider(LlmProvider):
             raise
         except Exception as exc:  # noqa: BLE001
             raise LlmError(f"Pulling {model} failed: {exc}") from exc
+
+
+    async def loaded(self) -> list[LoadedModel]:
+        """What Ollama currently has in memory, from its own accounting."""
+        try:
+            async with self._client() as client:
+                payload = (await client.get("/api/ps")).raise_for_status().json()
+        except Exception as exc:  # noqa: BLE001 - "cannot tell" is not worth an error here
+            logger.debug("Could not ask Ollama what it has loaded: %s", exc)
+            return []
+
+        return [
+            LoadedModel(
+                name=str(entry.get("name") or entry.get("model") or ""),
+                vram=int(entry.get("size_vram") or 0),
+                size=int(entry.get("size") or 0),
+                expires=str(entry.get("expires_at") or ""),
+            )
+            for entry in payload.get("models") or []
+            if entry.get("name") or entry.get("model")
+        ]
+
+    async def unload(self, model: str | None = None) -> list[str]:
+        """Ask Ollama to let go of a model, or of everything it is holding.
+
+        ``keep_alive: 0`` is Ollama's own way of saying "release this now": the request returns as soon as
+        the model is out of memory, having generated nothing. There is no separate unload endpoint.
+        """
+        targets = [model] if model else [m.name for m in await self.loaded()]
+        if not targets:
+            return []
+
+        freed: list[str] = []
+        try:
+            async with self._client() as client:
+                for name in targets:
+                    response = await client.post(
+                        "/api/generate", json={"model": name, "keep_alive": 0}
+                    )
+                    response.raise_for_status()
+                    freed.append(name)
+        except httpx.HTTPStatusError as exc:
+            raise LlmError(_explain(exc, targets[len(freed)])) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise LlmError(f"Ollama at {self.config.base_url} would not let go: {exc}") from exc
+        return freed
 
 
 def _explain(exc: httpx.HTTPStatusError, model: str) -> str:

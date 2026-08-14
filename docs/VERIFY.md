@@ -196,6 +196,9 @@ afterwards, so they are repeatable and never touch your real work.
 - [ ] With ComfyUI stopped, placing a step still works and uses the stored copy.
 - [ ] A value set by hand on a step survives that re-read; one that merely matched the old default follows
       the new one.
+- [ ] A step with no values of its own runs the graph **exactly** as ComfyUI has it — check a workflow with
+      subgraph-promoted comboboxes (a model or sampler picker) and confirm the shot uses the chosen entry,
+      not the first one in the list.
 
 ### The storyboard flow
 *Needs a language model. Ollama on `127.0.0.1:11434` is the quick path.*
@@ -221,6 +224,8 @@ afterwards, so they are repeatable and never touch your real work.
       and does *not* touch one that has.
 - [ ] Changing a language model on the Settings page does not wipe the flow edits.
 - [ ] The transcript survives a reload, and **Clear** empties it.
+- [ ] With a language model loaded, the Flow panel offers **Free _n_ GB** with the right figure; pressing it
+      empties `nvidia-smi` of that model and the button disappears. With nothing loaded, no button.
 
 ### Storyboards
 
@@ -234,7 +239,13 @@ afterwards, so they are repeatable and never touch your real work.
       rather than hanging.
 - [ ] **Write** on a premise returns the asked-for number of frames, each with action, camera, image prompt
       and shot prompt as *prose* — never a nested object, never a field name echoed as its own value.
-- [ ] **Suggest** names the characters in the premise; attaching one to a frame carries its appearance.
+- [ ] **Find them** names the characters in the premise; attaching one to a frame carries its appearance.
+- [ ] Pressing **Find them** again offers nobody already on the board — check the prompt in **What was
+      sent** names them as already known.
+- [ ] A model listing the same person twice in one answer still produces one character.
+- [ ] **Draw them** on a character with an appearance draws their reference and keeps it as an asset by
+      itself; the button then reads **Draw another**. Somebody with no appearance written cannot be drawn,
+      and the button says why.
 - [ ] **Draw all** renders every frame, and each picture appears on its frame as that frame finishes —
       without anything being kept first. A bar above the strip counts the frames off; **Stop** cancels.
 - [ ] Each frame shows its own percentage while it is drawing, and a failed frame says why on the card.
@@ -279,6 +290,14 @@ afterwards, so they are repeatable and never touch your real work.
   back blank — is a property of the step rather than a control structure.
 - **A step's order is not validated.** Describing before anything has been drawn is a mistake the app lets
   you make and then reports, in the same spirit as a workflow bound to the wrong parameter.
+- [ ] A workflow whose stored graph is missing a required input is converted again the next time it is
+      placed or used, without anything being re-imported — check a project made before a converter fix.
+
+- **Re-reading a workflow means re-converting it.** ComfyUI's own `graphToPrompt` runs in the browser, so
+  a file read back from its user directory is put through `comfy/graph_convert.py`. That handles subgraphs,
+  `control_after_generate` and dynamic combos, but it is a fallback rather than an equal: a conversion that
+  loses an input the stored prompt had is **refused**, the stored graph is kept, and the workflow says so.
+  Pressing "Save to ComfyWebStudio" in ComfyUI is always the exact path.
 - **Syncing from ComfyUI is best effort.** A workflow is re-read before it is placed or used, but an
   unreachable ComfyUI is not a refusal — the stored copy is used and the work proceeds. It also only
   applies to workflows we know a path for: one imported by dropping a `.json` in has no file to re-read.

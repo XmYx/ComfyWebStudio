@@ -114,7 +114,8 @@ Select a step and the Inspector shows its parameters. Two kinds arrive there:
 Subgraphs are handled too: a promoted input on a subgraph appears as a parameter like `$30.seed`.
 
 A value you type is stored **on the step**, not in the workflow, so two steps using the same workflow can
-differ. **Reset to workflow defaults** clears them.
+differ. **Reset to workflow defaults** clears them — and a parameter you have never touched is left strictly
+alone, so the step runs whatever the graph itself says rather than the app's reading of it.
 
 > **When a value changes in ComfyUI.** A step that was holding the workflow's old default follows the new
 > value automatically. A value you deliberately set on that step is kept — the app says which ones, rather
@@ -213,10 +214,18 @@ kept deliberately separate, because they are read by different things:
 Everything is editable. The model writes a first draft, not a contract — rewrite any field, reorder frames
 by dragging, add or delete them.
 
-**2. Characters.** **Suggest** reads the premise and names whoever recurs, each with an *appearance* written
-for an image generator so the same face survives from frame to frame. Give a character a reference image and
-it can be fed to workflows that accept one. Characters are attached per frame, so only the ones actually in
-a shot are sent.
+**2. Characters.** **Find them** reads the premise and names whoever recurs, each with an *appearance*
+written for an image generator so the same face survives from frame to frame. Press it again later and it
+only offers people who are genuinely new — it is told who you already have, and anyone who slips through
+twice is filtered out before you see them.
+
+Give a character a reference image and it can be fed to workflows that accept one. **Draw them** makes that
+picture with the same text-to-image workflow the frames use, from the appearance you wrote — which beats
+finding a photograph of somebody who does not exist. The result is kept as a project asset automatically,
+because a reference has to *be* an asset before a workflow can take it. Dragging an image in still works,
+and **Draw another** gives you a second take to choose from.
+
+Characters are attached per frame, so only the ones actually in a shot are sent.
 
 **3. Draw.** Pick a text-to-image template and which of its inputs is the prompt, then **Draw all** renders
 every frame. Each picture appears on its frame as that frame finishes — nothing to press first — with a
@@ -282,6 +291,12 @@ on its own.
 | **Run** | runs that step alone — the same as the buttons on the frames, from the other direction |
 | **Skip** | leaves the step out, here and when the whole flow runs |
 | **Run the flow** | runs them in order, waiting for the drawing to finish before looking at it |
+| **Free _n_ GB** | releases the language models from memory, so ComfyUI can have the graphics card |
+
+**Free _n_ GB** appears only while a language model is actually resident, and says how much it is holding.
+The flow alternates between a language model and ComfyUI, and on one card they want the same memory — a 7B
+model sitting there is several gigabytes an image model cannot use. Ollama does release it by itself after
+a few idle minutes, which is the wrong few minutes when you have finished writing and want to draw.
 
 Clicking a step's name opens it.
 
@@ -462,7 +477,8 @@ and the theme.
 | A step did not do what its prompt says | Open **Flow ▸ What was sent** and read the prompt that actually went. An unresolved `{token}` arrives verbatim, which is usually the answer. |
 | A step says its **default moved on** | The built-in wording changed in a newer version and yours did not. Reset it to take the new one, or leave it — nothing overwrites your version. |
 | *"no parameter … is set to receive it"* on **Make the shot** | The frame has a motion prompt and the image-to-video workflow has nowhere to put it. Pick one under **Its prompt**; the setup panel warns about this before you get that far. |
-| A step is running an old checkpoint or sampler | It should not: a workflow is re-read from ComfyUI whenever it is placed or used. If ComfyUI was unreachable at that moment the stored copy is used instead — **Sync from ComfyUI** in the workflow library forces it. |
+| A workflow says it *could not be read back exactly* | ComfyUI changed it in a way this app cannot convert without losing something, so the previously stored graph is still being used. Open it in ComfyUI and press the green **WebStudio** badge — that path is exact. |
+| A step is running an old checkpoint or sampler | It should not: a workflow is re-read from ComfyUI whenever it is placed or used, and a step you have not given a value to runs the graph exactly as it stands. If ComfyUI was unreachable at that moment the stored copy is used instead — **Sync from ComfyUI** in the workflow library forces it. |
 | The storyboard flags a reference input | The workflow you chose has no input for it. The assignment is kept; pick a workflow that takes one. |
 | **↻ Vary** returns the same picture | The drawing workflow exposes no seed, so there is nothing to vary. Add a `WS Seed Input` to it in ComfyUI. |
 | A frame still shows an older picture | The picture shown is whichever is newer, drawn or dropped in. **Redraw** it, or drop the image you want onto it. |

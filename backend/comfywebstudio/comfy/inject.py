@@ -65,10 +65,16 @@ def _apply_params(
     rng: random.Random,
 ) -> None:
     for param in workflow.params:
+        chosen = param.key in overrides
         value = overrides.get(param.key, param.default)
         if param.is_seed:
             value = _resolve_seed(value, seed_mode, rng)
         coerced = _coerce(value, param)
+
+        # Nobody set this, and the seed is not being stepped, so there is nothing to say about it — and
+        # the prompt already holds whatever ComfyUI itself put there. Writing a *derived* default over an
+        # authoritative value is how a combo set to the third checkpoint quietly runs as the first.
+        fill_only = not chosen and not (param.is_seed and seed_mode != "fixed")
 
         # A promoted subgraph input can drive several node inputs at once; all of them get the value.
         written = 0
@@ -76,7 +82,11 @@ def _apply_params(
             node = result.prompt.get(target.node_id)
             if not isinstance(node, dict):
                 continue
-            node.setdefault("inputs", {})[target.input_name] = coerced
+            inputs = node.setdefault("inputs", {})
+            if fill_only and inputs.get(target.input_name) is not None:
+                written += 1
+                continue
+            inputs[target.input_name] = coerced
             written += 1
 
         if not written:

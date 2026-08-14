@@ -723,6 +723,22 @@ export interface PipelineRun {
   finished: string | null
 }
 
+/** One language model sitting in memory, and how much of the graphics card it is holding. */
+export interface LoadedModel {
+  name: string
+  /** Bytes of VRAM. 0 when it is on the processor rather than the card. */
+  vram: number
+  size: number
+  expires: string
+  provider_id: string
+}
+
+export interface LoadedModels {
+  models: LoadedModel[]
+  /** Total VRAM across them, so the button can say what pressing it gets back. */
+  vram: number
+}
+
 export interface StageRunResult {
   stage_id: string
   status: string

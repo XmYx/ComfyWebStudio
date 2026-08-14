@@ -131,6 +131,11 @@ class WorkflowRef(Base):
     missing_nodes: list[str] = Field(default_factory=list)
     #: Non-fatal problems found during import or conversion, surfaced in the UI.
     warnings: list[str] = Field(default_factory=list)
+    #: Which version of our UI-to-prompt converter produced the stored prompt, or ``EXACT`` when ComfyUI
+    #: produced it itself. An older number means the graph is worth converting again: a fix to the
+    #: converter otherwise never reaches a workflow that is already imported, because nothing re-reads a
+    #: file that has not changed. Zero is "written before this was recorded".
+    converted_by: int = 0
     created: datetime = Field(default_factory=utcnow)
 
     def port(self, key: str, direction: PortDirection | None = None) -> PortSpec | None:

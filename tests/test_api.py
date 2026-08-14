@@ -140,6 +140,39 @@ async def test_workflow_without_ws_nodes_warns(client):
     assert any("No ComfyWebStudio input or output nodes" in w for w in workflow["warnings"])
 
 
+async def test_a_model_this_comfyui_lacks_is_reported_on_import(client):
+    """A checkpoint that is not on the machine fails the whole output, so it is worth saying at import."""
+    project = await make_project(client)
+    workflow = await import_workflow(
+        client,
+        project["id"],
+        "Missing model",
+        {
+            "1": {
+                "class_type": "KSampler",
+                "inputs": {"seed": 1, "steps": 20, "cfg": 8.0, "sampler_name": "gone_forever"},
+            }
+        },
+    )
+    assert any("gone_forever" in w and "does not have" in w for w in workflow["warnings"])
+
+
+async def test_a_model_this_comfyui_has_is_not_reported(client):
+    project = await make_project(client)
+    workflow = await import_workflow(
+        client,
+        project["id"],
+        "Present model",
+        {
+            "1": {
+                "class_type": "KSampler",
+                "inputs": {"seed": 1, "steps": 20, "cfg": 8.0, "sampler_name": "dpmpp_2m"},
+            }
+        },
+    )
+    assert not any("does not have" in w for w in workflow["warnings"])
+
+
 async def test_deleting_a_workflow_in_use_is_refused(client):
     project, _shot, _steps = await build_chain(client)
     workflow_id = (await client.get(f"/api/projects/{project['id']}/workflows")).json()[0]["id"]
@@ -2107,3 +2140,97 @@ async def test_a_value_somebody_set_by_hand_survives_the_re_read(client, fake_co
 
     kept = (await client.get(f"/api/projects/{project['id']}/shots/{shot['id']}")).json()
     assert kept["steps"][0]["param_overrides"]["prompt"] == "mine, deliberately"
+
+
+async def test_a_conversion_that_loses_inputs_does_not_replace_the_stored_graph(
+    client, fake_comfy, monkeypatch
+):
+    """The safety net under re-reading.
+
+    ComfyUI's own graphToPrompt runs in the browser; re-reading its file means converting it here, and our
+    converter is a good fallback rather than an equal one. A conversion that has lost an input the stored
+    prompt had must not be adopted — running a graph that is one edit out of date beats running a broken
+    one, which is what happened when a dynamic combo's inputs went missing.
+    """
+    from comfywebstudio.api import workflows as workflows_api
+
+    project = await make_project(client)
+    workflow = await _import_from_comfy(
+        client, fake_comfy, project["id"], _comfy_graph_with_prompt("as imported")
+    )
+    before = (
+        await client.get(f"/api/projects/{project['id']}/workflows/{workflow['id']}/graph?fmt=api")
+    ).json()
+
+    # ComfyUI's copy moves on, but converting it here comes back missing something.
+    (fake_comfy.root / "user" / "default" / "workflows" / "edited.json").write_text(
+        json.dumps(_comfy_graph_with_prompt("chosen in comfyui"))
+    )
+    real = workflows_api.analyse_workflow
+
+    async def lossy(state, ui_graph, api_prompt, backend_id):
+        analysis = await real(state, ui_graph, api_prompt, backend_id)
+        for node in analysis.api_prompt.values():
+            node.get("inputs", {}).pop("port_name", None)
+        return analysis
+
+    monkeypatch.setattr(workflows_api, "analyse_workflow", lossy)
+
+    shot = (
+        await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Shot"})
+    ).json()
+    placed = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+        json={"workflow_id": workflow["id"]},
+    )
+    assert placed.status_code == 201, placed.text
+
+    after = (
+        await client.get(f"/api/projects/{project['id']}/workflows/{workflow['id']}/graph?fmt=api")
+    ).json()
+    assert after == before, "a lossy conversion replaced a working graph"
+
+    # And it says so, rather than leaving the user to wonder why an edit did not arrive.
+    current = (await client.get(f"/api/projects/{project['id']}/workflows")).json()[0]
+    assert any("could not be read back exactly" in w for w in current["warnings"])
+
+
+async def test_a_stored_graph_comfyui_would_refuse_is_converted_again(client, fake_comfy):
+    """A workflow imported by an older, worse converter must not stay broken forever.
+
+    Nothing re-reads a file that has not changed, so "the conversion improved" never reached a workflow
+    already in a project: it kept submitting a prompt ComfyUI rejects, and the only cure was deleting and
+    re-importing it. Being missing a required input is a precise enough signal to try again.
+    """
+    project = await make_project(client)
+    workflow = await _import_from_comfy(
+        client, fake_comfy, project["id"], _comfy_graph_with_prompt("as imported")
+    )
+
+    # Stand in for what an older converter left behind: a prompt short of a required input.
+    stored = (
+        await client.get(f"/api/projects/{project['id']}/workflows/{workflow['id']}/graph?fmt=api")
+    ).json()
+    damaged = {
+        node_id: {**node, "inputs": {k: v for k, v in node["inputs"].items() if k != "port_name"}}
+        for node_id, node in stored.items()
+    }
+    client.app_state.store.write_workflow(project["id"], workflow["id"], "api", damaged)
+    assert "port_name" not in (
+        await client.get(f"/api/projects/{project['id']}/workflows/{workflow['id']}/graph?fmt=api")
+    ).json()["1"]["inputs"]
+
+    # Placing it is enough — the ComfyUI file has not changed, so nothing else would have looked.
+    shot = (
+        await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Shot"})
+    ).json()
+    placed = await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+        json={"workflow_id": workflow["id"]},
+    )
+    assert placed.status_code == 201, placed.text
+
+    healed = (
+        await client.get(f"/api/projects/{project['id']}/workflows/{workflow['id']}/graph?fmt=api")
+    ).json()
+    assert healed["1"]["inputs"]["port_name"] == "prompt"

@@ -292,6 +292,22 @@ def subgraph_param_key(instance_path: str, name: str) -> str:
     return f"{SUBGRAPH_PREFIX}{instance_path}.{name}"
 
 
+def _current_value(api_prompt: dict[str, Any], targets: list[ParamTarget], fallback: Any) -> Any:
+    """What the prompt currently has on the first of these inputs, or `fallback`.
+
+    A list is a link to another node rather than a value, so it is not a default — the slot is being
+    driven, and there is nothing for a person to have chosen.
+    """
+    for target in targets:
+        node = api_prompt.get(target.node_id)
+        if not isinstance(node, dict):
+            continue
+        value = (node.get("inputs") or {}).get(target.input_name)
+        if value is not None and not isinstance(value, list):
+            return value
+    return fallback
+
+
 async def subgraph_params(
     ui_graph: dict[str, Any],
     api_prompt: dict[str, Any],
@@ -324,7 +340,14 @@ async def subgraph_params(
             key=subgraph_param_key(param.instance_path, param.name),
             kind=_SLOT_TYPE_TO_KIND.get(param.type.upper(), "string"),  # type: ignore[arg-type]
             label=param.name,
-            default=param.default,
+            # What the prompt actually says, before what the UI document seems to say.
+            #
+            # Both describe the same slot, but only one of them is what ComfyUI will run, and the prompt
+            # is the one ComfyUI itself produced. The UI reading has to map a positional `widgets_values`
+            # array onto slot names, and when that comes up empty the fallback is the *schema's* default —
+            # the first entry of a combo list. So a model picker set to the third checkpoint would quietly
+            # describe itself as the first, and injection would then write that back over the right one.
+            default=_current_value(api_prompt, targets, param.default),
             group=param.subgraph_name,
             order=order,
             node_id=targets[0].node_id,

@@ -22,6 +22,56 @@ const KIND_LABEL = { llm: 'asks a model', comfy: 'runs a workflow', capture: 'ke
 
 type Tab = 'steps' | 'transcript'
 
+const gigabytes = (bytes: number) => `${(bytes / 1e9).toFixed(1)} GB`
+
+/**
+ * What the language models are holding, and a way to make them let go.
+ *
+ * The flow alternates between a language model and ComfyUI, and on one graphics card they are competing
+ * for the same memory: a 7B model resident is several gigabytes an image model cannot have. Ollama
+ * releases it by itself after a few idle minutes, which is exactly the wrong amount of time when you have
+ * finished writing and want to start drawing.
+ *
+ * It only appears when something is actually loaded, so it is an answer to a question rather than another
+ * button to read past.
+ */
+function FreeVram() {
+  const toast = useToast()
+  const { data, refetch, isFetching } = useQuery({
+    queryKey: ['llm-loaded'],
+    queryFn: api.settings.llmLoaded,
+    // Ollama unloads on its own too, so a stale "still loaded" would be a lie within a minute or two.
+    refetchInterval: 30_000,
+  })
+
+  const free = useMutation({
+    mutationFn: () => api.settings.llmUnload(),
+    onSuccess: (result) => {
+      void refetch()
+      if (result.unloaded.length) toast.push('ok', `Released ${result.unloaded.join(', ')}.`)
+      else if (result.warnings.length) toast.push('bad', result.warnings.join(' '))
+    },
+    onError: (error: ApiError) => toast.push('bad', error.message),
+  })
+
+  if (!data?.models.length) return null
+
+  return (
+    <Button
+      size="sm"
+      variant="ghost"
+      disabled={free.isPending || isFetching}
+      title={
+        `In memory: ${data.models.map((m) => m.name).join(', ')}.\n` +
+        'Release it so ComfyUI can have the card.'
+      }
+      onClick={() => free.mutate()}
+    >
+      {free.isPending ? <Spinner /> : null} Free {gigabytes(data.vram)}
+    </Button>
+  )
+}
+
 export function PipelinePanel({
   project,
   board,
@@ -97,22 +147,25 @@ export function PipelinePanel({
       <PanelHeader
         actions={
           !stage && (
-            running ? (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={async () => {
-                  await api.storyboards.cancelPipeline(project.id, board.id)
-                  void refetchRun()
-                }}
-              >
-                Stop
-              </Button>
-            ) : (
-              <Button size="sm" disabled={runAll.isPending} onClick={() => runAll.mutate()}>
-                Run the flow
-              </Button>
-            )
+            <div className="flex items-center gap-1">
+              <FreeVram />
+              {running ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={async () => {
+                    await api.storyboards.cancelPipeline(project.id, board.id)
+                    void refetchRun()
+                  }}
+                >
+                  Stop
+                </Button>
+              ) : (
+                <Button size="sm" disabled={runAll.isPending} onClick={() => runAll.mutate()}>
+                  Run the flow
+                </Button>
+              )}
+            </div>
           )
         }
       >

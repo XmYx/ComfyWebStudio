@@ -383,6 +383,98 @@ def check_make_shot(url: str, pid: str, board_id: str, animator: str) -> None:
           "with nothing tucked into the step's parameters instead")
 
 
+def check_characters(page, url: str, pid: str, board_id: str) -> None:
+    """Drawing a character rather than hunting for a picture of somebody who does not exist."""
+    print("Drawing a character")
+    # One who can be drawn and one who cannot, so both halves of the rule are on screen at once.
+    drawable = _api(url, f"/api/projects/{pid}/storyboards/{board_id}/characters",
+                    {"name": "Elara", "appearance": "a weathered keeper in a grey oilskin coat"}, "POST")
+    _api(url, f"/api/projects/{pid}/storyboards/{board_id}/characters", {"name": "Nobody"}, "POST")
+    page.goto(f"{url}/p/{pid}/storyboard", wait_until="networkidle")
+    page.wait_for_timeout(1600)
+
+    row = page.locator(f"[data-character={drawable['id']}]")
+    draw = row.get_by_role("button", name="Draw them")
+    check(draw.count() == 1, "somebody with an appearance offers to be drawn")
+    check(page.get_by_role("button", name="Draw them").last.is_disabled(),
+          "and somebody without one cannot be drawn yet")
+
+    draw.click()
+    kept = None
+    for _ in range(120):
+        page.wait_for_timeout(500)
+        board = _api(url, f"/api/projects/{pid}/storyboards/{board_id}")
+        kept = next(
+            (c["reference_asset_ids"] for c in board["characters"] if c["id"] == drawable["id"]), []
+        )
+        if kept:
+            break
+    if not kept:
+        skip("the portrait did not draw — is ComfyUI reachable?")
+        return
+
+    check(True, "the drawn picture is kept as their reference by itself")
+    asset = _api(url, f"/api/projects/{pid}")["assets"][kept[0]]
+    check(asset["kind"] == "image", f"and it is an image asset ({asset['kind']})")
+    page.wait_for_timeout(1200)
+    check(row.get_by_role("button", name="Draw another").count() > 0,
+          "the button then offers another take")
+
+
+def check_finding_characters(url: str, pid: str, board_id: str) -> None:
+    """Asked twice, it must not hand back the cast it already gave you."""
+    print("Finding the characters twice")
+    providers = _api(url, "/api/settings/llm-providers")
+    if not providers or not _api(url, "/api/settings")["story"]["write_model"]:
+        skip("no writing model configured, so suggesting cannot be exercised")
+        return
+
+    # Whether anybody *new* is found depends on the premise and on who is already there — this board
+    # starts with one character, and a premise with one person in it. So the invariant is the thing worth
+    # asserting: whatever comes back, none of it is somebody the board already has.
+    first = _api(url, f"/api/projects/{pid}/storyboards/{board_id}/characters/suggest", None, "POST")
+    for character in first:
+        _api(url, f"/api/projects/{pid}/storyboards/{board_id}/characters", character, "POST")
+    print(f"    (found {len(first)} the first time)")
+
+    again = _api(url, f"/api/projects/{pid}/storyboards/{board_id}/characters/suggest", None, "POST")
+    known = {c["name"].strip().casefold() for c in
+             _api(url, f"/api/projects/{pid}/storyboards/{board_id}")["characters"]}
+    repeats = [c["name"] for c in again if c["name"].strip().casefold() in known]
+    check(not repeats, f"nobody already on the board is offered again ({repeats})")
+
+    names = [c["name"].strip().casefold() for c in again]
+    check(len(names) == len(set(names)), f"and nobody is offered twice in one answer ({names})")
+
+
+def check_free_vram(page, url: str, pid: str) -> None:
+    """The button that hands the graphics card back, and only when there is something to hand back."""
+    print("Freeing the graphics card")
+    page.goto(f"{url}/p/{pid}/storyboard", wait_until="networkidle")
+    page.wait_for_timeout(1200)
+    page.locator("button:text-is('Flow')").first.click()
+    page.wait_for_timeout(1000)
+
+    loaded = _api(url, "/api/settings/llm-loaded")
+    button = page.get_by_role("button", name="Free", exact=False)
+
+    if not loaded["models"]:
+        # Nothing resident, so nothing to offer — a button reading "Free 0.0 GB" would be furniture.
+        check(button.count() == 0, "no button when no model is holding memory")
+        skip("nothing is loaded, so releasing it cannot be exercised")
+        return
+
+    check(button.count() > 0, f"the button appears while {len(loaded['models'])} model(s) are loaded")
+    check("GB" in button.first.inner_text(),
+          f"and says what pressing it gets back ({button.first.inner_text()!r})")
+
+    button.first.click()
+    page.wait_for_timeout(4000)
+    check(not _api(url, "/api/settings/llm-loaded")["models"], "pressing it releases them")
+    check(page.get_by_role("button", name="Free", exact=False).count() == 0,
+          "and the button goes away with them")
+
+
 def check_binding_panel(page, url: str, pid: str, board_id: str, drawer: str, animator: str) -> None:
     """Choosing several bindings in a row, through the panel, keeps every one of them.
 
@@ -540,6 +632,14 @@ def main() -> int:
             check_flow_panel(page, args.url, pid, board_id)
             print()
             check_binding_panel(page, args.url, pid, board_id, drawer, animator)
+            print()
+            check_finding_characters(args.url, pid, board_id)
+            print()
+            check_characters(page, args.url, pid, board_id)
+            print()
+            # Last, deliberately: it puts the models out of memory, and anything after it would pay to
+            # load them again.
+            check_free_vram(page, args.url, pid)
             print()
 
             real = [e for e in errors if "favicon" not in e.lower()]

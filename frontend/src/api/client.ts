@@ -13,8 +13,8 @@ import type {
   Vec2, Version, WorkflowRef,
   BoardStills, BoardSurfaces, DrawResult, LlmModel, LlmProviderConfig, Storyboard,
   StoryboardCharacter, StoryboardFrame,
-  AppPipelineView, Pipeline, PipelineRun, PipelineView, Stage, StageRun, StageRunPreview,
-  StageRunResult,
+  AppPipelineView, LoadedModels, Pipeline, PipelineRun, PipelineView, Stage, StageRun,
+  StageRunPreview, StageRunResult,
 } from './types'
 
 export class ApiError extends Error {
@@ -479,6 +479,12 @@ export const api = {
         `/api/projects/${projectId}/storyboards/${boardId}/characters/${characterId}`,
         { method: 'PATCH', body: json(body) },
       ),
+    /** Draw this character's reference with the board's text-to-image workflow. Kept automatically. */
+    drawCharacter: (projectId: string, boardId: string, characterId: string) =>
+      request<{ run_id: string; shot_id: string; step_id: string; workflow: string }>(
+        `/api/projects/${projectId}/storyboards/${boardId}/characters/${characterId}/portrait`,
+        { method: 'POST' },
+      ),
     removeCharacter: (projectId: string, boardId: string, characterId: string) =>
       request<void>(
         `/api/projects/${projectId}/storyboards/${boardId}/characters/${characterId}`,
@@ -731,6 +737,14 @@ export const api = {
       request<Array<{ name: string; size: string; vision: boolean; note: string }>>(
         '/api/settings/llm-library',
       ),
+
+    /** Which language models are holding memory right now, across the storyboard's providers. */
+    llmLoaded: () => request<LoadedModels>('/api/settings/llm-loaded'),
+    /** Let go of them, so an image model can have the card. */
+    llmUnload: (model?: string) =>
+      request<{ unloaded: string[]; warnings: string[] }>('/api/settings/llm-unload', {
+        method: 'POST', body: json({ model: model ?? null }),
+      }),
 
     /** The storyboard flow every board starts from, for this whole install. */
     pipeline: () => request<AppPipelineView>('/api/settings/pipeline'),

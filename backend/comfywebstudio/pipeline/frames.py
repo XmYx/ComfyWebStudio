@@ -154,34 +154,41 @@ def reference_nodes(
         )
 
 
-def ensure_step(
+def ensure_drawing_step(
     project,
     board: Storyboard,
     shot: Shot,
     workflow: WorkflowRef,
-    frame: StoryboardFrame,
     *,
+    owner_id: str,
+    order: int,
     prompt: str,
     slot: WorkflowSlot,
+    frame: StoryboardFrame | None = None,
 ) -> Step:
-    """The step that draws this frame, created if it has none, with its prompt brought up to date.
+    """The step that draws for this owner, created if it has none, with its prompt brought up to date.
+
+    An owner is a frame or a character: a frame's still and a character's reference picture are the same
+    job — run the drawing workflow with one prompt — so they are the same step, named by whose it is.
+    That naming is what ties the two together without a second mapping to keep in step.
 
     Idempotent, which is what makes "I edited frame 3's prompt, draw it again" a one-step run rather than
-    a rebuild. Steps are named by their frame's id, which ties one back to the other without a second
-    mapping to keep in step.
+    a rebuild.
 
     `prompt` arrives already rendered. That is the whole difference between a drawing step whose wording
     is fixed in code and one a user can edit.
     """
-    step = next((s for s in shot.steps if s.name == frame.id), None)
+    step = next((s for s in shot.steps if s.name == owner_id), None)
     if step is None:
         step = Step(
-            name=frame.id,
+            name=owner_id,
             workflow_id=workflow.id,
-            ui_pos=Vec2(x=40.0, y=40.0 + 220.0 * frame.order),
+            ui_pos=Vec2(x=40.0, y=40.0 + 220.0 * order),
         )
         shot.steps.append(step)
-        reference_nodes(project, board, frame, shot, step, slot.reference_params)
+        # Only a frame has characters to feed in. A character's own portrait is what a reference *is*.
+        if frame is not None:
+            reference_nodes(project, board, frame, shot, step, slot.reference_params)
 
     if step.workflow_id != workflow.id:
         # The board was re-bound to a different workflow. Values set for the old one are meaningless
@@ -192,6 +199,23 @@ def ensure_step(
 
     step.param_overrides[slot.prompt_param] = prompt
     return step
+
+
+def ensure_step(
+    project,
+    board: Storyboard,
+    shot: Shot,
+    workflow: WorkflowRef,
+    frame: StoryboardFrame,
+    *,
+    prompt: str,
+    slot: WorkflowSlot,
+) -> Step:
+    """The step that draws this frame. See :func:`ensure_drawing_step`."""
+    return ensure_drawing_step(
+        project, board, shot, workflow,
+        owner_id=frame.id, order=frame.order, prompt=prompt, slot=slot, frame=frame,
+    )
 
 
 def reseed(step: Step, workflow: WorkflowRef) -> bool:

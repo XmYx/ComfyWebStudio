@@ -36,7 +36,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from ..core.errors import NotFound, ValidationFailed
-from ..core.models import Shot
+from ..core.models import Asset, AssetSource, Shot, utcnow
 from ..core.pipeline import Pipeline, Stage, StageRun
 from ..core.prompting import render
 from ..core.storyboard import (
@@ -46,10 +46,11 @@ from ..core.storyboard import (
     StoryboardFrame,
 )
 from ..pipeline import sinks
-from ..pipeline.builtin import builtin_pipeline
+from ..pipeline.builtin import PORTRAIT_PROMPT, builtin_pipeline
 from ..pipeline.context import build_context
 from ..pipeline.frames import (
     STILLS_PREFIX,
+    ensure_drawing_step,
     ensure_step,
     slot_workflow,
     stills_shot,
@@ -540,6 +541,125 @@ def delete_character(
         frame.character_ids = [c for c in frame.character_ids if c != character_id]
     board.touch()
     state.store.save(project)
+
+
+# -- drawing a character rather than dragging one in -------------------------------------------------------
+
+
+def _character(board: Storyboard, character_id: str) -> StoryboardCharacter:
+    character = board.character(character_id)
+    if character is None:
+        raise NotFound(f"No character {character_id!r}")
+    return character
+
+
+async def _keep_portrait(state, project_id: str, board_id: str, character_id: str, run_id: str) -> None:
+    """Wait for the drawing to finish, then keep it as the character's reference.
+
+    A reference has to be an *asset*: an asset id is what gets wired into a workflow's reference input, and
+    a run's artifacts are cleared when its history is. So unlike a frame — where the picture on screen is
+    useful long before anyone keeps it — a portrait is only worth anything once it is kept, and making that
+    a second click would be a second click nobody would ever want to skip.
+    """
+    try:
+        await _keep_portrait_now(state, project_id, board_id, character_id, run_id)
+    except Exception as exc:  # noqa: BLE001 - nobody awaits this, so a failure would vanish otherwise
+        logger.warning("Could not keep the reference drawn for %s: %s", character_id, exc)
+
+
+async def _keep_portrait_now(
+    state, project_id: str, board_id: str, character_id: str, run_id: str
+) -> None:
+    from ..pipeline.frames import find_stills_shot
+
+    run = await state.orchestrator.wait(run_id)
+    if run is None or run.status not in {"success", "cached"}:
+        logger.info("The reference for %s was not drawn (%s)", character_id, run and run.status)
+        return
+
+    project = state.store.load(project_id)
+    board = next((b for b in project.storyboards if b.id == board_id), None)
+    character = board.character(character_id) if board else None
+    shot = find_stills_shot(project, board) if board else None
+    if board is None or character is None or shot is None:
+        logger.warning(
+            "Nothing to keep the reference on: board=%s character=%s shot=%s",
+            bool(board), bool(character), bool(shot),
+        )
+        return
+
+    step = next((s for s in shot.steps if s.name == character_id), None)
+    latest = state.store.latest_step_runs(project_id, shot.id).get(step.id) if step else None
+    artifact = next(
+        (a for a in latest["step_run"].outputs if a.kind == "image"), None
+    ) if latest else None
+    if artifact is None:
+        logger.warning(
+            "The reference for %s drew nothing to keep: step=%s, a run of it=%s, images=%s",
+            character_id, step and step.id, bool(latest),
+            [a.kind for a in latest["step_run"].outputs] if latest else [],
+        )
+        return
+
+    asset = Asset(
+        name=f"{character.name or 'character'} · reference",
+        kind="image",
+        path=artifact.path,
+        thumb=artifact.thumb,
+        sha256=artifact.sha256,
+        meta=dict(artifact.meta),
+        created=utcnow(),
+        source=AssetSource(shot_id=shot.id, step_id=step.id, port_key=artifact.port_key),
+    )
+    project.assets[asset.id] = asset
+    character.reference_asset_ids.append(asset.id)
+    board.touch()
+    state.store.save(project)
+    state.events.emit(
+        "project.changed", project_id=project_id, data={"action": "character_reference_drawn"}
+    )
+
+
+@router.post("/{board_id}/characters/{character_id}/portrait", status_code=202)
+async def draw_character(
+    state: StateDep, project: ProjectDep, board_id: str, character_id: str
+) -> dict[str, Any]:
+    """Draw this character's reference picture with the board's text-to-image workflow.
+
+    The alternative is finding a picture of an imaginary person somewhere else and dragging it in, which
+    for a character who does not exist means generating it in ComfyUI and exporting it by hand — the same
+    workflow, done the long way round.
+    """
+    board = _board(project, board_id)
+    character = _character(board, character_id)
+    if not character.appearance.strip():
+        raise ValidationFailed(
+            f"{character.name or 'This character'} has no appearance written yet, so there is nothing to "
+            "draw. Describe them first, or press Find them to have one written."
+        )
+
+    stage = _stage(state, board, "draw")
+    workflow, slot = workflow_for(project, board, stage.slot)
+    await state.sync_workflow(project, workflow)
+
+    shot = stills_shot(project, board)
+    step = ensure_drawing_step(
+        project, board, shot, workflow,
+        owner_id=character.id,
+        # Below the frames, so a canvas holding both reads in the order the work happens.
+        order=len(board.frames) + board.characters.index(character),
+        prompt=render(PORTRAIT_PROMPT, build_context(project, board, character=character))[0],
+        slot=slot,
+    )
+    state.store.save(project)
+
+    run = await state.orchestrator.start(project, shot, mode="step", step_ids=[step.id], force=True)
+    # Keeping it is what makes it usable, so it happens by itself once the picture exists.
+    state.spawn(
+        _keep_portrait(state, project.id, board.id, character.id, run.id),
+        name=f"portrait:{character.id}",
+    )
+    return {"run_id": run.id, "shot_id": shot.id, "step_id": step.id, "workflow": workflow.name}
 
 
 # -- what a workflow can actually take -------------------------------------------------------------------

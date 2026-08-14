@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.storyboard import Storyboard, StoryboardFrame
+from ..core.storyboard import Storyboard, StoryboardCharacter, StoryboardFrame
 from ..llm.storywriter import as_text
 
 #: How much premise the vision model is given. It only needs enough to know what it is looking at, and the
@@ -39,11 +39,13 @@ def build_context(
     count: int | None = None,
     outputs: dict[str, dict[str, Any]] | None = None,
     previous: str | None = None,
+    character: StoryboardCharacter | None = None,
 ) -> dict[str, str]:
     """The tokens available to a stage's templates.
 
     `outputs` carries what earlier stages in this pipeline run returned, keyed by stage id, reachable as
     ``{stage.<id>.<key>}``; `previous` names the stage whose outputs are also reachable as ``{prev.<key>}``.
+    `character` is set when the work is about one person rather than one frame — drawing their reference.
     """
     characters = character_block(board)
     context: dict[str, str] = {
@@ -86,6 +88,14 @@ def build_context(
         })
         for key, value in frame.fields.items():
             context[f"frame.fields.{key}"] = value
+
+    if character is not None:
+        context.update({
+            "character.id": character.id,
+            "character.name": character.name,
+            "character.description": character.description,
+            "character.appearance": character.appearance,
+        })
 
     for stage_id, payload in (outputs or {}).items():
         for key, value in payload.items():

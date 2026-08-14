@@ -298,7 +298,9 @@ def _apply(
                 proposed += frames
 
         elif output.writes == "board.characters":
-            people = sinks.characters_from(value)
+            # Against the board as well as against itself: proposing someone who is already there is the
+            # one thing this step does that a person then has to undo by hand.
+            people = sinks.characters_from(value, known=ctx.board.characters)
             written.append(
                 WriteRecord(
                     target=output.writes,

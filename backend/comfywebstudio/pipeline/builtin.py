@@ -17,8 +17,9 @@ from __future__ import annotations
 
 from ..core.pipeline import OutputField, Pipeline, Stage, StageModel, StageRetry
 
-#: Bumped when any built-in stage below changes.
-BUILTIN_REVISION = 1
+#: Bumped when any built-in stage below changes. A board that edited a stage records the revision it
+#: diverged at, which is how the panel can say the default has moved on since.
+BUILTIN_REVISION = 2
 
 WRITER_SYSTEM = """You are a storyboard artist working with a director.
 
@@ -68,9 +69,14 @@ CHARACTERS_PROMPT = """Who appears in this? Name each person or creature that re
 PREMISE:
 {board.premise}
 
+[[These are already known. Do not list them again, and do not list them under another name:
+{character_names}]]
+
 Answer with:
 {"characters": [{"name": "...", "description": "who they are",
-  "appearance": "what they look like, written for an image generator"}]}"""
+  "appearance": "what they look like, written for an image generator"}]}
+
+Answer with an empty list if there is nobody new."""
 
 DESCRIBE_PROMPT = """This is the still for one shot of a storyboard.
 
@@ -99,6 +105,10 @@ DRAW_PROMPT = "{frame.image_prompt} {board.style}"
 
 #: The motion prompt, falling back to the image prompt when nobody has written one.
 SHOT_PROMPT = "{frame.motion}"
+
+#: What a character's reference picture is drawn from. Their appearance is written for an image generator
+#: already — that is what the field is for — so this is mostly the house style catching up with it.
+PORTRAIT_PROMPT = "{character.appearance} {board.style}"
 
 
 def builtin_pipeline() -> Pipeline:

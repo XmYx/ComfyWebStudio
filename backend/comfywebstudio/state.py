@@ -125,6 +125,8 @@ class AppState:
         self.pipelines = PipelineRunner(self)
         #: Tokens handed to the ComfyUI bridge extension, mapped to the step they may write to.
         self.bridge_tokens: dict[str, dict[str, str]] = {}
+        #: Work that outlives the request that started it. Held strongly; see `spawn`.
+        self._background: set[asyncio.Task] = set()
 
     async def startup(self) -> None:
         logger.info("ComfyWebStudio starting; state root %s", self.settings.root)
@@ -137,10 +139,26 @@ class AppState:
                 logger.warning("Backend %s not available at startup: %s", config.name, exc)
 
     async def shutdown(self) -> None:
+        for task in list(self._background):
+            task.cancel()
+        if self._background:
+            await asyncio.gather(*self._background, return_exceptions=True)
         await self.pipelines.shutdown()
         await self.orchestrator.shutdown()
         await self.backends.close()
         await self.events.close()
+
+    def spawn(self, coro, *, name: str = "") -> asyncio.Task:
+        """Run something after the response has gone, without losing it to the garbage collector.
+
+        `asyncio.create_task` only holds a *weak* reference to the task through the loop, so a task
+        nobody keeps can be collected while it is still waiting — which is how a portrait that drew
+        perfectly well was never kept. Holding it until it is done is the whole job.
+        """
+        task = asyncio.create_task(coro, name=name or "background")
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        return task
 
     async def sync_workflow(self, project, workflow, *, backend_id: str | None = None) -> bool:
         """Bring our copy of a workflow up to date with ComfyUI's before it is used.

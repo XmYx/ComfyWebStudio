@@ -43,6 +43,21 @@ class ModelInfo:
 
 
 @dataclass(slots=True)
+class LoadedModel:
+    """One model currently sitting in memory, and how much of it is on the graphics card."""
+
+    name: str
+    #: Bytes of VRAM. 0 when it is on the processor, or when the provider does not break it down.
+    vram: int = 0
+    size: int = 0
+    #: When the provider intends to release it by itself, if it says.
+    expires: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "vram": self.vram, "size": self.size, "expires": self.expires}
+
+
+@dataclass(slots=True)
 class Reply:
     text: str
     model: str = ""
@@ -89,6 +104,24 @@ class LlmProvider(ABC):
         raise LlmError(
             f"{self.config.name} does not manage its own models — they are whatever the server was "
             "started with. Pull it there, or use Ollama."
+        )
+
+    async def loaded(self) -> list[LoadedModel]:
+        """Models resident in memory right now. Empty when the provider cannot say."""
+        return []
+
+    async def unload(self, model: str | None = None) -> list[str]:
+        """Put loaded models out of memory, and say which ones went.
+
+        The point is the graphics card. A language model and an image model competing for the same VRAM
+        means the second one runs on the processor, or does not run at all — and the storyboard flow uses
+        both, one after the other, so releasing one before the other starts is worth a button.
+
+        Only meaningful where the provider owns the process holding the memory.
+        """
+        raise LlmError(
+            f"{self.config.name} runs somewhere this app does not manage, so its memory is not ours to "
+            "free. Stop the model there instead."
         )
 
     async def close(self) -> None:  # pragma: no cover - most providers hold nothing open

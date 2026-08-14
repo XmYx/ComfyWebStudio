@@ -22,7 +22,7 @@ from ..comfy.discovery import (
     raw_param_key,
     subgraph_params,
 )
-from ..comfy.graph_convert import ui_graph_to_prompt
+from ..comfy.graph_convert import CONVERTER_VERSION, EXACT, ui_graph_to_prompt
 from ..comfy.objectinfo import WidgetSpec
 from ..comfy.userdata import (
     ensure_saved_in_comfy,
@@ -76,6 +76,8 @@ class WorkflowAnalysis:
     warnings: list[str] = field(default_factory=list)
     missing_nodes: list[str] = field(default_factory=list)
     hash: str = ""
+    #: Which converter produced `api_prompt`, or EXACT when ComfyUI did.
+    converted_by: int = EXACT
 
 
 async def analyse_workflow(
@@ -84,6 +86,8 @@ async def analyse_workflow(
     """Convert the document if we only have the UI format, then find every port and parameter."""
     warnings: list[str] = []
     ui_graph = ui_graph or {}
+    # Given a prompt, it came from ComfyUI — the bridge, or an API-format export. Nothing to improve on.
+    converted_by = EXACT if api_prompt is not None else CONVERTER_VERSION
 
     if api_prompt is None:
         if not ui_graph:
@@ -135,6 +139,9 @@ async def analyse_workflow(
             f"Found {len(promoted)} parameter(s) promoted by this workflow's subgraph(s)."
         )
 
+    if object_info is not None:
+        warnings.extend(await _absent_choices(api_prompt, object_info))
+
     if not result.ports:
         warnings.append(
             "No ComfyWebStudio input or output nodes were found. Add WS nodes in ComfyUI to expose "
@@ -149,7 +156,38 @@ async def analyse_workflow(
         warnings=warnings,
         missing_nodes=missing,
         hash=prompt_hash(api_prompt),
+        converted_by=converted_by,
     )
+
+
+async def _absent_choices(prompt: dict[str, Any], object_info) -> list[str]:
+    """Combo values this ComfyUI does not offer — a model file that is not on the machine, usually.
+
+    ComfyUI refuses the whole output for one of these, so finding them at import is worth a great deal
+    more than finding them in a run log. Reported rather than corrected: substituting a model nobody
+    chose is exactly the kind of quiet wrongness this codebase refuses to commit.
+    """
+    absent: list[str] = []
+    for node_id, node in prompt.items():
+        if not isinstance(node, dict):
+            continue
+        try:
+            widgets = await object_info.widgets(str(node.get("class_type") or ""))
+        except Exception:  # noqa: BLE001 - an unknown node type is reported separately
+            continue
+        for widget in widgets:
+            if not widget.choices:
+                continue
+            value = (node.get("inputs") or {}).get(widget.name)
+            if isinstance(value, list | dict) or value is None:
+                continue
+            if str(value) not in widget.choices:
+                absent.append(
+                    f"{node.get('class_type')} (node {node_id}) wants {widget.name}="
+                    f"{value!r}, which this ComfyUI does not have. Install it, or choose another in "
+                    "ComfyUI and save."
+                )
+    return absent[:10]
 
 
 async def _ingest(
@@ -165,6 +203,7 @@ async def _ingest(
         hash=analysis.hash,
         missing_nodes=analysis.missing_nodes,
         warnings=analysis.warnings,
+        converted_by=analysis.converted_by,
         last_synced=utcnow(),
     )
 
@@ -273,30 +312,130 @@ async def sync_workflow(state, project, workflow, *, backend_id: str | None = No
     The comparison is the point of the fast path: reading one file and finding it unchanged costs a round
     trip, while re-analysing a graph costs an ``/object_info`` fetch and a full conversion. Placing ten
     steps should not pay the second cost ten times.
+
+    It also re-converts a stored prompt that is **not runnable**, whatever ComfyUI's file says. A prompt
+    written by an older, worse version of the converter would otherwise stay broken for the life of the
+    project: nothing re-reads a file that has not changed, so "the conversion improved" never reached a
+    workflow already imported. Being missing a required input is a precise enough signal to act on.
     """
-    if not workflow.comfy_userdata_path:
+    stored_ui = _stored_graph(state, project.id, workflow.id, "ui")
+    stored = _stored_graph(state, project.id, workflow.id, "api")
+
+    fresh = None
+    if workflow.comfy_userdata_path:
+        try:
+            backend = await state.backends.get(backend_id)
+            fresh = await read_from_comfy(backend, workflow)
+        except Exception as exc:  # noqa: BLE001 - a stored copy is still perfectly usable
+            logger.debug("Could not re-read %r from ComfyUI: %s", workflow.name, exc)
+
+    moved = fresh is not None and fresh != stored_ui
+    broken = await _missing_required(state, stored, backend_id) if stored else set()
+    # A prompt this converter has since learned to do better. Worth redoing even when nothing else has
+    # changed: a mis-slid widget value is a *valid* value in the wrong place, so no amount of inspecting
+    # the stored prompt would ever reveal it — only converting the graph again does.
+    outdated = bool(stored_ui) and 0 <= workflow.converted_by < CONVERTER_VERSION
+
+    if not moved and not broken and not outdated:
         return False
+
+    if moved:
+        logger.info("%r has changed in ComfyUI; re-reading it before use", workflow.name)
+    elif broken:
+        logger.info(
+            "%r is stored in a state ComfyUI would refuse (%d input(s) missing, e.g. %s); "
+            "converting it again",
+            workflow.name, len(broken), sorted(broken)[0],
+        )
+    else:
+        logger.info(
+            "%r was converted by an older version of the converter (%d < %d); converting it again",
+            workflow.name, workflow.converted_by, CONVERTER_VERSION,
+        )
 
     try:
-        backend = await state.backends.get(backend_id)
-        fresh = await read_from_comfy(backend, workflow)
-    except Exception as exc:  # noqa: BLE001 - a stored copy is still perfectly usable
-        logger.debug("Could not re-read %r from ComfyUI: %s", workflow.name, exc)
-        return False
-
-    if fresh is None or fresh == _stored_graph(state, project.id, workflow.id, "ui"):
-        return False
-
-    logger.info("%r has changed in ComfyUI; re-reading it before use", workflow.name)
-    try:
-        analysis = await analyse_workflow(state, fresh, None, backend_id)
+        analysis = await analyse_workflow(state, fresh if moved else stored_ui, None, backend_id)
     except Exception as exc:  # noqa: BLE001 - mid-edit graphs are common and not our problem
-        logger.debug("ComfyUI's copy of %r could not be converted: %s", workflow.name, exc)
+        logger.debug("The graph for %r could not be converted: %s", workflow.name, exc)
+        return False
+
+    # Re-reading means re-*converting*, because ComfyUI's own graphToPrompt runs in the browser and only
+    # the bridge extension ever posts its output back. Our converter is a good fallback and not an equal
+    # one — a dynamic combo, for instance, occupies several slots of a positional array in a way no flat
+    # list of names can express. So a conversion that has *lost* something the stored prompt had must not
+    # replace it: being one edit out of date is a far better outcome than silently running a broken graph.
+    lost = _lost_inputs(analysis.api_prompt, stored) if stored else set()
+    # Losing an input the stored prompt had is only a reason to refuse when the stored one *worked*.
+    # A prompt that is already missing required inputs has nothing worth protecting.
+    if lost and not broken:
+        # Recorded even so, or every placement would try this again and reach the same conclusion.
+        workflow.converted_by = CONVERTER_VERSION
+        workflow.warnings = [
+            f"ComfyUI's copy could not be read back exactly — converting it here loses "
+            f"{len(lost)} input(s), starting with {sorted(lost)[0]}. The previously stored graph is "
+            "still being used. Open it in ComfyUI and press 'Save to ComfyWebStudio' to sync it exactly.",
+            *[w for w in workflow.warnings if "could not be read back exactly" not in w],
+        ]
+        state.store.save(project)
+        logger.warning(
+            "Converting ComfyUI's copy of %r drops %d input(s); keeping the stored graph",
+            workflow.name, len(lost),
+        )
         return False
 
     _apply_analysis(state, project, workflow, analysis)
     state.store.save(project)
     return True
+
+
+async def _missing_required(state, prompt: dict, backend_id: str | None) -> set[str]:
+    """Required inputs a prompt does not supply — what ComfyUI refuses a whole output for.
+
+    Read from the node schema rather than from our own widget list, because the point is to agree with
+    ComfyUI's validator: link inputs and a dynamic combo's revealed widgets count too.
+    """
+    if not prompt:
+        return set()
+    try:
+        object_info = await state.backends.object_info(backend_id)
+    except Exception:  # noqa: BLE001 - without a schema there is nothing to check against
+        return set()
+
+    absent: set[str] = set()
+    for node_id, node in prompt.items():
+        if not isinstance(node, dict):
+            continue
+        try:
+            schema = await object_info.node(str(node.get("class_type") or ""))
+        except Exception:  # noqa: BLE001 - an unknown node type is reported elsewhere
+            continue
+        if not schema:
+            continue
+        have = set(node.get("inputs") or {})
+        absent |= {
+            f"{node_id}.{name}"
+            for name in ((schema.get("input") or {}).get("required") or {})
+            if name not in have
+        }
+    return absent
+
+
+def _lost_inputs(fresh: dict, stored: dict) -> set[str]:
+    """Inputs the stored prompt supplies that a fresh conversion of the same graph does not.
+
+    Compared as plain keys rather than against ``/object_info``, because the inputs most likely to go
+    missing are exactly the ones the schema describes least well — a dynamic combo's sub-widgets do not
+    appear as widgets at all. A node that has genuinely been deleted is not a loss; a node that survived
+    with fewer inputs than before is.
+    """
+    lost: set[str] = set()
+    for node_id, node in stored.items():
+        current = fresh.get(node_id)
+        if not isinstance(node, dict) or not isinstance(current, dict):
+            continue
+        absent = set(node.get("inputs") or {}) - set(current.get("inputs") or {})
+        lost |= {f"{node_id}.{name}" for name in absent}
+    return lost
 
 
 def _apply_analysis(state, project, workflow, analysis, *, warning: str | None = None) -> set[str]:
@@ -317,6 +456,7 @@ def _apply_analysis(state, project, workflow, analysis, *, warning: str | None =
     workflow.hash = analysis.hash
     workflow.warnings = ([warning] if warning else []) + analysis.warnings
     workflow.missing_nodes = analysis.missing_nodes
+    workflow.converted_by = analysis.converted_by
     workflow.last_synced = utcnow()
 
     state.store.write_workflow(project.id, workflow.id, "api", analysis.api_prompt)

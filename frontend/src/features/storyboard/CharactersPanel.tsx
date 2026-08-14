@@ -10,9 +10,11 @@
  * having already chosen a workflow.
  */
 
+import { useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 
 import { api, ApiError } from '@/api/client'
+import { useStudioEvents } from '@/api/events'
 import type { Project, Storyboard, StoryboardCharacter } from '@/api/types'
 import { isOurDrag, readDrag } from '@/lib/dnd'
 import {
@@ -29,21 +31,46 @@ export function CharactersPanel({ project, board, onChanged }: Props) {
   const toast = useToast()
   const fail = (error: unknown) => toast.push('bad', (error as ApiError).message)
 
+  /** Characters whose reference is being drawn right now, so the row can say so. */
+  const [drawing, setDrawing] = useState<Record<string, boolean>>({})
+
   const suggest = useMutation({
     mutationFn: () => api.storyboards.suggestCharacters(project.id, board.id),
     onSuccess: async (found) => {
       // Proposing is not deciding — but with nothing there yet, accepting them all is the obvious
       // next click, so it is done for you and can be edited or deleted like anything else.
-      const known = new Set(board.characters.map((c) => c.name.toLowerCase()))
-      const fresh = found.filter((c) => !known.has(c.name.toLowerCase()))
-      for (const character of fresh) {
+      //
+      // Anyone already on the board has been filtered out by the server, which also knows to tell the
+      // model who it already has. Asked twice, this used to hand back the whole cast again.
+      for (const character of found) {
         await api.storyboards.addCharacter(project.id, board.id, character)
       }
-      toast.push('ok', fresh.length ? `Added ${fresh.length}.` : 'Nobody new was found.')
+      toast.push('ok', found.length ? `Added ${found.length}.` : 'Nobody new was found.')
       onChanged()
     },
     onError: fail,
   })
+
+  const drawPortrait = async (character: StoryboardCharacter) => {
+    setDrawing((busy) => ({ ...busy, [character.id]: true }))
+    try {
+      await api.storyboards.drawCharacter(project.id, board.id, character.id)
+    } catch (error) {
+      setDrawing(({ [character.id]: _done, ...rest }) => rest)
+      fail(error)
+    }
+  }
+
+  // The picture is kept as an asset by the server once the run finishes, which is what makes it usable
+  // as a reference at all — so the row just waits for the project to change under it.
+  useStudioEvents((event) => {
+    if (event.type !== 'run.finished' && event.type !== 'project.changed') return
+    setDrawing({})
+    if (event.type === 'project.changed'
+        && (event.data as { action?: string }).action === 'character_reference_drawn') {
+      onChanged()
+    }
+  }, [board.id])
 
   const patch = async (character: StoryboardCharacter, body: Partial<StoryboardCharacter>) => {
     try {
@@ -97,8 +124,9 @@ export function CharactersPanel({ project, board, onChanged }: Props) {
       <div className="min-h-0 flex-1 overflow-y-auto p-2">
         {!board.characters.length ? (
           <Empty title="Nobody yet">
-            Press <strong>Find them</strong> to read the premise, or add one by hand. Drag an asset onto a
-            character to use it as their reference.
+            Press <strong>Find them</strong> to read the premise, or add one by hand. Write what somebody
+            looks like and <strong>Draw them</strong> makes their reference picture; dragging an asset onto
+            a character works too.
           </Empty>
         ) : (
           board.characters.map((character) => (
@@ -167,8 +195,22 @@ export function CharactersPanel({ project, board, onChanged }: Props) {
                     </button>
                   )
                 })}
-                {!character.reference_asset_ids.length && (
-                  <Badge tone="muted">drag an asset here</Badge>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={drawing[character.id] || !character.appearance.trim()}
+                  title={
+                    character.appearance.trim()
+                      ? 'Draw them with the text-to-image workflow, from what you wrote above'
+                      : 'Write what they look like first'
+                  }
+                  onClick={() => void drawPortrait(character)}
+                >
+                  {drawing[character.id] ? <Spinner /> : null}
+                  {character.reference_asset_ids.length ? 'Draw another' : 'Draw them'}
+                </Button>
+                {!character.reference_asset_ids.length && !drawing[character.id] && (
+                  <Badge tone="muted">or drag an asset here</Badge>
                 )}
               </div>
             </div>

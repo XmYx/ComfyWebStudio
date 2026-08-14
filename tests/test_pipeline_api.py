@@ -10,6 +10,8 @@ answer rather than a hope.
 
 from __future__ import annotations
 
+import asyncio
+
 from tests.test_api import run_and_wait
 from tests.test_storyboard import (  # noqa: F401 - the autouse fixture travels with them
     ScriptedProvider,
@@ -730,3 +732,220 @@ class TestRebuildingAShot:
         again = await client.post(f"/api/projects/{pid}/storyboards/{bid}/frames/{fid}/shot")
         assert again.status_code == 422
         assert "Delete that shot to rebuild it" in again.text
+
+
+class TestFreeingTheGraphicsCard:
+    """The flow alternates between a language model and ComfyUI, and they want the same memory."""
+
+    @staticmethod
+    def _holding(monkeypatch, models):
+        """Make the scripted provider report — and release — some resident models."""
+        from comfywebstudio.llm.provider import LoadedModel
+
+        held = list(models)
+
+        async def loaded(self):
+            return [LoadedModel(name=n, vram=v) for n, v in held]
+
+        async def unload(self, model=None):
+            gone = [n for n, _ in held if model is None or n == model]
+            held[:] = [(n, v) for n, v in held if n not in gone]
+            return gone
+
+        monkeypatch.setattr(ScriptedProvider, "loaded", loaded, raising=False)
+        monkeypatch.setattr(ScriptedProvider, "unload", unload, raising=False)
+        return held
+
+    async def test_it_reports_what_is_in_memory(self, client, monkeypatch):
+        self._holding(monkeypatch, [("writer", 4_000_000_000), ("looker", 3_300_000_000)])
+
+        body = (await client.get("/api/settings/llm-loaded")).json()
+        assert [m["name"] for m in body["models"]] == ["writer", "looker"]
+        assert body["vram"] == 7_300_000_000
+
+    async def test_it_releases_everything_and_says_what_went(self, client, monkeypatch):
+        held = self._holding(monkeypatch, [("writer", 4_000_000_000)])
+
+        freed = (await client.post("/api/settings/llm-unload", json={})).json()
+        assert freed["unloaded"] == ["writer"]
+        assert held == []
+        assert (await client.get("/api/settings/llm-loaded")).json()["models"] == []
+
+    async def test_one_model_can_be_released_on_its_own(self, client, monkeypatch):
+        self._holding(monkeypatch, [("writer", 1), ("looker", 2)])
+
+        freed = (await client.post("/api/settings/llm-unload", json={"model": "looker"})).json()
+        assert freed["unloaded"] == ["looker"]
+        assert [m["name"] for m in (await client.get("/api/settings/llm-loaded")).json()["models"]] == [
+            "writer"
+        ]
+
+    async def test_nothing_loaded_is_not_an_error(self, client, monkeypatch):
+        self._holding(monkeypatch, [])
+        assert (await client.post("/api/settings/llm-unload", json={})).json()["unloaded"] == []
+
+    async def test_a_provider_that_cannot_free_its_own_memory_says_so(self, client):
+        # The base implementation refuses, which is what a remote OpenAI-compatible server should do:
+        # its memory is not ours to manage.
+        response = await client.post("/api/settings/llm-unload", json={})
+        assert response.status_code == 422
+        assert "not ours to free" in response.text
+
+    async def test_asking_what_is_loaded_never_fails(self, client):
+        # A provider that cannot answer reports nothing rather than breaking the panel it is drawn in.
+        assert (await client.get("/api/settings/llm-loaded")).json() == {"models": [], "vram": 0}
+
+
+class TestFindingCharactersTwice:
+    async def test_somebody_already_on_the_board_is_not_offered_again(self, client):
+        pid, bid, _d, _a = await storyboard_project(client)
+        first = (
+            await client.post(f"/api/projects/{pid}/storyboards/{bid}/characters/suggest")
+        ).json()
+        assert [c["name"] for c in first] == ["Elara"]
+
+        await client.post(
+            f"/api/projects/{pid}/storyboards/{bid}/characters", json={"name": "Elara"}
+        )
+        again = (
+            await client.post(f"/api/projects/{pid}/storyboards/{bid}/characters/suggest")
+        ).json()
+        assert again == []
+
+    async def test_matching_ignores_case_and_spacing(self, client):
+        pid, bid, _d, _a = await storyboard_project(client)
+        await client.post(
+            f"/api/projects/{pid}/storyboards/{bid}/characters", json={"name": "  elara  "}
+        )
+        assert (
+            await client.post(f"/api/projects/{pid}/storyboards/{bid}/characters/suggest")
+        ).json() == []
+
+    async def test_the_same_name_twice_in_one_answer_is_one_character(self, client, monkeypatch):
+        # A model listing someone twice used to make two rows: the batch was only ever compared with the
+        # board, never with itself.
+        import json as _json
+
+        from comfywebstudio.llm.provider import Reply
+
+        async def doubled(self, prompt, *, model, system="", images=None, json_object=False,
+                          schema=None, temperature=0.7):
+            return Reply(
+                text=_json.dumps({"characters": [
+                    {"name": "Elara", "description": "the keeper", "appearance": "grey coat"},
+                    {"name": "elara", "description": "her again", "appearance": "grey coat"},
+                    {"name": "The light", "description": "out at sea", "appearance": "a glow"},
+                ]}),
+                model=model,
+            )
+
+        monkeypatch.setattr(ScriptedProvider, "complete", doubled)
+        pid, bid, _d, _a = await storyboard_project(client)
+        found = (
+            await client.post(f"/api/projects/{pid}/storyboards/{bid}/characters/suggest")
+        ).json()
+        assert [c["name"] for c in found] == ["Elara", "The light"]
+
+    async def test_the_model_is_told_who_is_already_known(self, client):
+        pid, bid, _d, _a = await storyboard_project(client)
+        await client.post(
+            f"/api/projects/{pid}/storyboards/{bid}/characters", json={"name": "Elara"}
+        )
+
+        ScriptedProvider.calls = []
+        await client.post(f"/api/projects/{pid}/storyboards/{bid}/characters/suggest")
+        sent = ScriptedProvider.calls[-1]["prompt"]
+        assert "Do not list them again" in sent and "Elara" in sent
+
+    async def test_with_nobody_known_the_prompt_does_not_mention_it(self, client):
+        pid, bid, _d, _a = await storyboard_project(client)
+        ScriptedProvider.calls = []
+        await client.post(f"/api/projects/{pid}/storyboards/{bid}/characters/suggest")
+        assert "Do not list them again" not in ScriptedProvider.calls[-1]["prompt"]
+
+
+class TestDrawingACharacter:
+    async def test_it_draws_them_and_keeps_the_picture_as_their_reference(self, client):
+        pid, bid, _d, _a = await storyboard_project(client)
+        character = (
+            await client.post(
+                f"/api/projects/{pid}/storyboards/{bid}/characters",
+                json={"name": "Elara", "appearance": "a keeper in a grey coat"},
+            )
+        ).json()
+
+        started = await client.post(
+            f"/api/projects/{pid}/storyboards/{bid}/characters/{character['id']}/portrait"
+        )
+        assert started.status_code == 202, started.text
+        await asyncio.wait_for(
+            client.app_state.orchestrator.wait(started.json()["run_id"]), timeout=30
+        )
+        # Keeping it happens in a task of its own once the picture exists.
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            board = (await client.get(f"/api/projects/{pid}/storyboards/{bid}")).json()
+            if board["characters"][0]["reference_asset_ids"]:
+                break
+
+        assert board["characters"][0]["reference_asset_ids"], "the portrait was never kept"
+        project = (await client.get(f"/api/projects/{pid}")).json()
+        asset_id = board["characters"][0]["reference_asset_ids"][0]
+        assert project["assets"][asset_id]["kind"] == "image"
+        assert "Elara" in project["assets"][asset_id]["name"]
+
+    async def test_the_prompt_is_what_they_look_like_plus_the_house_style(self, client):
+        pid, bid, _d, _a = await storyboard_project(client)
+        character = (
+            await client.post(
+                f"/api/projects/{pid}/storyboards/{bid}/characters",
+                json={"name": "Elara", "appearance": "a keeper in a grey coat"},
+            )
+        ).json()
+        started = (
+            await client.post(
+                f"/api/projects/{pid}/storyboards/{bid}/characters/{character['id']}/portrait"
+            )
+        ).json()
+
+        project = (await client.get(f"/api/projects/{pid}")).json()
+        shot = next(s for s in project["shots"] if s["id"] == started["shot_id"])
+        step = next(s for s in shot["steps"] if s["id"] == started["step_id"])
+        # The board's style is "16mm"; the character's appearance is theirs.
+        assert step["param_overrides"]["prompt"] == "a keeper in a grey coat 16mm"
+        assert step["name"] == character["id"]
+
+    async def test_drawing_again_reuses_the_same_step(self, client):
+        pid, bid, _d, _a = await storyboard_project(client)
+        character = (
+            await client.post(
+                f"/api/projects/{pid}/storyboards/{bid}/characters",
+                json={"name": "Elara", "appearance": "grey coat"},
+            )
+        ).json()
+        one = (await client.post(
+            f"/api/projects/{pid}/storyboards/{bid}/characters/{character['id']}/portrait")).json()
+        two = (await client.post(
+            f"/api/projects/{pid}/storyboards/{bid}/characters/{character['id']}/portrait")).json()
+        assert one["step_id"] == two["step_id"]
+
+    async def test_somebody_with_no_appearance_written_is_refused(self, client):
+        pid, bid, _d, _a = await storyboard_project(client)
+        character = (
+            await client.post(
+                f"/api/projects/{pid}/storyboards/{bid}/characters", json={"name": "Nobody"}
+            )
+        ).json()
+
+        response = await client.post(
+            f"/api/projects/{pid}/storyboards/{bid}/characters/{character['id']}/portrait"
+        )
+        assert response.status_code == 422
+        assert "no appearance written" in response.text
+
+    async def test_drawing_a_character_that_is_not_there_says_so(self, client):
+        pid, bid, _d, _a = await storyboard_project(client)
+        response = await client.post(
+            f"/api/projects/{pid}/storyboards/{bid}/characters/char_nope/portrait"
+        )
+        assert response.status_code == 404

@@ -316,6 +316,78 @@ async def list_llm_models(state: StateDep, provider_id: str) -> dict:
     }
 
 
+# -- what is holding the graphics card --------------------------------------------------------------------
+
+
+def _story_providers(state) -> list:
+    """The providers the storyboard actually uses, in order, without repeating one."""
+    story = state.settings.story
+    wanted = [story.provider_id, story.vision_provider_id]
+    seen: list = []
+    for provider_id in wanted:
+        if provider_id and provider_id not in [p.id for p in seen]:
+            config = next(
+                (p for p in state.settings.llm_providers if p.id == provider_id and p.enabled), None
+            )
+            if config is not None:
+                seen.append(config)
+    return seen
+
+
+@router.get("/llm-loaded")
+async def llm_loaded(state: StateDep) -> dict:
+    """Which language models are sitting in memory, and how much of the card they are holding.
+
+    Across the storyboard's providers rather than one, because the writing model and the looking model can
+    be different endpoints and both of them take room.
+    """
+    from ..llm.provider import create_provider
+
+    resident: list[dict] = []
+    for config in _story_providers(state):
+        provider = create_provider(config)
+        try:
+            resident += [
+                {**model.as_dict(), "provider_id": config.id} for model in await provider.loaded()
+            ]
+        finally:
+            await provider.close()
+    return {"models": resident, "vram": sum(m["vram"] for m in resident)}
+
+
+class UnloadRequest(BaseModel):
+    #: One model, or every loaded one when omitted.
+    model: str | None = None
+
+
+@router.post("/llm-unload")
+async def llm_unload(state: StateDep, body: UnloadRequest) -> dict:
+    """Let go of the loaded models, so something else can have the graphics card.
+
+    The storyboard alternates between a language model and ComfyUI, and they compete for the same memory:
+    a 7B model resident is several gigabytes an image model cannot use. Ollama releases on its own after a
+    few idle minutes, but "a few minutes" is exactly the wrong amount of time when you are waiting.
+    """
+    from ..llm.provider import LlmError, create_provider
+
+    freed: list[str] = []
+    problems: list[str] = []
+    for config in _story_providers(state):
+        provider = create_provider(config)
+        try:
+            freed += await provider.unload(body.model)
+        except LlmError as exc:
+            problems.append(str(exc))
+        finally:
+            await provider.close()
+
+    # A provider that cannot free its own memory is worth reporting, but not worth failing over when
+    # another one did let go.
+    if problems and not freed:
+        raise ValidationFailed(" ".join(problems))
+    return {"unloaded": freed, "warnings": problems}
+
+
 # -- the storyboard flow, for everyone using this install ------------------------------------------------
 
 

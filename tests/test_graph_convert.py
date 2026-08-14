@@ -48,6 +48,8 @@ def object_info() -> FakeObjectInfo:
                     "steps": ["INT", {"default": 20}],
                     "cfg": ["FLOAT", {"default": 8.0}],
                     "sampler_name": [["euler", "dpmpp_2m"], {"default": "euler"}],
+                    "scheduler": [["simple", "normal"], {"default": "normal"}],
+                    "denoise": ["FLOAT", {"default": 1.0}],
                 },
             ),
             "EmptyLatentImage": schema(
@@ -57,6 +59,36 @@ def object_info() -> FakeObjectInfo:
             "CLIPTextEncode": schema(
                 "CLIPTextEncode",
                 {"text": ["STRING", {"multiline": True}], "clip": ["CLIP"]},
+            ),
+            # A dynamic combo: choosing a mode reveals that mode's own sub-widgets, each taking a slot
+            # of its own in `widgets_values`. The schema says nothing about how many.
+            "TextGenerate": schema(
+                "TextGenerate",
+                {
+                    "clip": ["CLIP"],
+                    "prompt": ["STRING", {"multiline": True}],
+                    "max_length": ["INT", {"default": 512}],
+                    # A dynamic combo declares each mode's own widgets, which is what makes expanding
+                    # it exact rather than a guess. Shaped as ComfyUI really serves it.
+                    "sampling_mode": ["COMFY_DYNAMICCOMBO_V3", {
+                        "options": [
+                            {"key": "on", "inputs": {
+                                "required": {
+                                    "temperature": ["FLOAT", {"default": 0.7}],
+                                    "top_k": ["INT", {"default": 64}],
+                                    "top_p": ["FLOAT", {"default": 0.95}],
+                                    "min_p": ["FLOAT", {"default": 0.05}],
+                                    "repetition_penalty": ["FLOAT", {"default": 1.05}],
+                                    "seed": ["INT", {"default": 0}],
+                                },
+                                "optional": {"presence_penalty": ["FLOAT", {"default": 0.0}]},
+                            }},
+                            {"key": "off", "inputs": {"required": {}}},
+                        ],
+                    }],
+                    "thinking": ["BOOLEAN", {"default": True}],
+                    "use_default_template": ["BOOLEAN", {"default": True}],
+                },
             ),
         }
     )
@@ -491,3 +523,276 @@ async def test_widget_specs_expose_choices_for_both_encodings():
     assert combo_options("COMBO", {"options": ["p"]}) == ["p"]
     assert combo_options(["q"], {}) == ["q"]
     assert combo_options("INT", {}) is None
+
+
+# -- a combo keeps the value the workflow actually has ----------------------------------------------------
+
+
+async def test_a_promoted_parameter_takes_its_default_from_the_prompt(object_info):
+    """The prompt is what runs, so the prompt is what a default has to describe.
+
+    Reading it from the UI document instead means mapping a positional `widgets_values` array onto slot
+    names, and when that comes up empty the fallback is the *schema's* default — the first entry of a combo
+    list. A model picker set to the third checkpoint would then describe itself as the first.
+    """
+    from comfywebstudio.comfy.discovery import subgraph_params
+
+    ui = subgraph_workflow()
+    prompt = (await ui_graph_to_prompt(ui, object_info)).prompt
+    # Whatever the document says, this is what ComfyUI would run.
+    prompt["20:5"]["inputs"]["width"] = 1536
+    prompt["20:5"]["inputs"]["height"] = 1536
+
+    specs = {p.label: p for p in await subgraph_params(ui, prompt, object_info)}
+    assert specs["size"].default == 1536
+
+
+async def test_a_promoted_slot_that_is_driven_by_a_link_keeps_its_own_default(object_info):
+    # A link is not a value somebody chose, so it must not become one.
+    from comfywebstudio.comfy.discovery import subgraph_params
+
+    ui = subgraph_workflow()
+    prompt = (await ui_graph_to_prompt(ui, object_info)).prompt
+    prompt["20:5"]["inputs"]["width"] = ["30", 0]
+    prompt["20:5"]["inputs"]["height"] = ["30", 0]
+
+    specs = {p.label: p for p in await subgraph_params(ui, prompt, object_info)}
+    assert specs["size"].default == 640
+
+
+async def test_a_value_nobody_set_is_left_exactly_as_the_workflow_had_it(object_info):
+    """The regression: a shot ran a combo's *first* option instead of the chosen one.
+
+    Injection used to write `param.default` for every parameter whether or not anyone had set a value —
+    so a default derived slightly wrongly did not merely display wrongly, it overwrote a correct value on
+    its way to ComfyUI.
+    """
+    from comfywebstudio.comfy.discovery import subgraph_params
+    from comfywebstudio.comfy.inject import prepare_prompt
+    from comfywebstudio.core.models import WorkflowRef
+
+    ui = subgraph_workflow()
+    prompt = (await ui_graph_to_prompt(ui, object_info)).prompt
+    workflow = WorkflowRef(name="SG", params=await subgraph_params(ui, prompt, object_info))
+
+    # Whatever the reason — a stale re-scan, a document the mapper could not read — the default disagrees
+    # with the prompt. The prompt wins, because nobody asked for anything else.
+    for param in workflow.params:
+        if param.label == "size":
+            param.default = 64
+
+    injected = prepare_prompt(prompt, workflow, overrides={}, run_key="r/s")
+    # Each input keeps what it had. `size` drives both, and they differ in this graph — which is exactly
+    # what "leave it alone" has to mean: not one value chosen for both, but neither of them touched.
+    assert injected.prompt["20:5"]["inputs"]["width"] == 640
+    assert injected.prompt["20:5"]["inputs"]["height"] == 480
+
+
+async def test_a_value_somebody_did_set_still_wins(object_info):
+    """And then it reaches every input the promoted slot drives, differing values included."""
+    from comfywebstudio.comfy.discovery import subgraph_params
+    from comfywebstudio.comfy.inject import prepare_prompt
+    from comfywebstudio.core.models import WorkflowRef
+
+    ui = subgraph_workflow()
+    prompt = (await ui_graph_to_prompt(ui, object_info)).prompt
+    workflow = WorkflowRef(name="SG", params=await subgraph_params(ui, prompt, object_info))
+
+    injected = prepare_prompt(prompt, workflow, overrides={"$20.size": 1024}, run_key="r/s")
+    assert injected.prompt["20:5"]["inputs"]["width"] == 1024
+    assert injected.prompt["20:5"]["inputs"]["height"] == 1024
+
+
+async def test_a_step_with_no_values_of_its_own_changes_nothing_at_all(object_info):
+    """The strongest form of the rule, and the one worth keeping.
+
+    A shot built from a storyboard has an empty `param_overrides`, so every parameter falls back to its
+    default. If defaults are written unconditionally, "run this workflow" quietly becomes "run this
+    workflow, with every value replaced by our reading of it" — and one imperfect reading is enough to
+    swap a checkpoint.
+    """
+    from comfywebstudio.comfy.discovery import subgraph_params
+    from comfywebstudio.comfy.inject import RUN_KEY_INPUT, prepare_prompt
+    from comfywebstudio.core.models import WorkflowRef
+
+    ui = subgraph_workflow()
+    prompt = (await ui_graph_to_prompt(ui, object_info)).prompt
+    workflow = WorkflowRef(name="SG", params=await subgraph_params(ui, prompt, object_info))
+
+    injected = prepare_prompt(prompt, workflow, overrides={}, run_key="r/s")
+
+    differences = {
+        f"{node_id}.{name}": (prompt[node_id]["inputs"].get(name), value)
+        for node_id, node in injected.prompt.items()
+        for name, value in node["inputs"].items()
+        if name != RUN_KEY_INPUT and prompt[node_id]["inputs"].get(name) != value
+    }
+    assert differences == {}
+
+
+# -- widgets that were never converted into inputs --------------------------------------------------------
+
+
+def _ksampler_graph() -> dict:
+    """A KSampler with its seed converted to an input, exactly as ComfyUI serialises one.
+
+    The shape that broke: seven widget values, and an `inputs` array naming only the one widget somebody
+    turned into a link socket.
+    """
+    return graph(
+        [
+            {
+                "id": 1,
+                "type": "KSampler",
+                "widgets_values": [12345, "randomize", 8, 1.0, "euler", "simple", 1.0],
+                "inputs": [
+                    {"name": "model", "type": "MODEL", "link": None},
+                    {"name": "seed", "type": "INT", "widget": {"name": "seed"}, "link": None},
+                ],
+            },
+        ],
+        [],
+    )
+
+
+async def test_widgets_nobody_converted_are_not_dropped(object_info):
+    """The regression ComfyUI reported as "Required input is missing".
+
+    The order `widgets_values` follows is the schema's. Reading it from the node's own `inputs` — which
+    holds only the converted widgets — mapped seven values onto one name and lost the rest, so the prompt
+    reached ComfyUI without steps, cfg, sampler_name or scheduler.
+    """
+    result = await ui_graph_to_prompt(_ksampler_graph(), object_info)
+    inputs = result.prompt["1"]["inputs"]
+
+    assert inputs["seed"] == 12345
+    assert inputs["steps"] == 8
+    assert inputs["cfg"] == 1.0
+    assert inputs["sampler_name"] == "euler"
+    assert inputs["scheduler"] == "simple"
+    assert inputs["denoise"] == 1.0
+    # `control_after_generate` occupies a slot without being an input of its own.
+    assert "randomize" not in inputs.values()
+    assert not [w for w in result.warnings if "unmapped" in w]
+
+
+async def test_the_same_holds_inside_a_subgraph(object_info):
+    """Where it actually bit: every inner node has at most its promoted widgets in `inputs`."""
+    document = _ksampler_graph()
+    inner = document["nodes"][0]
+    definition = {
+        "id": "sg-uuid",
+        "name": "Sampling",
+        "inputNode": {"id": -10},
+        "outputNode": {"id": -20},
+        "inputs": [{"id": "i1", "name": "seed", "type": "INT", "linkIds": [201]}],
+        "outputs": [],
+        "nodes": [{**inner, "inputs": [
+            {"name": "model", "type": "MODEL", "link": None},
+            {"name": "seed", "type": "INT", "widget": {"name": "seed"}, "link": 201},
+        ]}],
+        "links": [
+            {"id": 201, "origin_id": -10, "origin_slot": 0, "target_id": 1, "target_slot": 1,
+             "type": "INT"},
+        ],
+    }
+    document = graph(
+        [{"id": 20, "type": "sg-uuid",
+          "inputs": [{"name": "seed", "type": "INT", "widget": {"name": "seed"}, "link": None}],
+          "outputs": [], "widgets_values": []}],
+        [],
+    )
+    document["definitions"] = {"subgraphs": [definition]}
+
+    result = await ui_graph_to_prompt(document, object_info)
+    inputs = result.prompt["20:1"]["inputs"]
+    assert inputs["steps"] == 8 and inputs["sampler_name"] == "euler"
+    assert inputs["scheduler"] == "simple" and inputs["denoise"] == 1.0
+
+
+async def test_a_node_list_that_explains_more_of_the_values_still_wins(object_info):
+    """A dynamic combo can expand into entries the schema never mentions, so the node's own list stays.
+
+    Here the schema accounts for one value and the node's list for both, so the node's list is used.
+    """
+    document = graph(
+        [
+            {
+                "id": 1,
+                "type": "CLIPTextEncode",
+                "widgets_values": ["a lighthouse", "extra from a dynamic widget"],
+                "inputs": [
+                    {"name": "text", "type": "STRING", "widget": {"name": "text"}, "link": None},
+                    {"name": "text.mode", "type": "STRING", "widget": {"name": "text.mode"},
+                     "link": None},
+                ],
+            },
+        ],
+        [],
+    )
+    result = await ui_graph_to_prompt(document, object_info)
+    inputs = result.prompt["1"]["inputs"]
+    assert inputs["text"] == "a lighthouse"
+    assert inputs["text.mode"] == "extra from a dynamic widget"
+
+
+async def test_a_dynamic_combo_is_expanded_into_the_widgets_it_reveals(object_info):
+    """The regression ComfyUI reported as "Required input is missing: temperature".
+
+    Picking a mode on a dynamic combo reveals that mode's own widgets, each taking a slot in
+    `widgets_values` *and* required by name in the prompt. Skipping the combo dropped them and shifted
+    everything after it, so a trailing boolean was read as somebody's `top_k` and six required inputs
+    never arrived — which is why ComfyUI ignored the output that depended on the node.
+    """
+    document = graph(
+        [
+            {
+                "id": 1,
+                "type": "TextGenerate",
+                # prompt, max_length, mode, then seven sub-widgets, then the two booleans.
+                "widgets_values": ["a lighthouse", 512, "on", 0.7, 64, 0.95, 0.05, 1.05, 0, 0,
+                                   True, True],
+                "inputs": [{"name": "clip", "type": "CLIP", "link": None}],
+            },
+        ],
+        [],
+    )
+    inputs = (await ui_graph_to_prompt(document, object_info)).prompt["1"]["inputs"]
+
+    assert inputs["prompt"] == "a lighthouse"
+    assert inputs["max_length"] == 512
+    assert inputs["sampling_mode"] == "on"
+
+    # The mode's own widgets, under the combo's name: ComfyUI joins the path with dots, so a bare
+    # `temperature` validates as missing however right it looks.
+    assert inputs["sampling_mode.temperature"] == 0.7
+    assert inputs["sampling_mode.top_k"] == 64
+    assert inputs["sampling_mode.top_p"] == 0.95
+    assert inputs["sampling_mode.min_p"] == 0.05
+    assert inputs["sampling_mode.repetition_penalty"] == 1.05
+    assert inputs["sampling_mode.seed"] == 0
+    assert inputs["sampling_mode.presence_penalty"] == 0
+    assert "temperature" not in inputs
+
+    # And what follows them still lines up.
+    assert inputs["thinking"] is True
+    assert inputs["use_default_template"] is True
+
+
+async def test_a_dynamic_combo_with_no_sub_widgets_still_lines_up(object_info):
+    document = graph(
+        [
+            {
+                "id": 1,
+                "type": "TextGenerate",
+                "widgets_values": ["a lighthouse", 512, "off", False, False],
+                "inputs": [{"name": "clip", "type": "CLIP", "link": None}],
+            },
+        ],
+        [],
+    )
+    inputs = (await ui_graph_to_prompt(document, object_info)).prompt["1"]["inputs"]
+    assert inputs["sampling_mode"] == "off"
+    # "off" reveals nothing, so the booleans follow it immediately.
+    assert inputs["thinking"] is False and inputs["use_default_template"] is False
+    assert not [k for k in inputs if k.startswith("sampling_mode.")]
