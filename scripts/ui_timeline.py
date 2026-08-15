@@ -163,8 +163,10 @@ def build(url: str, tmp: Path) -> tuple[str, str]:
         raise SystemExit(f"The demo shot did not run ({run['status']}): {run.get('error')}")
 
     asset = _upload_media(url, pid, write_tone(tmp / "tone.wav"), "audio/wav")
-    track = _api(url, f"/api/projects/{pid}/timeline/tracks",
-                 {"kind": "audio", "name": "Music"}, "POST")
+    # The audio lane a project comes with, rather than a second one beside it — a timeline arrives with
+    # somewhere to put sound, so needing to make one would be the thing worth reporting.
+    timeline = _api(url, f"/api/projects/{pid}/timeline")
+    track = next(t for t in timeline["tracks"] if t["kind"] == "audio")
     _api(url, f"/api/projects/{pid}/timeline/tracks/{track['id']}/clips",
          {"source": {"kind": "asset", "asset_id": asset["id"]}, "start": 0, "name": "Tone"}, "POST")
     return pid, shot["id"]
@@ -264,12 +266,20 @@ def main() -> int:
                 bool(video) and any(c["name"] == "Wide" for c in video[0]["clips"]),
                 f"the shot became a clip ({[t['kind'] for t in timeline['tracks']]})",
             )
-            check(len(timeline["tracks"]) > before, "on a video track of its own")
+            # Into the empty video lane the project already had, rather than stacking another one on
+            # top of it: a fresh timeline that grows a second, blank, video track on the first drop is
+            # tidy-up nobody asked for.
+            check(
+                len(timeline["tracks"]) == before and len(video) == 1,
+                f"into the video lane already there, not a new one ({len(timeline['tracks'])} tracks)",
+            )
             if shots:
                 page.screenshot(path=str(shots / "timeline-dropped-shot.png"))
 
             print("Choosing which output a clip shows")
-            page.locator("[id^='clip-']").last.click()
+            # The picture, by name — "the last clip" stopped meaning "the one just dropped" once the
+            # timeline had a lane for sound as well.
+            page.locator("[id^='clip-']").filter(has_text="Wide").first.click()
             page.wait_for_timeout(900)
             options = page.evaluate(
                 "() => [...document.querySelectorAll('select')]"
@@ -366,15 +376,15 @@ def main() -> int:
                 "there is a snap toggle",
             )
 
-            # Drag across the gap between the two clips, in the video lane.
+            # One click in the gap between the two clips selects the whole gap — no dragging its edges
+            # out by eye, which was the only way to reach one before.
             lane = page.locator("[data-dock-group] .relative > div").filter(has=page.locator("[id^='clip-']")).last
             box = lane.bounding_box()
-            page.mouse.move(box["x"] + 260, box["y"] + box["height"] / 2)
-            page.mouse.down()
-            page.mouse.move(box["x"] + 330, box["y"] + box["height"] / 2, steps=12)
-            page.wait_for_timeout(300)
-            page.mouse.up()
+            page.mouse.click(box["x"] + 290, box["y"] + box["height"] / 2)
             page.wait_for_timeout(400)
+            # The playhead is drawn the same way, so the span is told apart by its border.
+            marker = page.locator("div.pointer-events-none.absolute.inset-y-0.border-x")
+            check(marker.count() == 1, f"one click selects the gap it landed in ({marker.count()} marked)")
 
             before = _api(args.url, f"/api/projects/{pid}/timeline")
             starts_before = [c["start"] for c in
@@ -390,6 +400,75 @@ def main() -> int:
             )
             if shots:
                 page.screenshot(path=str(shots / "timeline-ripple.png"))
+
+
+            print("Several clips at once")
+            # Two clips side by side on the video lane — the ripple delete above left only one, and a
+            # range needs two ends.
+            video = next(
+                t for t in _api(args.url, f"/api/projects/{pid}/timeline")["tracks"]
+                if t["kind"] == "video"
+            )
+            for start in (10.0, 14.0):
+                _api(args.url, f"/api/projects/{pid}/timeline/from-shot",
+                     {"shot_id": shot_id, "track_id": video["id"], "start": start}, "POST")
+            page.reload(wait_until="networkidle")
+            page.wait_for_timeout(2500)
+            clips = page.locator("[id^='clip-']")
+
+            def chosen() -> int:
+                return page.evaluate(
+                    "() => [...document.querySelectorAll(\"[id^='clip-']\")]"
+                    ".filter((c) => c.className.includes('ring-1')).length"
+                )
+
+            # By index within the video lane, so a click never strays onto the audio one.
+            lane_clips = page.locator("[data-dock-group] .relative > div").filter(
+                has=page.locator("[id^='clip-']")
+            ).first.locator("[id^='clip-']")
+            clips = lane_clips if lane_clips.count() >= 3 else clips
+
+            clips.nth(0).click()
+            page.wait_for_timeout(250)
+            one = chosen()
+            clips.nth(1).click(modifiers=["Control"])
+            page.wait_for_timeout(250)
+            check(one == 1 and chosen() == 2, f"ctrl-click adds to the selection ({one} → {chosen()})")
+
+            clips.nth(1).click(modifiers=["Control"])
+            page.wait_for_timeout(250)
+            check(chosen() == 1, f"and ctrl-clicking again takes it back out ({chosen()})")
+
+            clips.nth(0).click()
+            page.wait_for_timeout(200)
+            clips.nth(1).click(modifiers=["Shift"])
+            page.wait_for_timeout(250)
+            check(chosen() >= 2, f"shift-click takes the range between them ({chosen()})")
+
+            print("A clip takes the space it lands on")
+            timeline = _api(args.url, f"/api/projects/{pid}/timeline")
+            video = next(t for t in timeline["tracks"] if t["kind"] == "video")
+            fps = timeline["fps"]
+            first, second = video["clips"][0], video["clips"][1]
+            # Dragged back so it starts halfway through the clip before it.
+            _api(
+                args.url,
+                f"/api/projects/{pid}/timeline/tracks/{video['id']}/clips/{second['id']}",
+                {"start": first["start"] + first["duration"] / 2},
+                "PATCH",
+            )
+            after = _api(args.url, f"/api/projects/{pid}/timeline")
+            lane_now = next(t for t in after["tracks"] if t["id"] == video["id"])
+            spans = [(c["start"], c["start"] + c["duration"]) for c in lane_now["clips"]]
+            buried = [
+                (a, b) for i, (a, b) in enumerate(spans)
+                for (c, d) in spans[i + 1:] if a < d and c < b
+            ]
+            check(not buried, f"nothing is left buried underneath ({buried})")
+            check(
+                all(abs(v * fps - round(v * fps)) < 1e-6 for span in spans for v in span),
+                f"and every edge is on a frame ({spans})",
+            )
 
             real = [e for e in errors if "favicon" not in e.lower()]
             check(not real, f"no page errors ({len(real)} found)")

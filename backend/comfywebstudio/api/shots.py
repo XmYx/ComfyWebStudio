@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from ..core.errors import NotFound
+from ..core.errors import NotFound, ValidationFailed
 from ..core.graph import validate_new_link, validate_placed
 from ..core.models import (
     Link,
@@ -248,6 +248,88 @@ def replace_step_params(
     step.param_overrides = dict(overrides)
     state.store.save(project)
     return step
+
+
+class ApplyParamsRequest(BaseModel):
+    #: Parameter keys to push out. Empty means every parameter this step's workflow exposes.
+    keys: list[str] = []
+
+
+class ApplyParamsResult(BaseModel):
+    """What ``apply to all shots`` actually did, per parameter, so the UI can say more than 'done'."""
+
+    #: Step ids that were changed.
+    steps: list[str] = []
+    #: ``key -> the value that was written``.
+    values: dict[str, Any] = {}
+    #: Steps that carry this parameter but were left alone, and why.
+    skipped: list[str] = []
+
+
+@router.post("/steps/{step_id}/params/apply-to-all")
+def apply_params_to_all(
+    state: StateDep, project: ProjectDep, step_id: str, body: ApplyParamsRequest
+) -> ApplyParamsResult:
+    """Give every other step running this workflow the same value for these parameters.
+
+    The reach is *the same workflow*, not the same-looking widget: a parameter key only means anything
+    against the workflow that declared it, and `steps` in one graph is not `steps` in another. A storyboard
+    turns one workflow into twenty shots, which is exactly when re-typing a checkpoint twenty times stops
+    being reasonable.
+
+    What is sent is the parameter's **effective** value — the override if the step has one, the workflow's
+    own default otherwise — so applying an untouched parameter spreads what this step actually runs with
+    rather than nothing at all.
+
+    A target whose input is fed by a link is skipped and named. Its value arrives from upstream at run
+    time, so writing an override there would change the inspector and change nothing about the run.
+    """
+    _, source = find_step(project, step_id)
+    workflow = project.workflow(source.workflow_id)
+    if workflow is None:
+        raise NotFound(f"No workflow {source.workflow_id!r} in this project")
+
+    specs = {param.key: param for param in workflow.params}
+    keys = [key for key in (body.keys or list(specs)) if key in specs]
+    if not keys:
+        raise ValidationFailed("None of those parameters belong to this step's workflow.")
+
+    values = {
+        key: source.param_overrides[key] if key in source.param_overrides else specs[key].default
+        for key in keys
+    }
+
+    changed: list[str] = []
+    skipped: list[str] = []
+    for shot in project.shots:
+        # A template editing session is a template wearing a shot's clothes; quietly rewriting one from a
+        # shot's inspector would edit every shot that ever placed that template.
+        if shot.template_edit_id:
+            continue
+        for step in shot.steps:
+            if step.id == source.id or step.workflow_id != source.workflow_id:
+                continue
+            fed = {link.to_port for link in shot.links if link.to_step == step.id}
+            wanted = {key: value for key, value in values.items() if key not in fed}
+            blocked = sorted(set(values) & fed)
+            if blocked:
+                skipped.append(f"{shot.name} · {step.name}: {', '.join(blocked)} comes from a link")
+            # Compared against the target's *effective* value, not its override map: a step that already
+            # runs this value needs no override, and one whose override merely restates the workflow
+            # default should not collect a second one saying the same thing.
+            if not wanted or all(
+                (step.param_overrides[key] if key in step.param_overrides else specs[key].default) == value
+                for key, value in wanted.items()
+            ):
+                continue
+            step.param_overrides.update(wanted)
+            changed.append(step.id)
+
+    if changed:
+        state.store.save(project)
+        state.events.emit("project.changed", project_id=project.id, data={"action": "params_applied"})
+
+    return ApplyParamsResult(steps=changed, values=values, skipped=skipped)
 
 
 @router.delete("/steps/{step_id}", status_code=204)

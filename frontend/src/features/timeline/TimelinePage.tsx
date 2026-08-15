@@ -18,7 +18,8 @@ import {
 } from '@/components/ui'
 import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
 import { isOurDrag, readDrag } from '@/lib/dnd'
-import { snap, snapMove, snapTargets } from './snapping'
+import { travelOrder } from './edits'
+import { gapAt, snap, snapMove, snapTargets, toFrame } from './snapping'
 import { TrackMixer } from './TrackMixer'
 import { Waveform } from './Waveform'
 import { TimelineAudio } from './TimelineAudio'
@@ -369,42 +370,36 @@ function TrackArea({
   snapping: boolean
 }) {
   const toast = useToast()
+  const selectedClips = useStudio((s) => s.selectedClips)
+  const selectClips = useStudio((s) => s.selectClips)
+  const toggleClip = useStudio((s) => s.toggleClip)
   //: Where the drag in progress has snapped to, drawn as a guide so the alignment is visible.
   const [snapGuide, setSnapGuide] = useState<number | null>(null)
   //: A span of *time* selected by dragging across empty space, which ripple delete then removes.
   const [range, setRange] = useState<{ from: number; to: number } | null>(null)
 
   /**
-   * Dragging across empty lane space selects a span of time.
+   * Clicking empty lane space selects the whole gap it is in.
    *
-   * Distinct from selecting a clip: what is selected here is the gap itself, which is the thing a ripple
-   * delete acts on. It snaps to the same targets as a clip drag, so a span can be taken out exactly
-   * between two cuts.
+   * A gap is bounded by the clips either side of it, so both of its edges are already known — asking the
+   * user to drag them out by eye was busywork that also let them miss by a few pixels and take a slice
+   * of a neighbour with them. One click selects it exactly; Delete takes it out.
+   *
+   * A click that lands past the last clip selects nothing: there is no gap there, only the end.
    */
-  const beginRange = (event: React.MouseEvent) => {
+  const selectGap = (event: React.MouseEvent, track: Track) => {
     if (event.button !== 0) return
-    const lane = event.currentTarget as HTMLElement
-    const box = lane.getBoundingClientRect()
-    const targets = snapTargets(project.timeline, playhead)
-    const at = (clientX: number) =>
-      snap(Math.max(0, (clientX - box.left) / zoom), targets, zoom, snapping).time
+    const box = (event.currentTarget as HTMLElement).getBoundingClientRect()
+    const at = Math.max(0, (event.clientX - box.left) / zoom)
 
-    const anchor = at(event.clientX)
-    setRange({ from: anchor, to: anchor })
-
-    const move = (e: MouseEvent) => {
-      const now = at(e.clientX)
-      setRange({ from: Math.min(anchor, now), to: Math.max(anchor, now) })
+    onSelectClip(null)
+    const found = gapAt(track.clips, at)
+    if (!found || !Number.isFinite(found.to) || found.to <= found.from) {
+      setRange(null)
+      return
     }
-    const up = (e: MouseEvent) => {
-      window.removeEventListener('mousemove', move)
-      window.removeEventListener('mouseup', up)
-      const now = at(e.clientX)
-      // A click, not a drag: clear rather than leaving a zero-width selection nobody can see.
-      if (Math.abs(now - anchor) * zoom < 3) setRange(null)
-    }
-    window.addEventListener('mousemove', move)
-    window.addEventListener('mouseup', up)
+    const fps = project.timeline.fps
+    setRange({ from: toFrame(found.from, fps), to: toFrame(found.to, fps) })
   }
 
   useEffect(() => {
@@ -433,6 +428,46 @@ function TrackArea({
       toast.push('bad', (error as ApiError).message)
     }
   }
+  const selectedIds = useMemo(
+    () => new Set(selectedClips.map((c) => c.clipId)),
+    [selectedClips],
+  )
+
+  /** The selected clips as the objects themselves, for a drag that has to carry them all. */
+  const selectedObjects = useMemo(
+    () =>
+      project.timeline.tracks.flatMap((track) =>
+        track.clips.filter((clip) => selectedIds.has(clip.id)).map((clip) => ({ track, clip })),
+      ),
+    [project.timeline.tracks, selectedIds],
+  )
+
+  /**
+   * What clicking a clip means, by the modifiers held.
+   *
+   * Ctrl (or Cmd) adds and removes one at a time; shift takes everything between the last one picked and
+   * this one, on the same lane — the two gestures every editor and file manager already uses, so there is
+   * nothing here to learn.
+   */
+  const clickClip = (event: React.MouseEvent, track: Track, clip: Clip) => {
+    const entry = { trackId: track.id, clipId: clip.id }
+    if (event.ctrlKey || event.metaKey) {
+      toggleClip(entry)
+      return
+    }
+    if (event.shiftKey && selectedClip) {
+      const lane = project.timeline.tracks.find((t) => t.id === selectedClip.trackId)
+      const anchor = lane?.clips.findIndex((c) => c.id === selectedClip.clipId) ?? -1
+      const here = lane?.id === track.id ? track.clips.findIndex((c) => c.id === clip.id) : -1
+      if (lane && anchor >= 0 && here >= 0) {
+        const [low, high] = anchor < here ? [anchor, here] : [here, anchor]
+        selectClips(lane.clips.slice(low, high + 1).map((c) => ({ trackId: lane.id, clipId: c.id })))
+        return
+      }
+    }
+    onSelectClip(entry)
+  }
+
   //: The lane a drag is currently over, so it can be highlighted as a target.
   const [dropTrack, setDropTrack] = useState<string | null>(null)
 
@@ -739,7 +774,7 @@ function TrackArea({
                 }}
                 onDragLeave={() => setDropTrack(null)}
                 onDrop={(event) => void dropShot(event, track)}
-                onMouseDown={beginRange}
+                onMouseDown={(event) => selectGap(event, track)}
               >
                 {track.clips.map((clip) => (
                   <ClipBlock
@@ -749,11 +784,12 @@ function TrackArea({
                     clip={clip}
                     zoom={zoom}
                     status={clipStatus.get(clip.id)}
-                    selected={selectedClip?.clipId === clip.id}
+                    selected={selectedIds.has(clip.id)}
                     snapping={snapping}
                     playhead={playhead}
                     onSnapGuide={setSnapGuide}
-                    onSelect={() => onSelectClip({ trackId: track.id, clipId: clip.id })}
+                    onSelect={(event) => clickClip(event, track, clip)}
+                    alsoSelected={selectedIds.has(clip.id) ? selectedObjects : []}
                     onChanged={onChanged}
                     onContextMenu={(event) => {
                       onSelectClip({ trackId: track.id, clipId: clip.id })
@@ -910,7 +946,7 @@ function TrackHeader({
 
 function ClipBlock({
   project, track, clip, zoom, status, selected, snapping, playhead, onSnapGuide,
-  onSelect, onChanged, onContextMenu,
+  onSelect, onChanged, onContextMenu, alsoSelected,
 }: {
   project: Project
   track: Track
@@ -921,9 +957,11 @@ function ClipBlock({
   snapping: boolean
   playhead: number
   onSnapGuide: (time: number | null) => void
-  onSelect: () => void
+  onSelect: (event: React.MouseEvent) => void
   onChanged: () => void
   onContextMenu: (event: React.MouseEvent) => void
+  /** The other selected clips, which a drag carries along. */
+  alsoSelected: Array<{ track: Track; clip: Clip }>
 }) {
   const dragState = useRef<{ mode: 'move' | 'trim'; x: number; start: number; duration: number } | null>(null)
 
@@ -940,11 +978,11 @@ function ClipBlock({
       const on = snapping && !move.altKey
       if (state.mode === 'move') {
         const wanted = Math.max(0, state.start + delta)
-        const result = snapMove(wanted, state.duration, targets, zoom, on)
+        const result = snapMove(wanted, state.duration, targets, zoom, on, project.timeline.fps)
         return { start: Math.max(0, result.time), duration: state.duration, guide: result.target }
       }
       const wantedEnd = state.start + Math.max(0.04, state.duration + delta)
-      const result = snap(wantedEnd, targets, zoom, on)
+      const result = snap(wantedEnd, targets, zoom, on, project.timeline.fps)
       return {
         start: state.start,
         duration: Math.max(0.04, result.time - state.start),
@@ -953,14 +991,21 @@ function ClipBlock({
     }
 
     // Tied clips move with it as you drag, not only once the server has been told — otherwise the
-    // partner sits still and then jumps, which reads as a glitch rather than as a tie.
-    const partners = clip.link_id
-      ? project.timeline.tracks.flatMap((other) =>
-          other.clips
-            .filter((c) => c.link_id === clip.link_id && c.id !== clip.id)
-            .map((c) => ({ id: c.id, start: c.start, duration: c.duration })),
-        )
-      : []
+    // partner sits still and then jumps, which reads as a glitch rather than as a tie. Anything else
+    // the user has selected travels too: that is the whole point of selecting several.
+    const travelling = new Map<string, { track: Track; clip: Clip }>()
+    for (const other of alsoSelected) {
+      if (other.clip.id !== clip.id) travelling.set(other.clip.id, other)
+    }
+    for (const other of project.timeline.tracks.flatMap((t) =>
+      t.clips.filter((c) => clip.link_id && c.link_id === clip.link_id && c.id !== clip.id)
+        .map((c) => ({ track: t, clip: c })),
+    )) {
+      travelling.set(other.clip.id, other)
+    }
+    const partners = [...travelling.values()].map(({ track: t, clip: c }) => ({
+      id: c.id, trackId: t.id, start: c.start, duration: c.duration, locked: t.locked,
+    }))
 
     const onMove = (move: MouseEvent) => {
       if (!dragState.current) return
@@ -973,7 +1018,7 @@ function ClipBlock({
 
       for (const partner of partners) {
         const node = document.getElementById(`clip-${partner.id}`)
-        if (!node) continue
+        if (!node || partner.locked) continue
         node.style.left = `${Math.max(0, partner.start + (start - state.start)) * zoom}px`
         node.style.width = `${Math.max(0.04, partner.duration + (duration - state.duration)) * zoom}px`
       }
@@ -990,9 +1035,26 @@ function ClipBlock({
 
       if (Math.abs(up.clientX - state.x) < 2) return
       const { start, duration } = resolve(up)
-      // Persist once, on release — dragging fires far too often to PATCH every frame.
-      const patch = state.mode === 'move' ? { start } : { duration }
-      await api.timeline.updateClip(project.id, track.id, clip.id, patch)
+      const moved = start - state.start
+      const grew = duration - state.duration
+
+      // Everything travelling, the dragged clip included. Tied clips are left out: the server moves a
+      // clip's partners itself, and sending them here as well would apply the shift twice.
+      const carried = [
+        { id: clip.id, trackId: track.id, start: state.start, duration: state.duration, locked: false },
+        ...partners.filter(
+          (p) => !p.locked && (!clip.link_id || alsoSelected.some((o) => o.clip.id === p.id)),
+        ),
+      ]
+
+      // Persisted once, on release — dragging fires far too often to PATCH every frame — and in the
+      // order `travelOrder` gives, so that no clip lands on one that has not moved out of the way yet.
+      for (const item of travelOrder(carried, moved)) {
+        await api.timeline.updateClip(project.id, item.trackId, item.id,
+          state.mode === 'move'
+            ? { start: Math.max(0, item.start + moved) }
+            : { duration: Math.max(0.04, item.duration + grew) })
+      }
       onChanged()
     }
 

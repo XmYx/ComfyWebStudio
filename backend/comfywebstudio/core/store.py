@@ -260,6 +260,11 @@ class ProjectStore:
             return []
         runs: list[Run] = []
         for path in sorted(directory.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            # The cache index lives in this directory too, and `Run` ignores unknown keys — so without
+            # this it validates cleanly into a run with no shot, no steps and a status of "pending", and
+            # every run list in the app carries one permanent ghost.
+            if path.name.startswith("."):
+                continue
             try:
                 run = Run.model_validate(json.loads(path.read_text(encoding="utf-8")))
             except (OSError, json.JSONDecodeError, ValueError) as exc:

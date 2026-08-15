@@ -17,6 +17,7 @@ from .core.errors import BackendUnavailable
 from .core.plugins import PluginStore
 from .core.store import ProjectStore
 from .core.template_store import TemplateStore
+from .execution.batch import ShotQueue
 from .execution.events import EventBus
 from .execution.orchestrator import Orchestrator
 from .media.store import MediaStore
@@ -123,6 +124,8 @@ class AppState:
         )
         #: Drives a storyboard's whole flow in the background, since part of it waits on ComfyUI.
         self.pipelines = PipelineRunner(self)
+        #: Renders several shots one after another, for the same reason.
+        self.batches = ShotQueue(self)
         #: Tokens handed to the ComfyUI bridge extension, mapped to the step they may write to.
         self.bridge_tokens: dict[str, dict[str, str]] = {}
         #: Work that outlives the request that started it. Held strongly; see `spawn`.
@@ -143,6 +146,7 @@ class AppState:
             task.cancel()
         if self._background:
             await asyncio.gather(*self._background, return_exceptions=True)
+        await self.batches.shutdown()
         await self.pipelines.shutdown()
         await self.orchestrator.shutdown()
         await self.backends.close()

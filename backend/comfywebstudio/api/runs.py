@@ -6,6 +6,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from ..core.models import Run, RunMode
+from ..execution.batch import ShotBatch
 from .deps import ProjectDep, ShotDep, StateDep
 
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["runs"])
@@ -27,6 +28,34 @@ async def start_run(
     return await state.orchestrator.start(
         project, shot, mode=body.mode, step_ids=body.step_ids, force=body.force
     )
+
+
+class StartBatchRequest(BaseModel):
+    #: Rendered in the order given. Empty means every shot in the project.
+    shot_ids: list[str] = []
+    force: bool = False
+
+
+@router.post("/runs/batch", status_code=202)
+async def start_batch(state: StateDep, project: ProjectDep, body: StartBatchRequest) -> ShotBatch:
+    """Queue several shots, rendered one after another. Follow it on ``/api/events``."""
+    shot_ids = body.shot_ids or [s.id for s in project.shots if not s.template_edit_id]
+    return await state.batches.start(project, shot_ids, force=body.force)
+
+
+@router.get("/runs/batch/active")
+def active_batch(state: StateDep, project: ProjectDep) -> ShotBatch | None:
+    """What the project is rendering right now, so a reloaded page rejoins a queue already in flight."""
+    return state.batches.active(project.id)
+
+
+@router.post("/runs/batch/{batch_id}/cancel")
+async def cancel_batch(state: StateDep, project: ProjectDep, batch_id: str) -> dict:
+    cancelled = await state.batches.cancel(batch_id)
+    return {
+        "cancelled": cancelled,
+        "message": "Stopping." if cancelled else "That queue is not currently running.",
+    }
 
 
 @router.get("/runs")

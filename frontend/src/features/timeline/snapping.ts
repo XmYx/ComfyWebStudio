@@ -15,6 +15,19 @@ import type { Timeline } from '@/api/types'
 /** How close, on screen, an edge has to be before it is pulled in. */
 export const SNAP_PX = 8
 
+/**
+ * Put a time on the frame grid.
+ *
+ * Every time this module hands back goes through here. A cut is a frame boundary — there is no half a
+ * frame in the finished file — so a clip that ends at 5.0333 next to one that starts at 5.0334 looks
+ * flush at every zoom level and still renders a black frame between them. Rounding is what makes
+ * "snapped" mean "touching".
+ */
+export function toFrame(time: number, fps: number): number {
+  if (!fps || fps <= 0) return Math.max(0, time)
+  return Math.max(0, Math.round(time * fps) / fps)
+}
+
 export interface SnapTarget {
   time: number
   /** What it is, for the guide's tooltip — 'clip' | 'playhead' | 'start'. */
@@ -54,9 +67,11 @@ export function snapTargets(
  * constant in seconds — the whole point of snapping to what you can see.
  */
 export function snap(
-  time: number, targets: SnapTarget[], zoom: number, enabled = true,
+  time: number, targets: SnapTarget[], zoom: number, enabled = true, fps = 0,
 ): SnapResult {
-  if (!enabled || zoom <= 0) return { time, target: null }
+  // Even with snapping off, the result lands on a frame: turning snapping off means "do not pull me to
+  // that other clip", not "let me put a cut halfway through a frame".
+  if (!enabled || zoom <= 0) return { time: toFrame(time, fps), target: null }
 
   let best: SnapTarget | null = null
   let bestDistance = SNAP_PX
@@ -67,7 +82,9 @@ export function snap(
       bestDistance = distance
     }
   }
-  return best ? { time: best.time, target: best } : { time, target: null }
+  // A target is already where something else is, so it is taken as it stands — rounding a neighbour's
+  // edge would move the cut away from the very thing it was pulled to.
+  return best ? { time: best.time, target: best } : { time: toFrame(time, fps), target: null }
 }
 
 /**
@@ -77,10 +94,10 @@ export function snap(
  * common as lining up its beginning, and an editor that only did the former would feel half-finished.
  */
 export function snapMove(
-  start: number, duration: number, targets: SnapTarget[], zoom: number, enabled = true,
+  start: number, duration: number, targets: SnapTarget[], zoom: number, enabled = true, fps = 0,
 ): SnapResult {
-  const head = snap(start, targets, zoom, enabled)
-  const tail = snap(start + duration, targets, zoom, enabled)
+  const head = snap(start, targets, zoom, enabled, fps)
+  const tail = snap(start + duration, targets, zoom, enabled, fps)
 
   if (head.target && tail.target) {
     // Both are in range; take whichever is actually closer.
@@ -92,5 +109,28 @@ export function snapMove(
   }
   if (head.target) return head
   if (tail.target) return { time: tail.time - duration, target: tail.target }
-  return { time: start, target: null }
+  return { time: toFrame(start, fps), target: null }
+}
+
+/**
+ * The gap a time falls in on one track: from the end of the clip before it to the start of the clip
+ * after, or to the end of the timeline when there is nothing after.
+ *
+ * This is what clicking empty space selects. Dragging out the span by hand was the only way to get at
+ * a gap before, which meant the most common thing you want to do with one — take it out — depended on
+ * hitting both of its edges by eye.
+ */
+export function gapAt(
+  clips: Array<{ start: number; duration: number }>, time: number,
+): { from: number; to: number } | null {
+  const ordered = [...clips].sort((a, b) => a.start - b.start)
+  if (ordered.some((c) => time >= c.start && time < c.start + c.duration)) return null
+
+  let from = 0
+  for (const clip of ordered) {
+    if (clip.start + clip.duration <= time) from = Math.max(from, clip.start + clip.duration)
+  }
+  const next = ordered.find((c) => c.start > time)
+  const to = next ? next.start : Infinity
+  return to > from ? { from, to } : null
 }

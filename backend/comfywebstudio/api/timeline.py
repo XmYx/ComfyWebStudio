@@ -13,7 +13,8 @@ from pydantic import ValidationError as PydanticValidationError
 
 from ..core.errors import NotFound, ValidationFailed
 from ..core.ids import new_id, slugify
-from ..core.models import Clip, ClipSource, Timeline, Track, TrackKind
+from ..core.models import Clip, ClipSource, RenderChoice, Timeline, Track, TrackKind
+from ..core.timeline_edit import align, place, quantise
 from ..execution.events import StudioEvent
 from ..render.compositor import TimelineResolver
 from ..render.encoder import TimelineRenderer
@@ -77,6 +78,8 @@ class RenderRequest(BaseModel):
     end_s: float | None = None
     #: For ``clip``.
     clip_id: str | None = None
+    #: The preset these settings came from, remembered with them so the dialog reopens on it.
+    preset_id: str | None = None
 
     # Output overrides, applied on top of the project's render settings for this render only. Left unset,
     # each one keeps whatever the project already uses — this dialog is not a way to edit project settings
@@ -226,11 +229,11 @@ def create_clip(
         name=body.name,
         source=body.source or ClipSource(kind="step_output"),
         start=start,
-        duration=max(0.04, duration),
+        duration=duration,
         text=body.text,
     )
-    track.clips.append(clip)
-    track.clips.sort(key=lambda c: c.start)
+    # Frame-aligned, and it takes the space it lands on rather than burying what was there.
+    place(track, clip, project.timeline.fps)
 
     # Media that carries its own sound gets an audio clip too, tied to the picture. Placing a video and
     # silently leaving its audio behind means finding out at the render.
@@ -278,8 +281,9 @@ def update_clip(
     if "source" in body and "duration" not in body and updated.source != clip.source:
         updated.duration = _default_duration(state, project, updated.source, updated.duration)
 
-    updated.start = max(0.0, updated.start)
-    updated.duration = max(0.04, updated.duration)  # one frame at 24fps is the floor
+    # On the frame grid, always. A drag that lands a thousandth of a second short of its neighbour
+    # looks flush and renders a black frame; rounding here is what makes "snapped" mean "touching".
+    align(updated, project.timeline.fps)
     updated.volume = max(0.0, min(4.0, updated.volume))
     updated.pan = max(-1.0, min(1.0, updated.pan))
 
@@ -293,11 +297,10 @@ def update_clip(
                 continue
             partner.start = max(0.0, partner.start + moved)
             partner.duration = max(0.04, partner.duration + resized)
-            partner_track.clips.sort(key=lambda c: c.start)
+            place(partner_track, partner, project.timeline.fps)
 
-    track.clips = sorted(
-        [updated if c.id == clip_id else c for c in track.clips], key=lambda c: c.start
-    )
+    track.clips = [updated if c.id == clip_id else c for c in track.clips]
+    place(track, updated, project.timeline.fps)
     state.store.save(project)
     return updated
 
@@ -390,24 +393,32 @@ def shot_output(
     except Exception:  # noqa: BLE001 - a broken shot yields nothing rather than breaking the caller
         return None
 
+    # Video before image, whatever order the workflow happens to declare its outputs in. A shot that
+    # produced a clip *and* a still frame of it is a clip as far as the timeline is concerned — cutting
+    # in the still and leaving the motion behind is never what was wanted, and it is a mistake that only
+    # shows up when the render comes out as a slideshow.
+    ranked = sorted(kinds, key=lambda kind: 0 if kind == "video" else 1)
+
     fallback: ClipSource | None = None
-    for step_id in reversed(order):
-        step = shot.step(step_id)
-        workflow = project.workflow(step.workflow_id) if step else None
-        if step is None or workflow is None or not step.enabled:
-            continue
-        for port in workflow.outputs:
-            if port.kind not in kinds:
+    for wanted in ranked:
+        for step_id in reversed(order):
+            step = shot.step(step_id)
+            workflow = project.workflow(step.workflow_id) if step else None
+            if step is None or workflow is None or not step.enabled:
                 continue
-            source = ClipSource(
-                kind="step_output", shot_id=shot.id, step_id=step.id, port_key=port.key
-            )
-            artifacts, error = resolver.artifacts_for(Clip(source=source))
-            if not error and artifacts:
-                return source
-            # The last step's declared port, kept in case nothing in the shot has run.
-            if fallback is None:
-                fallback = source
+            for port in workflow.outputs:
+                if port.kind != wanted:
+                    continue
+                source = ClipSource(
+                    kind="step_output", shot_id=shot.id, step_id=step.id, port_key=port.key
+                )
+                artifacts, error = resolver.artifacts_for(Clip(source=source))
+                if not error and artifacts:
+                    return source
+                # The last step's declared port, kept in case nothing in the shot has run. Ranked the
+                # same way, so an unrun shot is cut in as the video it is going to be.
+                if fallback is None:
+                    fallback = source
 
     return None if require_output else fallback
 
@@ -578,7 +589,7 @@ def place_shot(state: StateDep, project: ProjectDep, body: PlaceShotRequest) -> 
         start = _append_at(track) if body.start is None else max(0.0, body.start)
         duration = _default_duration(state, project, visual, 3.0)
         clip = Clip(name=shot.name, source=visual, start=start, duration=duration)
-        track.clips = sorted([*track.clips, clip], key=lambda c: c.start)
+        place(track, clip, project.timeline.fps)
         placed.append(clip)
 
     # A video usually carries its own sound. Placing the picture and leaving the audio behind means
@@ -594,8 +605,12 @@ def place_shot(state: StateDep, project: ProjectDep, body: PlaceShotRequest) -> 
             _append_at(track) if body.start is None else max(0.0, body.start)
         )
         duration = _default_duration(state, project, audio_source, placed[0].duration if placed else 3.0)
+        # Exactly as long as the picture when it came from the same media: a sound track a frame longer
+        # than the shot it belongs to is a click at every cut.
+        if placed and audio_source == embedded:
+            duration = placed[0].duration
         clip = Clip(name=f"{shot.name} (audio)", source=audio_source, start=start, duration=duration)
-        track.clips = sorted([*track.clips, clip], key=lambda c: c.start)
+        place(track, clip, project.timeline.fps)
         placed.append(clip)
 
     if len(placed) > 1:
@@ -627,7 +642,14 @@ def build_from_shots(
     if not shots:
         raise ValidationFailed("No shots to build from.")
 
-    track = Track(kind="video", name="Shots")
+    # The empty video track a new timeline comes with, when that is what is there — otherwise assembling
+    # a cut on a fresh project leaves a blank lane above it for ever. An occupied one is left alone: a
+    # build must never quietly overwrite a cut somebody made.
+    existing = next((t for t in project.timeline.tracks if t.kind == "video" and not t.clips), None)
+    track = existing if existing is not None and not existing.locked else Track(
+        kind="video", name="Shots"
+    )
+    audio_track = _track_for(project.timeline, "audio", "Audio")
     resolver = TimelineResolver(state.store, project)
     cursor = 0.0
     skipped: list[str] = []
@@ -637,8 +659,26 @@ def build_from_shots(
         if source is None:
             skipped.append(shot.name)
             continue
-        duration = _default_duration(state, project, source, 3.0)
-        track.clips.append(Clip(name=shot.name, source=source, start=cursor, duration=duration))
+        duration = quantise(_default_duration(state, project, source, 3.0), project.timeline.fps)
+        clip = Clip(name=shot.name, source=source, start=cursor, duration=duration)
+        track.clips.append(clip)
+
+        # The sound that came with the picture, laid alongside it and tied to it. Assembling a cut and
+        # discovering at the render that it is silent is the failure this exists to prevent.
+        sound = shot_output(project, shot, resolver, _AUDIO_KINDS, require_output=True)
+        if sound is None and _has_audio(state, project, source):
+            sound = source
+        if sound is not None and not audio_track.locked:
+            clip.link_id = new_id("link")
+            audio_track.clips.append(
+                Clip(
+                    name=f"{shot.name} (audio)",
+                    source=sound.model_copy(deep=True),
+                    start=cursor,
+                    duration=duration,
+                    link_id=clip.link_id,
+                )
+            )
         cursor += duration
 
     if not track.clips:
@@ -646,7 +686,9 @@ def build_from_shots(
             "None of the selected shots have produced image or video output yet. Run them first."
         )
 
-    project.timeline.tracks.append(track)
+    audio_track.clips.sort(key=lambda c: c.start)
+    if track not in project.timeline.tracks:
+        project.timeline.tracks.append(track)
     state.store.save(project)
     if skipped:
         state.events.emit(
@@ -739,6 +781,15 @@ async def render_timeline(state: StateDep, project: ProjectDep, body: RenderRequ
     """Render the timeline, or part of it. Runs in a worker thread; progress arrives on the event bus."""
     if project.timeline.duration <= 0 and not body.still:
         raise ValidationFailed("The timeline is empty — add at least one clip before rendering.")
+
+    # Remembered before anything is encoded, so a render that fails still leaves the settings that were
+    # chosen for it — having to retype them because the first attempt did not work is its own annoyance.
+    project.settings.render = RenderChoice(
+        width=body.width, height=body.height, fps=body.fps,
+        container=body.container, video_codec=body.video_codec, crf=body.crf,
+        preset_id=body.preset_id,
+    )
+    state.store.save(project)
 
     render_id = new_id("render")
     base_name = slugify(body.name or f"{project.name}-{render_id[-6:]}")

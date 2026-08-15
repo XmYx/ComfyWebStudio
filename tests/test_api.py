@@ -336,6 +336,126 @@ async def test_media_endpoint_refuses_traversal(client):
     assert response.status_code == 422
 
 
+async def steps_in_three_shots(client) -> tuple[dict, dict, list[dict]]:
+    """Three shots, each running the same workflow — the shape a storyboard produces."""
+    project = await make_project(client)
+    workflow = await import_workflow(client, project["id"], "Generate", generator_prompt())
+
+    shots, steps = [], []
+    for index in range(3):
+        shot = (
+            await client.post(f"/api/projects/{project['id']}/shots", json={"name": f"Shot {index + 1}"})
+        ).json()
+        step = (
+            await client.post(
+                f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+                json={"workflow_id": workflow["id"]},
+            )
+        ).json()
+        shots.append(shot)
+        steps.append(step)
+    return project, workflow, steps
+
+
+async def test_a_parameter_is_applied_to_every_step_on_the_same_workflow(client):
+    project, _workflow, steps = await steps_in_three_shots(client)
+    await client.patch(
+        f"/api/projects/{project['id']}/steps/{steps[0]['id']}",
+        json={"param_overrides": {"prompt": "a lighthouse"}},
+    )
+
+    response = await client.post(
+        f"/api/projects/{project['id']}/steps/{steps[0]['id']}/params/apply-to-all",
+        json={"keys": ["prompt"]},
+    )
+    assert response.status_code == 200, response.text
+    assert set(response.json()["steps"]) == {steps[1]["id"], steps[2]["id"]}
+    assert response.json()["values"] == {"prompt": "a lighthouse"}
+
+    now = (await client.get(f"/api/projects/{project['id']}")).json()
+    applied = [shot["steps"][0]["param_overrides"].get("prompt") for shot in now["shots"]]
+    assert applied == ["a lighthouse"] * 3
+
+
+async def test_applying_spreads_the_workflow_default_when_nothing_was_overridden(client):
+    """The effective value, not the override map — an untouched parameter still runs with something."""
+    project, _workflow, steps = await steps_in_three_shots(client)
+    for step in steps[1:]:
+        await client.patch(
+            f"/api/projects/{project['id']}/steps/{step['id']}",
+            json={"param_overrides": {"prompt": "diverged"}},
+        )
+
+    response = await client.post(
+        f"/api/projects/{project['id']}/steps/{steps[0]['id']}/params/apply-to-all", json={"keys": []},
+    )
+    assert response.json()["values"]["prompt"] == "a cat", "the workflow's own default"
+
+    now = (await client.get(f"/api/projects/{project['id']}")).json()
+    assert all(shot["steps"][0]["param_overrides"]["prompt"] == "a cat" for shot in now["shots"][1:])
+
+
+async def test_applying_leaves_a_step_whose_input_comes_from_a_link(client):
+    project, _workflow, steps = await steps_in_three_shots(client)
+    now = (await client.get(f"/api/projects/{project['id']}")).json()
+    second = next(s for s in now["shots"] if s["steps"][0]["id"] == steps[1]["id"])
+
+    value = (
+        await client.post(
+            f"/api/projects/{project['id']}/shots/{second['id']}/nodes",
+            json={"kind": "string", "value": "this shot says its own thing"},
+        )
+    ).json()
+    link = await client.post(
+        f"/api/projects/{project['id']}/shots/{second['id']}/links",
+        json={
+            "from_step": value["id"], "from_port": "value",
+            "to_step": steps[1]["id"], "to_port": "prompt",
+        },
+    )
+    assert link.status_code == 201, link.text
+
+    await client.patch(
+        f"/api/projects/{project['id']}/steps/{steps[0]['id']}",
+        json={"param_overrides": {"prompt": "a lighthouse"}},
+    )
+    result = (
+        await client.post(
+            f"/api/projects/{project['id']}/steps/{steps[0]['id']}/params/apply-to-all",
+            json={"keys": ["prompt"]},
+        )
+    ).json()
+
+    assert result["steps"] == [steps[2]["id"]], "the linked step keeps taking its value from upstream"
+    assert any("comes from a link" in note for note in result["skipped"])
+
+
+async def test_applying_does_not_reach_a_different_workflow(client):
+    project, shot, steps = await build_chain(client)
+    await client.patch(
+        f"/api/projects/{project['id']}/steps/{steps[0]['id']}",
+        json={"param_overrides": {"prompt": "a lighthouse"}},
+    )
+    result = (
+        await client.post(
+            f"/api/projects/{project['id']}/steps/{steps[0]['id']}/params/apply-to-all", json={},
+        )
+    ).json()
+    assert result["steps"] == [], "the consumer step declares its own 'prompt', from another workflow"
+
+    now = (await client.get(f"/api/projects/{project['id']}")).json()
+    assert now["shots"][0]["steps"][1]["param_overrides"] == {}
+
+
+async def test_applying_an_unknown_parameter_is_refused(client):
+    project, _shot, steps = await build_chain(client)
+    response = await client.post(
+        f"/api/projects/{project['id']}/steps/{steps[0]['id']}/params/apply-to-all",
+        json={"keys": ["not_a_parameter"]},
+    )
+    assert response.status_code == 422
+
+
 async def test_run_with_a_parameter_override(client):
     project, shot, steps = await build_chain(client)
     await client.patch(
@@ -1915,6 +2035,243 @@ async def test_a_shot_can_be_cut_in_before_it_has_been_run(client):
     assert resolved["clips"][0]["artifacts"]
 
 
+async def test_a_new_project_has_somewhere_to_put_pictures_and_sound(client):
+    """The audio track is there from the start, not conjured under the user at the moment of a drop."""
+    project = await make_project(client)
+    kinds = [t["kind"] for t in project["timeline"]["tracks"]]
+    assert kinds == ["video", "audio"]
+
+
+async def test_a_shot_is_cut_in_as_video_rather_than_as_a_still_of_itself(client):
+    """A shot that made both a clip and a frame of it is a clip as far as the timeline is concerned."""
+    project = await make_project(client)
+    both = {
+        "1": {"class_type": "EmptyImage", "inputs": {"width": 16, "height": 16}},
+        # Declared *before* the video output, so declaration order cannot be what decides this.
+        "2": {
+            "class_type": "WSImageOutput",
+            "inputs": {"image": ["1", 0], "port_name": "still", "format": "png", "run_key": ""},
+        },
+        "3": {
+            "class_type": "WSVideoOutput",
+            "inputs": {"images": ["1", 0], "port_name": "movie", "fps": 8.0, "run_key": ""},
+        },
+    }
+    workflow = await import_workflow(client, project["id"], "Both", both)
+    shot = (await client.post(f"/api/projects/{project['id']}/shots", json={"name": "Wide"})).json()
+    await client.post(
+        f"/api/projects/{project['id']}/shots/{shot['id']}/steps",
+        json={"workflow_id": workflow["id"]},
+    )
+
+    timeline = (
+        await client.post(
+            f"/api/projects/{project['id']}/timeline/from-shot", json={"shot_id": shot["id"]}
+        )
+    ).json()
+    video = next(t for t in timeline["tracks"] if t["kind"] == "video")
+    assert video["clips"][0]["source"]["port_key"] == "movie"
+
+
+async def test_a_dropped_clip_takes_the_space_it_lands_on(client):
+    project_id, shot_id = await _timeline_project(client)
+    await client.post(f"/api/projects/{project_id}/timeline/from-shot", json={"shot_id": shot_id})
+
+    timeline = (await client.get(f"/api/projects/{project_id}/timeline")).json()
+    track = next(t for t in timeline["tracks"] if t["clips"])
+    first = track["clips"][0]
+
+    # A second clip dragged so that it starts halfway through the first.
+    half = first["duration"] / 2
+    await client.post(
+        f"/api/projects/{project_id}/timeline/from-shot",
+        json={"shot_id": shot_id, "track_id": track["id"], "start": half},
+    )
+
+    after = (await client.get(f"/api/projects/{project_id}/timeline")).json()
+    lane = next(t for t in after["tracks"] if t["id"] == track["id"])
+    assert len(lane["clips"]) == 2
+    # The one underneath gave way rather than being buried where the render would find it.
+    assert lane["clips"][0]["duration"] == pytest.approx(half, abs=1 / 24)
+    assert lane["clips"][0]["start"] + lane["clips"][0]["duration"] == pytest.approx(
+        lane["clips"][1]["start"], abs=1e-6
+    ), "and they touch exactly, with no frame left between them"
+
+
+async def test_a_clip_dragged_onto_another_trims_it_through_the_api(client):
+    project_id, shot_id = await _timeline_project(client)
+    await client.post(f"/api/projects/{project_id}/timeline/from-shot", json={"shot_id": shot_id})
+    timeline = (await client.get(f"/api/projects/{project_id}/timeline")).json()
+    track = next(t for t in timeline["tracks"] if t["clips"])
+
+    second = (
+        await client.post(
+            f"/api/projects/{project_id}/timeline/tracks/{track['id']}/clips",
+            json={"name": "second", "start": 10, "duration": 2},
+        )
+    ).json()
+    # Dragged back so it overlaps the first clip's tail.
+    await client.patch(
+        f"/api/projects/{project_id}/timeline/tracks/{track['id']}/clips/{second['id']}",
+        json={"start": 0.5},
+    )
+
+    after = (await client.get(f"/api/projects/{project_id}/timeline")).json()
+    lane = next(t for t in after["tracks"] if t["id"] == track["id"])
+    moved = next(c for c in lane["clips"] if c["id"] == second["id"])
+    # The clip it landed on was straddled, so it survives as a head and a tail either side — what it
+    # must not do is stay buried underneath, where only the render would find it.
+    assert len(lane["clips"]) == 3
+    for other in lane["clips"]:
+        if other["id"] == second["id"]:
+            continue
+        assert (
+            other["start"] + other["duration"] <= moved["start"] + 1e-6
+            or other["start"] >= moved["start"] + moved["duration"] - 1e-6
+        ), "nothing is left buried under the clip that was dragged over it"
+
+
+async def test_clip_times_are_kept_on_the_frame_grid(client):
+    project_id, _shot_id = await _timeline_project(client)
+    timeline = (await client.get(f"/api/projects/{project_id}/timeline")).json()
+    track = next(t for t in timeline["tracks"] if t["kind"] == "video")
+    fps = timeline["fps"]
+
+    clip = (
+        await client.post(
+            f"/api/projects/{project_id}/timeline/tracks/{track['id']}/clips",
+            json={"name": "c", "start": 1.0 / fps * 3 + 0.003, "duration": 1.0},
+        )
+    ).json()
+    assert clip["start"] * fps == pytest.approx(round(clip["start"] * fps))
+
+    nudged = (
+        await client.patch(
+            f"/api/projects/{project_id}/timeline/tracks/{track['id']}/clips/{clip['id']}",
+            json={"start": 2.0 + 0.7 / fps},
+        )
+    ).json()
+    assert nudged["start"] * fps == pytest.approx(round(nudged["start"] * fps))
+
+
+async def test_the_common_render_sizes_are_there_from_the_start(client):
+    presets = (await client.get("/api/settings/render-presets")).json()
+    names = [p["name"] for p in presets]
+    assert names == [
+        "VGA landscape", "VGA portrait",
+        "720p landscape", "720p portrait",
+        "1080p landscape", "1080p portrait",
+        "4K landscape", "4K portrait",
+    ]
+    by_name = {p["name"]: (p["width"], p["height"]) for p in presets}
+    assert by_name["1080p landscape"] == (1920, 1080)
+    assert by_name["1080p portrait"] == (1080, 1920), "the same size the other way up"
+
+
+async def test_a_preset_can_be_added_edited_and_removed(client):
+    created = await client.post(
+        "/api/settings/render-presets",
+        json={"name": "Square", "width": 1080, "height": 1080, "crf": 20},
+    )
+    assert created.status_code == 201, created.text
+    preset = created.json()
+    assert preset["builtin"] is False
+
+    edited = (
+        await client.patch(f"/api/settings/render-presets/{preset['id']}", json={"width": 2048})
+    ).json()
+    assert (edited["width"], edited["height"]) == (2048, 1080)
+    assert edited["crf"] == 20, "an untouched field keeps what it had"
+
+    assert (await client.delete(f"/api/settings/render-presets/{preset['id']}")).status_code == 204
+    names = [p["name"] for p in (await client.get("/api/settings/render-presets")).json()]
+    assert "Square" not in names
+
+
+async def test_a_built_in_preset_can_be_edited_and_deleted_like_any_other(client):
+    """"Editable presets, plus these you cannot touch" would not be editable presets."""
+    presets = (await client.get("/api/settings/render-presets")).json()
+    builtin = next(p for p in presets if p["name"] == "720p landscape")
+
+    edited = (
+        await client.patch(f"/api/settings/render-presets/{builtin['id']}", json={"crf": 12})
+    ).json()
+    assert edited["crf"] == 12
+    assert edited["builtin"] is False, "once edited it is the user's, not the one that shipped"
+
+    # Pressing Update on a preset nobody has touched is not an edit.
+    untouched = next(p for p in presets if p["name"] == "4K landscape")
+    same = (
+        await client.patch(
+            f"/api/settings/render-presets/{untouched['id']}",
+            json={"width": untouched["width"], "height": untouched["height"]},
+        )
+    ).json()
+    assert same["builtin"] is True
+
+    assert (await client.delete(f"/api/settings/render-presets/{builtin['id']}")).status_code == 204
+
+
+async def test_restoring_puts_back_what_was_deleted_without_touching_the_rest(client):
+    presets = (await client.get("/api/settings/render-presets")).json()
+    doomed = next(p for p in presets if p["name"] == "4K portrait")
+    await client.delete(f"/api/settings/render-presets/{doomed['id']}")
+    await client.post(
+        "/api/settings/render-presets", json={"name": "Mine", "width": 800, "height": 600}
+    )
+
+    restored = (await client.post("/api/settings/render-presets/restore")).json()
+    names = [p["name"] for p in restored]
+    assert "4K portrait" in names, "the deleted built-in came back"
+    assert "Mine" in names, "and nothing of the user's was lost"
+    assert len([n for n in names if n == "1080p landscape"]) == 1, "no duplicates of what was already there"
+
+
+async def test_a_preset_needs_a_name(client):
+    response = await client.post("/api/settings/render-presets", json={"width": 100, "height": 100})
+    assert response.status_code == 422
+
+
+async def test_an_impossible_frame_size_is_refused(client):
+    response = await client.post(
+        "/api/settings/render-presets", json={"name": "Vast", "width": 999999, "height": 100},
+    )
+    assert response.status_code == 422
+
+
+async def test_presets_survive_a_settings_patch(client):
+    """The Settings page replaces whole sub-models; the preset list must not be collateral."""
+    before = (await client.get("/api/settings/render-presets")).json()
+    await client.patch("/api/settings", json={"ui": {"theme": "light"}})
+    after = (await client.get("/api/settings/render-presets")).json()
+    assert [p["id"] for p in after] == [p["id"] for p in before]
+
+
+async def test_what_a_project_rendered_with_is_remembered(client):
+    project_id, shot_id = await _timeline_project(client)
+    await client.post(f"/api/projects/{project_id}/timeline/from-shot", json={"shot_id": shot_id})
+
+    response = await client.post(
+        f"/api/projects/{project_id}/timeline/render",
+        json={
+            "scope": "timeline", "still": True, "time_s": 0.0,
+            "width": 1280, "height": 720, "fps": 30, "crf": 20, "preset_id": "preset_abc",
+        },
+    )
+    assert response.status_code == 202, response.text
+
+    project = (await client.get(f"/api/projects/{project_id}")).json()
+    remembered = project["settings"]["render"]
+    assert (remembered["width"], remembered["height"]) == (1280, 720)
+    assert remembered["fps"] == 30
+    assert remembered["crf"] == 20
+    assert remembered["preset_id"] == "preset_abc"
+
+    # The composition itself is untouched: rendering out at another size is not resizing the project.
+    timeline = (await client.get(f"/api/projects/{project_id}/timeline")).json()
+    assert (timeline["width"], timeline["height"]) != (1280, 720) or timeline["fps"] != 30
+
+
 async def test_a_track_can_be_soloed_and_panned(client):
     project_id, shot_id = await _timeline_project(client)
     await client.post(f"/api/projects/{project_id}/timeline/from-shot", json={"shot_id": shot_id})
@@ -2013,7 +2370,8 @@ async def test_a_nonsense_clip_patch_is_refused_rather_than_stored(client):
     assert response.status_code == 422, response.text
 
     unchanged = (await client.get(f"/api/projects/{project['id']}/timeline")).json()
-    assert unchanged["tracks"][0]["clips"][0]["transform"]["fit"] == "contain"
+    kept = next(t for t in unchanged["tracks"] if t["id"] == track["id"])
+    assert kept["clips"][0]["transform"]["fit"] == "contain"
 
 
 # -- a workflow is re-read from ComfyUI before it is used ------------------------------------------------

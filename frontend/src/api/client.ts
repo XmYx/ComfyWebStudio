@@ -6,9 +6,11 @@
  */
 
 import type {
+  ApplyParamsResult,
   AppSettings, Asset, BackendConfig, BackendStatus, BindableWidget, Clip, GraphReport,
   Link, PlacedTemplate, PluginInfo, Project, ProjectSummary, RenderRequest, ResolvedTimeline,
-  Run, RunMode, Shot, ShotTemplate, Step, StepRun,
+  RenderPreset,
+  Run, RunMode, Shot, ShotBatch, ShotTemplate, Step, StepRun,
   TemplateInstance, TemplateSummary, Timeline, Track, TrackKind, ValueNode, ValueNodeKind,
   Vec2, Version, WorkflowRef,
   BoardStills, BoardSurfaces, DrawResult, LlmModel, LlmProviderConfig, Storyboard,
@@ -206,6 +208,15 @@ export const api = {
       request<Step>(`/api/projects/${projectId}/steps/${stepId}/params`, {
         method: 'PUT',
         body: json(overrides),
+      }),
+    /**
+     * Push this step's value for `keys` onto every other step in the project running the same workflow.
+     * No keys means every parameter the workflow exposes.
+     */
+    applyParamsToAll: (projectId: string, stepId: string, keys: string[] = []) =>
+      request<ApplyParamsResult>(`/api/projects/${projectId}/steps/${stepId}/params/apply-to-all`, {
+        method: 'POST',
+        body: json({ keys }),
       }),
     remove: (projectId: string, stepId: string) =>
       request<void>(`/api/projects/${projectId}/steps/${stepId}`, { method: 'DELETE' }),
@@ -522,6 +533,21 @@ export const api = {
       ),
     clearCache: (projectId: string) =>
       request<{ ok: boolean }>(`/api/projects/${projectId}/cache/clear`, { method: 'POST' }),
+
+    /** Render several shots one after another. No ids means every shot in the project. */
+    startBatch: (projectId: string, shotIds: string[] = [], force = false) =>
+      request<ShotBatch>(`/api/projects/${projectId}/runs/batch`, {
+        method: 'POST',
+        body: json({ shot_ids: shotIds, force }),
+      }),
+    /** What is rendering now — how a reloaded page rejoins a queue already in flight. */
+    activeBatch: (projectId: string) =>
+      request<ShotBatch | null>(`/api/projects/${projectId}/runs/batch/active`),
+    cancelBatch: (projectId: string, batchId: string) =>
+      request<{ cancelled: boolean; message: string }>(
+        `/api/projects/${projectId}/runs/batch/${batchId}/cancel`,
+        { method: 'POST' },
+      ),
   },
 
   // -- media ---------------------------------------------------------------------------------------
@@ -719,6 +745,20 @@ export const api = {
       '/api/settings/notices',
     ),
     backends: () => request<BackendConfig[]>('/api/settings/backends'),
+
+    /** Named output sizes and formats. Editable and deletable, built-in or not. */
+    renderPresets: () => request<RenderPreset[]>('/api/settings/render-presets'),
+    addRenderPreset: (body: Partial<RenderPreset>) =>
+      request<RenderPreset>('/api/settings/render-presets', { method: 'POST', body: json(body) }),
+    updateRenderPreset: (id: string, body: Partial<RenderPreset>) =>
+      request<RenderPreset>(`/api/settings/render-presets/${id}`, {
+        method: 'PATCH', body: json(body),
+      }),
+    removeRenderPreset: (id: string) =>
+      request<void>(`/api/settings/render-presets/${id}`, { method: 'DELETE' }),
+    /** Put back any built-in that has been deleted, leaving everything else as it is. */
+    restoreRenderPresets: () =>
+      request<RenderPreset[]>('/api/settings/render-presets/restore', { method: 'POST' }),
 
     /** The configured language-model endpoints. */
     llmProviders: () => request<LlmProviderConfig[]>('/api/settings/llm-providers'),

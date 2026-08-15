@@ -8,6 +8,8 @@
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { ParamSpec } from '@/api/types'
+import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
+import { useCommandContext } from '@/features/menu/useCommandContext'
 import { Badge, Button, Select, TextArea, TextInput, cx } from '@/components/ui'
 
 const SAVE_DEBOUNCE_MS = 400
@@ -24,13 +26,45 @@ interface Props {
   onUnexpose?: (key: string) => void
   /** Pin or unpin a parameter from the step's node on the canvas. */
   onTogglePinned?: (key: string, pinned: boolean) => void
+  /**
+   * Give every other step running this workflow the same value. An empty list means every parameter.
+   *
+   * Offered from the right-click menu rather than a button per row: it reaches outside the step being
+   * edited, which is not something to put one stray click away from a value the user is dragging.
+   */
+  onApplyToAll?: (keys: string[]) => void
+  /** How many other steps in the project run this workflow — 0 hides the offer, since it would do nothing. */
+  applyTargets?: number
 }
 
 export function ParamForm({
   params, overrides, linkedKeys, pinnedKeys, onChange, onReset, onUnexpose, onTogglePinned,
+  onApplyToAll, applyTargets = 0,
 }: Props) {
   const [draft, setDraft] = useState<Record<string, unknown>>(overrides)
   const timer = useRef<number>()
+  const commandContext = useCommandContext()
+  const contextMenu = useContextMenu()
+
+  const rowMenu = (param: ParamSpec): MenuItem[] => {
+    if (!onApplyToAll) return []
+    const others = `${applyTargets} other step${applyTargets === 1 ? '' : 's'}`
+    return [
+      { type: 'header', label: param.label || param.key },
+      {
+        type: 'action',
+        label: `Apply to all shots (${others})`,
+        disabled: applyTargets === 0,
+        onSelect: () => onApplyToAll([param.key]),
+      },
+      {
+        type: 'action',
+        label: `Apply every parameter to all shots (${others})`,
+        disabled: applyTargets === 0,
+        onSelect: () => onApplyToAll([]),
+      },
+    ]
+  }
 
   // Adopt server state when the selection changes, but do not clobber what the user is typing.
   useEffect(() => setDraft(overrides), [overrides])
@@ -78,6 +112,7 @@ export function ParamForm({
                 onChange={(value) => update(param.key, value)}
                 onUnexpose={onUnexpose}
                 onTogglePinned={onTogglePinned}
+                onContextMenu={(event) => contextMenu.open(event, rowMenu(param))}
               />
             ))}
           </div>
@@ -87,12 +122,14 @@ export function ParamForm({
       <div className="border-t border-[var(--color-edge)] pt-3">
         <Button size="sm" variant="ghost" onClick={onReset}>Reset to workflow defaults</Button>
       </div>
+
+      <ContextMenu state={contextMenu.menu} onClose={contextMenu.close} context={commandContext} />
     </div>
   )
 }
 
 function ParamRow({
-  param, value, linked, pinned, onChange, onUnexpose, onTogglePinned,
+  param, value, linked, pinned, onChange, onUnexpose, onTogglePinned, onContextMenu,
 }: {
   param: ParamSpec
   value: unknown
@@ -101,9 +138,12 @@ function ParamRow({
   onChange: (value: unknown) => void
   onUnexpose?: (key: string) => void
   onTogglePinned?: (key: string, pinned: boolean) => void
+  onContextMenu?: (event: React.MouseEvent) => void
 }) {
   return (
-    <div>
+    // The whole row, label and widget alike: a right-click on a slider or a dropdown is about the
+    // parameter, and hunting for the label to hit is not an interaction anyone wants.
+    <div onContextMenu={onContextMenu}>
       <div className="mb-1 flex items-center justify-between gap-2">
         <span className="flex items-center gap-1.5 text-xs font-medium" title={param.tooltip}>
           {onTogglePinned && (

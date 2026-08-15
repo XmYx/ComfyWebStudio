@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from .core.ids import new_id
 from .core.pipeline import PipelineOverlay
 
 APP_NAME = "ComfyWebStudio"
@@ -136,6 +137,53 @@ class RenderSettings(BaseModel):
     audio_sample_rate: int = 48000
 
 
+class RenderPreset(BaseModel):
+    """A named output size and format, so "1080p" is one click rather than four fields.
+
+    Editable and deletable whatever it came from: the built-ins are seeded into the list on first run and
+    are ordinary entries from then on. That is what makes "editable, addable presets" true rather than
+    "editable, addable presets, plus these four you cannot touch".
+    """
+
+    id: str = Field(default_factory=lambda: new_id("preset"))
+    name: str
+    width: int = Field(default=1920, ge=16, le=16384)
+    height: int = Field(default=1080, ge=16, le=16384)
+    #: Left unset, the cut keeps its own rate. A preset is about size and format, and forcing 24 fps onto
+    #: a 30 fps timeline is rarely what picking "1080p" was meant to mean.
+    fps: float | None = None
+    container: str = "mp4"
+    video_codec: str = "libx264"
+    crf: int = Field(default=18, ge=0, le=51)
+    #: True for the ones shipped with the app. Purely a label — it grants no protection.
+    builtin: bool = False
+
+
+#: The sizes worth having ready, each way up.
+#:
+#: Seeded into `settings.json` on first run rather than resolved at read time, so an edit or a deletion
+#: sticks. The cost is that a preset added in a later version does not reach an install that already has
+#: a list — "Restore the built-in presets" is there for exactly that.
+_BUILTIN_SIZES: list[tuple[str, int, int]] = [
+    ("VGA", 640, 480),
+    ("720p", 1280, 720),
+    ("1080p", 1920, 1080),
+    ("4K", 3840, 2160),
+]
+
+
+def default_render_presets() -> list[RenderPreset]:
+    presets: list[RenderPreset] = []
+    for name, wide, tall in _BUILTIN_SIZES:
+        presets.append(
+            RenderPreset(name=f"{name} landscape", width=wide, height=tall, builtin=True)
+        )
+        presets.append(
+            RenderPreset(name=f"{name} portrait", width=tall, height=wide, builtin=True)
+        )
+    return presets
+
+
 class PreviewSettings(BaseModel):
     thumbnail_size: int = Field(default=320, ge=64, le=2048)
     thumbnail_format: Literal["webp", "jpeg", "png"] = "webp"
@@ -174,6 +222,8 @@ class AppSettings(BaseModel):
 
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     render: RenderSettings = Field(default_factory=RenderSettings)
+    #: Named output sizes and formats, seeded with the common ones on first run.
+    render_presets: list[RenderPreset] = Field(default_factory=default_render_presets)
     preview: PreviewSettings = Field(default_factory=PreviewSettings)
     ui: UISettings = Field(default_factory=UISettings)
     story: StorySettings = Field(default_factory=StorySettings)

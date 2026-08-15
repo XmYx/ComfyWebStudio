@@ -77,6 +77,36 @@ export function StepInspector({ project, shot, step, onChanged, onRunStep }: Pro
 
   const pinnedKeys = useMemo(() => new Set(pinned), [pinned])
 
+  // Every other step in the project running this same workflow — the reach of “apply to all shots”, and
+  // the reason the offer disappears when there is nothing for it to reach.
+  const applyTargets = useMemo(
+    () =>
+      project.shots
+        .filter((s) => !s.template_edit_id)
+        .flatMap((s) => s.steps)
+        .filter((s) => s.id !== step.id && s.workflow_id === step.workflow_id).length,
+    [project.shots, step.id, step.workflow_id],
+  )
+
+  const applyToAll = async (keys: string[]) => {
+    try {
+      const result = await api.steps.applyParamsToAll(project.id, step.id, keys)
+      queryClient.invalidateQueries({ queryKey: ['project', project.id] })
+      const what = keys.length === 1 ? `“${keys[0]}”` : `${Object.keys(result.values).length} parameters`
+      toast.push(
+        result.steps.length ? 'ok' : 'info',
+        result.steps.length
+          ? `Applied ${what} to ${result.steps.length} step(s).`
+          : `Every other step already had ${what}.`,
+      )
+      // A port fed by a link takes its value from upstream, so saying nothing here would leave the user
+      // believing a step changed that did not.
+      for (const note of result.skipped.slice(0, 3)) toast.push('info', `Skipped ${note}.`)
+    } catch (error) {
+      toast.push('bad', (error as ApiError).message)
+    }
+  }
+
   if (!workflow) {
     return (
       <Panel className="p-3">
@@ -153,6 +183,8 @@ export function StepInspector({ project, shot, step, onChanged, onRunStep }: Pro
               linkedKeys={linkedKeys}
               pinnedKeys={pinnedKeys}
               onTogglePinned={togglePinned}
+              onApplyToAll={applyToAll}
+              applyTargets={applyTargets}
               onChange={(overrides) => saveParams.mutate(overrides)}
               onReset={async () => {
                 await api.steps.replaceParams(project.id, step.id, {})

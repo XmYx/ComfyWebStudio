@@ -9,6 +9,7 @@ from pathlib import Path
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
+from pydantic import ValidationError as PydanticValidationError
 
 from ..core.errors import NotFound, ValidationFailed
 from ..core.ids import new_id
@@ -22,10 +23,12 @@ from ..settings import (
     ExecutionSettings,
     LlmProviderConfig,
     PreviewSettings,
+    RenderPreset,
     RenderSettings,
     StorySettings,
     UISettings,
     corrupt_settings_notices,
+    default_render_presets,
 )
 from .deps import StateDep
 
@@ -104,6 +107,104 @@ def update_settings(state: StateDep, body: UpdateSettingsRequest) -> AppSettings
     state.save_settings()
     state.events.emit("settings.changed", data={"scope": "app"})
     return settings
+
+
+# -- render presets ------------------------------------------------------------------------------------
+
+
+class RenderPresetRequest(BaseModel):
+    """Everything a preset holds. Absent fields keep what the preset already had."""
+
+    name: str | None = None
+    width: int | None = None
+    height: int | None = None
+    fps: float | None = None
+    container: str | None = None
+    video_codec: str | None = None
+    crf: int | None = None
+
+
+def _validated(data: dict) -> RenderPreset:
+    """Build a preset, turning a bounds failure into the 422 the client can show.
+
+    Without this a frame size of six figures escapes as an unhandled `ValidationError` and the request
+    dies as a 500 — a server fault reported for what is only a number typed too large.
+    """
+    try:
+        return RenderPreset.model_validate(data)
+    except PydanticValidationError as exc:
+        detail = exc.errors()[0]
+        raise ValidationFailed(
+            f"{'.'.join(str(p) for p in detail['loc'])}: {detail['msg']}"
+        ) from exc
+
+
+def _preset(settings: AppSettings, preset_id: str) -> RenderPreset:
+    found = next((p for p in settings.render_presets if p.id == preset_id), None)
+    if found is None:
+        raise NotFound(f"No render preset {preset_id!r}")
+    return found
+
+
+@router.get("/render-presets")
+def list_render_presets(state: StateDep) -> list[RenderPreset]:
+    return state.settings.render_presets
+
+
+@router.post("/render-presets", status_code=201)
+def create_render_preset(state: StateDep, body: RenderPresetRequest) -> RenderPreset:
+    if not (body.name or "").strip():
+        raise ValidationFailed("Give the preset a name.")
+    preset = _validated({**body.model_dump(exclude_none=True), "name": body.name.strip()})
+    state.settings.render_presets.append(preset)
+    state.save_settings()
+    state.events.emit("settings.changed", data={"scope": "render_presets"})
+    return preset
+
+
+@router.patch("/render-presets/{preset_id}")
+def update_render_preset(state: StateDep, preset_id: str, body: RenderPresetRequest) -> RenderPreset:
+    preset = _preset(state.settings, preset_id)
+    changes = body.model_dump(exclude_none=True)
+    if "name" in changes and not changes["name"].strip():
+        raise ValidationFailed("A preset needs a name.")
+
+    # Re-validated rather than assigned field by field, so the bounds on the model are the only place
+    # that decides what a sane frame size is.
+    updated = _validated({**preset.model_dump(), **changes})
+    # Once *actually* edited, a built-in is just a preset — keeping the flag would let "restore the
+    # built-ins" mistake it for the shipped one. Compared by value rather than by "a PATCH arrived",
+    # because pressing Update on a preset you have not touched should not change what it is.
+    if any(getattr(updated, field) != getattr(preset, field) for field in changes):
+        updated.builtin = False
+    state.settings.render_presets = [
+        updated if p.id == preset_id else p for p in state.settings.render_presets
+    ]
+    state.save_settings()
+    state.events.emit("settings.changed", data={"scope": "render_presets"})
+    return updated
+
+
+@router.delete("/render-presets/{preset_id}", status_code=204)
+def delete_render_preset(state: StateDep, preset_id: str) -> None:
+    _preset(state.settings, preset_id)
+    state.settings.render_presets = [p for p in state.settings.render_presets if p.id != preset_id]
+    state.save_settings()
+    state.events.emit("settings.changed", data={"scope": "render_presets"})
+
+
+@router.post("/render-presets/restore")
+def restore_render_presets(state: StateDep) -> list[RenderPreset]:
+    """Put back any built-in that has been deleted, leaving everything else alone.
+
+    Not a reset: a preset the user wrote, and an edit they made to a built-in, both survive. Restoring
+    should never be a decision anybody has to think twice about.
+    """
+    have = {p.name for p in state.settings.render_presets}
+    state.settings.render_presets += [p for p in default_render_presets() if p.name not in have]
+    state.save_settings()
+    state.events.emit("settings.changed", data={"scope": "render_presets"})
+    return state.settings.render_presets
 
 
 # -- backends ------------------------------------------------------------------------------------------

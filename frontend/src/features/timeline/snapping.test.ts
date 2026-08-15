@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { SNAP_PX, snap, snapMove, snapTargets } from './snapping'
+import { SNAP_PX, gapAt, snap, snapMove, snapTargets, toFrame } from './snapping'
 import type { Timeline } from '@/api/types'
 
 const clip = (id: string, start: number, duration: number) =>
@@ -86,5 +86,57 @@ describe('snapping a clip being moved', () => {
 
   it('leaves it where it is when neither edge is near anything', () => {
     expect(snapMove(3, 2, targets, 40)).toEqual({ time: 3, target: null })
+  })
+})
+
+describe('the frame grid', () => {
+  it('rounds a time onto a frame', () => {
+    expect(toFrame(3 / 24 + 0.0001, 24)).toBeCloseTo(3 / 24, 9)
+    expect(toFrame(0.9999 / 24, 24)).toBeCloseTo(1 / 24, 9)
+  })
+
+  it('never goes negative', () => {
+    expect(toFrame(-2, 24)).toBe(0)
+  })
+
+  it('leaves a time alone when there is no frame rate to speak of', () => {
+    expect(toFrame(1.234, 0)).toBe(1.234)
+  })
+
+  it('applies even with snapping switched off — a cut still lands on a frame', () => {
+    expect(snap(1.0 + 0.4 / 24, [], 40, false, 24).time).toBeCloseTo(1, 9)
+  })
+
+  it('takes a target as it stands rather than rounding it away from its neighbour', () => {
+    // 5.02 is not on the 24 fps grid, but it is where the clip it is snapping to actually is.
+    expect(snap(5.03, [{ time: 5.02, kind: 'clip' }], 400, true, 24).time).toBe(5.02)
+  })
+
+  it('puts an unsnapped move on the grid', () => {
+    expect(snapMove(1 + 0.4 / 24, 2, [], 40, true, 24).time).toBeCloseTo(1, 9)
+  })
+})
+
+describe('the gap under a click', () => {
+  const clips = [{ start: 0, duration: 1 }, { start: 3, duration: 1 }]
+
+  it('is the space between the clips either side', () => {
+    expect(gapAt(clips, 2)).toEqual({ from: 1, to: 3 })
+  })
+
+  it('runs from the start when there is nothing before', () => {
+    expect(gapAt([{ start: 2, duration: 1 }], 1)).toEqual({ from: 0, to: 2 })
+  })
+
+  it('runs to the end of time when there is nothing after', () => {
+    expect(gapAt(clips, 9)).toEqual({ from: 4, to: Infinity })
+  })
+
+  it('is nothing at all when the click landed on a clip', () => {
+    expect(gapAt(clips, 0.5)).toBeNull()
+  })
+
+  it('does not care what order the clips are stored in', () => {
+    expect(gapAt([...clips].reverse(), 2)).toEqual({ from: 1, to: 3 })
   })
 })

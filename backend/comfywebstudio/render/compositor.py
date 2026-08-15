@@ -160,7 +160,13 @@ class FrameCompositor:
         if resolved is None or not resolved.usable:
             return None
 
-        local_t = time_s - clip.start
+        # Snapped to the frame grid rather than used raw.
+        #
+        # `time_s - clip.start` is a difference of two floats, and for a clip starting at 1.0 the sample
+        # at 1.3333… comes back as 0.33333333333333326 — a hair *below* a third. Anything that turns that
+        # into an index by truncation picks the frame before, so the clip's first picture is shown twice
+        # and one of its later ones never appears at all. That is the held frame.
+        local_t = self._on_grid(time_s - clip.start)
         if resolved.kind == "text":
             image = self._render_text(clip)
         elif resolved.kind == "video":
@@ -180,11 +186,25 @@ class FrameCompositor:
             placed.putalpha(alpha)
         return placed
 
+    def _on_grid(self, seconds: float) -> float:
+        """Round a time onto the timeline's frame grid.
+
+        Every sample the renderer takes is a whole number of frames from the start, and every clip now
+        starts on one too, so the exact answer is always a multiple of the frame period. Rounding to it
+        removes the float drift that subtraction introduces, without an epsilon fudged into the caller.
+        """
+        fps = self.timeline.fps
+        return seconds if fps <= 0 else round(seconds * fps) / fps
+
     def _sequence_frame(self, resolved: ResolvedClip, local_t: float) -> Image.Image | None:
         """Pick a frame from an image sequence.
 
         A single image holds for the clip's whole duration; a multi-image batch is played across it, which
         is what makes a batch of generated frames behave like footage on the timeline.
+
+        Counted in frames rather than as a ratio of seconds: clip frame *k* of *K* shows picture
+        ``k * count // K``, which is integer arithmetic from end to end and so cannot land a hair either
+        side of a boundary.
         """
         count = len(resolved.paths)
         if count == 0:
@@ -192,8 +212,14 @@ class FrameCompositor:
         if count == 1:
             return self._load_image(resolved.paths[0])
 
-        duration = max(resolved.clip.duration, 1e-6)
-        index = min(count - 1, max(0, int((local_t / duration) * count)))
+        fps = self.timeline.fps
+        if fps > 0:
+            span = max(1, round(resolved.clip.duration * fps))
+            frame = min(span - 1, max(0, round(local_t * fps)))
+            index = min(count - 1, frame * count // span)
+        else:  # no frame rate to count in; fall back to the ratio
+            duration = max(resolved.clip.duration, 1e-6)
+            index = min(count - 1, max(0, int((local_t / duration) * count)))
         return self._load_image(resolved.paths[index])
 
     def _load_image(self, path: Path) -> Image.Image:

@@ -493,12 +493,22 @@ class Track(Base):
         return next((c for c in self.clips if c.id == clip_id), None)
 
 
+def default_tracks() -> list[Track]:
+    """What a new timeline starts with: somewhere to put pictures, and somewhere to put sound.
+
+    The audio track is there from the beginning rather than conjured the first time something needs it,
+    because a shot that came with sound should land complete on a timeline the user has already seen —
+    not make a new lane appear underneath them at the moment of the drop.
+    """
+    return [Track(kind="video", name="Video"), Track(kind="audio", name="Audio")]
+
+
 class Timeline(Base):
     fps: float = 24.0
     width: int = 1024
     height: int = 1024
     background: str = "#000000"
-    tracks: list[Track] = Field(default_factory=list)
+    tracks: list[Track] = Field(default_factory=default_tracks)
 
     # Serialised so the UI does not have to re-derive it from every clip on every render. It is ignored
     # on input (``extra="ignore"``), so a round trip cannot corrupt it.
@@ -555,12 +565,36 @@ class Asset(Base):
         return self.source is not None
 
 
+class RenderChoice(Base):
+    """What this project last rendered with, so the Render dialog opens where it was left.
+
+    Kept on the project rather than in the app settings because format is a property of the piece: a
+    portrait short and a 4K landscape piece live side by side, and having one silently adopt the other's
+    settings because it was rendered second is exactly the surprise this avoids.
+
+    Separate from `Timeline.width/height`, which is the *canvas* — what the clips are composited onto.
+    Rendering a 1024×1024 cut out at 1080p is a legitimate thing to do and must not resize the project.
+    """
+
+    width: int | None = None
+    height: int | None = None
+    fps: float | None = None
+    container: str | None = None
+    video_codec: str | None = None
+    crf: int | None = None
+    #: The preset these came from, so the dialog can show it as still selected. Cleared as soon as any
+    #: field is changed by hand — claiming a preset for settings that no longer match it would be a lie.
+    preset_id: str | None = None
+
+
 class ProjectSettings(Base):
     fps: float = 24.0
     width: int = 1024
     height: int = 1024
     #: Default ComfyUI backend for this project's steps; individual steps may override it.
     backend_id: str | None = None
+    #: Remembered from the last render. Absent until the project has been rendered once.
+    render: RenderChoice = Field(default_factory=RenderChoice)
 
 
 class Project(Base):

@@ -34,11 +34,20 @@ class EventStream {
     const socket = new WebSocket(`${protocol}://${location.host}/api/events${query}`)
     this.socket = socket
 
+    // Every callback below asks "am I still the socket?" first, because a replaced one keeps firing
+    // until its close handshake finishes. Guarding on the `closing` flag instead is not enough: a
+    // project switch sets it, then clears it again before the old socket's `onclose` arrives, so the
+    // dead socket schedules a reconnect and the app ends up with *two* live streams delivering every
+    // event twice — which reads as run state rewinding a step and then catching up.
+    const mine = () => this.socket === socket
+
     socket.onopen = () => {
+      if (!mine()) return socket.close()
       this.attempt = 0
       this.emit({ type: 'stream.connected', project_id: this.projectId, run_id: null, step_id: null, data: {}, ts: Date.now() })
     }
     socket.onmessage = (message) => {
+      if (!mine()) return
       try {
         const event = JSON.parse(message.data) as StudioEvent
         if (event.type !== 'ping') this.emit(event)
@@ -47,6 +56,7 @@ class EventStream {
       }
     }
     socket.onclose = () => {
+      if (!mine()) return
       this.socket = null
       if (this.closing) return
       this.emit({ type: 'stream.disconnected', project_id: this.projectId, run_id: null, step_id: null, data: {}, ts: Date.now() })

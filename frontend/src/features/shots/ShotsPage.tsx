@@ -8,9 +8,9 @@ import { useStudio } from '@/store/studio'
 import { selectWidgets, useLayout } from '@/store/layout'
 import { ShotCanvas } from '@/features/graph/ShotCanvas'
 import { ComfyPanel } from '@/features/comfy/ComfyPanel'
+import { ShotList } from './ShotList'
 import { WorkflowLibrary } from './WorkflowLibrary'
 import { AssetLibrary } from './AssetLibrary'
-import { startDrag } from '@/lib/dnd'
 import { StepInspector } from './StepInspector'
 import { InstanceInspector } from './InstanceInspector'
 import { TemplateEditor } from '@/features/graph/TemplateEditor'
@@ -18,7 +18,7 @@ import { Dock } from '@/features/shell/Dock'
 import { TimelinePage } from '@/features/timeline/TimelinePage'
 import { Monitor } from '@/features/timeline/Monitor'
 import {
-  Badge, Button, Callout, Empty, Panel, PanelHeader, Spinner, cx, useToast,
+  Badge, Button, Callout, Empty, Panel, PanelHeader, Spinner, useToast,
 } from '@/components/ui'
 import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
 import { useCommandContext } from '@/features/menu/useCommandContext'
@@ -35,6 +35,7 @@ export function ShotsPage() {
   const openInstanceId = useStudio((s) => s.openInstanceId)
   const openInstance_ = useStudio((s) => s.openInstance)
   const activeRun = useStudio((s) => s.activeRun)
+  const queue = useStudio((s) => s.queue)
   const seedFromResults = useStudio((s) => s.seedFromResults)
   // The transport is shared, so a floating Monitor widget follows the same playhead as the timeline.
   const playhead = useStudio((s) => s.playhead)
@@ -137,6 +138,42 @@ export function ShotsPage() {
     mutationFn: () => api.runs.cancel(projectId!, activeRun!.id),
   })
 
+  // No ids means every shot, which is what the backend takes an empty list to mean too.
+  const startBatch = useMutation({
+    mutationFn: ({ shotIds, force }: { shotIds: string[]; force?: boolean }) =>
+      api.runs.startBatch(projectId!, shotIds, force ?? false),
+    onError: (err: ApiError) => toast.push('bad', err.message),
+  })
+
+  const cancelBatch = useMutation({
+    mutationFn: (batchId: string) => api.runs.cancelBatch(projectId!, batchId),
+    onError: (err: ApiError) => toast.push('bad', err.message),
+  })
+
+  // A queue outlives the page that started it, so a reload rejoins the one already running rather than
+  // showing an idle panel over a ComfyUI that is very much busy.
+  const { data: runningBatch } = useQuery({
+    queryKey: ['batch-active', projectId],
+    queryFn: () => api.runs.activeBatch(projectId!),
+    enabled: Boolean(projectId),
+  })
+
+  useEffect(() => {
+    if (!runningBatch || useStudio.getState().queue) return
+    const finished = runningBatch.shots.filter((s) => s.status !== 'queued' && s.status !== 'running')
+    useStudio.getState().beginQueue({
+      id: runningBatch.id,
+      shotIds: runningBatch.shots.map((s) => s.shot_id),
+      done: Object.fromEntries(finished.map((s) => [s.shot_id, s.status])),
+      current: runningBatch.shots.find((s) => s.status === 'running')?.shot_id ?? null,
+    })
+    // The statuses too, not just the queue: this page missed the run events for everything the batch
+    // got through before it was opened, and a shot that failed ten minutes ago should still say so.
+    for (const entry of finished) {
+      useStudio.getState().adoptShotRun(entry.shot_id, entry.run_id, entry.status, entry.error)
+    }
+  }, [runningBatch])
+
   const createShot = useMutation({
     mutationFn: () => api.shots.create(projectId!, `Shot ${shots.length + 1}`),
     onSuccess: (created) => {
@@ -218,49 +255,18 @@ export function ShotsPage() {
 
   // Each panel is a widget the Dock places — docked into a slot, or floating in a window of its own.
   const shotsPanel = (
-    <Panel>
-      <PanelHeader
-        actions={<Button size="sm" onClick={() => createShot.mutate()}>+</Button>}
-      >
-        Shots
-      </PanelHeader>
-      <div className="max-h-48 overflow-y-auto p-1">
-        {!shots.length ? (
-          <div className="p-2 text-xs text-[var(--color-ink-dim)]">
-            Create a shot to begin.
-          </div>
-        ) : (
-          shots.map((candidate) => (
-            <button
-              key={candidate.id}
-              draggable
-              // Dragging a shot onto another shot's canvas makes a node supplying its last result.
-              onDragStart={(event) =>
-                startDrag(event, { kind: 'shot', id: candidate.id, name: candidate.name })
-              }
-              title="Click to open, or drag onto a canvas to use its output"
-              onClick={() => setShot(candidate.id)}
-              onContextMenu={(event) => {
-                setShot(candidate.id)
-                contextMenu.open(event, shotMenu(candidate))
-              }}
-              className={cx(
-                'flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-xs transition-colors',
-                candidate.id === shot?.id
-                  ? 'bg-[var(--color-panel-2)] text-[var(--color-ink)]'
-                  : 'text-[var(--color-ink-dim)] hover:bg-[var(--color-panel-2)]/60',
-              )}
-            >
-              <span className="truncate">{candidate.name}</span>
-              {/* Placed templates count too — a shot made only of them is not an empty shot. */}
-              <span className="text-[10px]">
-                {candidate.steps.length + candidate.instances.length}
-              </span>
-            </button>
-          ))
-        )}
-      </div>
-    </Panel>
+    <ShotList
+      shots={shots}
+      currentId={shot?.id ?? null}
+      onOpen={setShot}
+      onCreate={() => createShot.mutate()}
+      onRender={(ids) => startBatch.mutate({ shotIds: ids })}
+      onStop={() => queue && cancelBatch.mutate(queue.id)}
+      onContextMenu={(event, candidate) => {
+        setShot(candidate.id)
+        contextMenu.open(event, shotMenu(candidate))
+      }}
+    />
   )
 
   const canvasPanel = (
@@ -274,7 +280,18 @@ export function ShotsPage() {
                   {report.issues.filter((i) => i.level === 'error').length} issue(s)
                 </Badge>
               )}
-              {running ? (
+              {queue ? (
+                // A queue owns the ComfyUI for its whole length. Cancelling only the shot in flight
+                // would stop this one and start the next, which is not what a button here would mean.
+                <Button
+                  size="sm"
+                  variant="danger"
+                  onClick={() => cancelBatch.mutate(queue.id)}
+                  title="Stop the render queue"
+                >
+                  <Spinner /> Stop queue
+                </Button>
+              ) : running ? (
                 <Button size="sm" variant="danger" onClick={() => cancelRun.mutate()}>
                   <Spinner /> Cancel
                 </Button>

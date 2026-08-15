@@ -381,10 +381,20 @@ export const COMMANDS: Command[] = [
         await guard(ctx, () => api.steps.remove(ctx.project!.id, ctx.step!.id), 'Step deleted.')
         useStudio.getState().selectStep(null)
       } else if (clip) {
+        // Everything selected, not only the one the inspector happens to be showing — selecting three
+        // clips and pressing Delete removing one of them would be its own kind of surprise.
+        const chosen = useStudio.getState().selectedClips
+        const doomed = chosen.length
+          ? chosen
+          : [{ trackId: clip.track, clipId: clip.clip.id }]
         await guard(
           ctx,
-          () => api.timeline.removeClip(ctx.project!.id, clip.track, clip.clip.id),
-          'Clip deleted.',
+          async () => {
+            for (const target of doomed) {
+              await api.timeline.removeClip(ctx.project!.id, target.trackId, target.clipId)
+            }
+          },
+          doomed.length > 1 ? `${doomed.length} clips deleted.` : 'Clip deleted.',
         )
         useStudio.getState().selectClip(null)
       }

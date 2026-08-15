@@ -284,7 +284,10 @@ class Orchestrator:
                 if step_run.status not in {"success", "cached", "error"}:
                     step_run.status = "cancelled"
                     self._merge(run, step_run)
-            self.events.emit("run.cancelled", project_id=project.id, run_id=run.id)
+            self.events.emit(
+                "run.cancelled", project_id=project.id, run_id=run.id,
+                data={"shot_id": shot.id},
+            )
             raise
         except Exception as exc:  # noqa: BLE001 - a run must always reach a terminal state
             logger.exception("Run %s failed unexpectedly", run.id)
@@ -297,7 +300,8 @@ class Orchestrator:
             self.events.emit(
                 "run.finished",
                 project_id=project.id, run_id=run.id,
-                data={"status": run.status, "error": run.error},
+                # The shot id rides along so a UI watching several runs can tell which one just ended.
+                data={"status": run.status, "error": run.error, "shot_id": shot.id},
             )
 
     def _dependency_map(self, shot: Shot, included: set[str]) -> dict[str, set[str]]:

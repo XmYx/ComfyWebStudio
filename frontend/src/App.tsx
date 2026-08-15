@@ -68,9 +68,13 @@ function ProjectShell({ children }: { children: React.ReactNode }) {
         break
 
       case 'run.finished':
-        store.endRun(event.data.status, event.data.error)
-        if (event.data.status === 'success') toast.push('ok', 'Run finished.')
-        else if (event.data.status !== 'cancelled') toast.push('bad', event.data.error ?? 'Run failed.')
+        store.endRun(event.data.status, event.data.error, event.data.shot_id)
+        // A queue reports itself once at the end; one toast per shot would bury everything else, and the
+        // panel is already showing each shot's outcome next to its name.
+        if (!store.queue) {
+          if (event.data.status === 'success') toast.push('ok', 'Run finished.')
+          else if (event.data.status !== 'cancelled') toast.push('bad', event.data.error ?? 'Run failed.')
+        }
         queryClient.invalidateQueries({ queryKey: ['runs', projectId] })
         // The storyboard reads its frames' pictures from the run history rather than from assets, so what
         // a run just produced is what the strip should be showing.
@@ -78,9 +82,39 @@ function ProjectShell({ children }: { children: React.ReactNode }) {
         break
 
       case 'run.cancelled':
-        store.endRun('cancelled')
-        toast.push('info', 'Run cancelled.')
+        store.endRun('cancelled', null, event.data?.shot_id)
+        if (!store.queue) toast.push('info', 'Run cancelled.')
         break
+
+      case 'shots.batch.started':
+        store.beginQueue({
+          id: event.data.batch_id,
+          shotIds: (event.data.shots ?? []).map((s: any) => s.id),
+          done: {},
+          current: null,
+        })
+        break
+
+      case 'shots.batch.progress':
+        store.patchQueue(event.data.shot_id, event.data.status)
+        break
+
+      case 'shots.batch.finished': {
+        store.endQueue()
+        const shots: Array<{ status: string }> = event.data.shots ?? []
+        const failed = shots.filter((s) => s.status === 'error').length
+        toast.push(
+          failed ? 'bad' : event.data.status === 'cancelled' ? 'info' : 'ok',
+          event.data.status === 'cancelled'
+            ? 'Render queue stopped.'
+            : failed
+              ? `Rendered ${shots.length - failed} of ${shots.length} shots — ${failed} failed.`
+              : `Rendered ${shots.length} shot${shots.length === 1 ? '' : 's'}.`,
+        )
+        queryClient.invalidateQueries({ queryKey: ['runs', projectId] })
+        queryClient.invalidateQueries({ queryKey: ['batch-active', projectId] })
+        break
+      }
 
       case 'workflow.synced': {
         const removed: string[] = event.data.removed_ports ?? []

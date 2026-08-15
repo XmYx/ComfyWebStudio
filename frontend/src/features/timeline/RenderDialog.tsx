@@ -2,16 +2,24 @@
  * Choosing what to render and how.
  *
  * Scope first, because it is the decision that changes what comes out: the whole cut, a span between two
- * times, the selected clip on its own, or every clip as its own file. Output settings sit underneath and
- * default to the project's — an untouched field renders exactly as the Render button always did, and
- * nothing here writes back to the project.
+ * times, the selected clip on its own, or every clip as its own file.
+ *
+ * Output settings sit underneath, and they *are* remembered: the dialog reopens on whatever this project
+ * last rendered with, because a portrait short and a 4K landscape piece live side by side and retyping
+ * four fields every time is not a decision anybody is making afresh. Presets are the same idea one level
+ * up — a named size and format, editable and deletable whichever of them shipped with the app.
+ *
+ * The composition size on the timeline is left alone throughout. Rendering a 1024×1024 cut out at 1080p
+ * is a legitimate thing to do and must not resize the project to match.
  */
 
 import { useEffect, useMemo, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import type { Clip, Project, RenderRequest, RenderScope } from '@/api/types'
+import { api, ApiError } from '@/api/client'
+import type { Clip, Project, RenderPreset, RenderRequest, RenderScope } from '@/api/types'
 import { formatTimecode } from '@/lib/format'
-import { Button, Callout, Field, Modal, Select, TextInput, cx } from '@/components/ui'
+import { Button, Callout, Field, Modal, Select, TextInput, cx, useToast } from '@/components/ui'
 
 interface Props {
   open: boolean
@@ -60,19 +68,110 @@ export function RenderDialog({ open, onClose, project, playhead, selectedClip, o
   const [container, setContainer] = useState<string>('mp4')
   const [codec, setCodec] = useState<string>('libx264')
   const [crf, setCrf] = useState<number>(18)
+  const [presetId, setPresetId] = useState<string>('')
 
-  // Reopening should reflect the timeline as it is now, and default to the clip if one is selected —
-  // that is almost always why someone opens this with a clip highlighted.
+  const toast = useToast()
+  const queryClient = useQueryClient()
+  const { data: presets } = useQuery({
+    queryKey: ['render-presets'],
+    queryFn: () => api.settings.renderPresets(),
+    enabled: open,
+  })
+
+  const refreshPresets = () => queryClient.invalidateQueries({ queryKey: ['render-presets'] })
+  const fail = (error: unknown) => toast.push('bad', (error as ApiError).message)
+
+  // Reopening picks up where the last render left off, falling back to the timeline for a project that
+  // has never been rendered. Scope defaults to the clip when one is selected — that is almost always why
+  // someone opens this with a clip highlighted.
   useEffect(() => {
     if (!open) return
+    const last = project.settings.render
     setScope(selectedClip ? 'clip' : 'timeline')
     setStart(0)
     setEnd(timeline.duration)
-    setWidth(timeline.width)
-    setHeight(timeline.height)
-    setFps(timeline.fps)
+    setWidth(last?.width ?? timeline.width)
+    setHeight(last?.height ?? timeline.height)
+    setFps(last?.fps ?? timeline.fps)
+    setContainer(last?.container ?? 'mp4')
+    setCodec(last?.video_codec ?? 'libx264')
+    setCrf(last?.crf ?? 18)
+    setPresetId(last?.preset_id ?? '')
     setStill(false)
   }, [open])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Everything a preset carries, so "does this still match?" is asked in one place. */
+  const matches = (preset: RenderPreset) =>
+    preset.width === width &&
+    preset.height === height &&
+    preset.container === container &&
+    preset.video_codec === codec &&
+    preset.crf === crf &&
+    (preset.fps == null || preset.fps === fps)
+
+  const selectedPreset = presets?.find((p) => p.id === presetId) ?? null
+  // Shown as selected only while the settings still are what it says. Editing a field by hand and
+  // leaving the preset's name in the box would make the box a lie.
+  const activePreset = selectedPreset && matches(selectedPreset) ? selectedPreset : null
+
+  const applyPreset = (preset: RenderPreset) => {
+    setWidth(preset.width)
+    setHeight(preset.height)
+    if (preset.fps != null) setFps(preset.fps)
+    setContainer(preset.container)
+    setCodec(preset.video_codec)
+    setCrf(preset.crf)
+    setPresetId(preset.id)
+  }
+
+  const asPreset = () => ({ width, height, fps, container, video_codec: codec, crf })
+
+  const savePreset = useMutation({
+    mutationFn: async () => {
+      const name = window.prompt('Name this preset', `${width}×${height}`)?.trim()
+      if (!name) return null
+      return api.settings.addRenderPreset({ name, ...asPreset() })
+    },
+    onSuccess: (created) => {
+      if (!created) return
+      setPresetId(created.id)
+      refreshPresets()
+      toast.push('ok', `Saved “${created.name}”.`)
+    },
+    onError: fail,
+  })
+
+  const updatePreset = useMutation({
+    mutationFn: () => api.settings.updateRenderPreset(selectedPreset!.id, asPreset()),
+    onSuccess: (updated) => {
+      refreshPresets()
+      toast.push('ok', `Updated “${updated.name}”.`)
+    },
+    onError: fail,
+  })
+
+  const deletePreset = useMutation({
+    mutationFn: async () => {
+      if (!window.confirm(`Delete the preset “${selectedPreset!.name}”?`)) return false
+      await api.settings.removeRenderPreset(selectedPreset!.id)
+      return true
+    },
+    onSuccess: (removed) => {
+      if (!removed) return
+      setPresetId('')
+      refreshPresets()
+    },
+    onError: fail,
+  })
+
+  const restorePresets = useMutation({
+    mutationFn: () => api.settings.restoreRenderPresets(),
+    onSuccess: (all) => {
+      refreshPresets()
+      toast.push('ok', `${all.length} presets available.`)
+    },
+    onError: fail,
+  })
 
   const scopes: Array<{ value: RenderScope; label: string; hint: string; disabled?: boolean }> = [
     {
@@ -107,6 +206,7 @@ export function RenderDialog({ open, onClose, project, playhead, selectedClip, o
       fps,
       ...(scope === 'range' ? { start_s: start, end_s: end } : {}),
       ...(scope === 'clip' && selectedClip ? { clip_id: selectedClip.clip.id } : {}),
+      preset_id: activePreset?.id ?? null,
       ...(still ? {} : { container, video_codec: codec, crf }),
     }
     onRender(body)
@@ -182,9 +282,65 @@ export function RenderDialog({ open, onClose, project, playhead, selectedClip, o
         </label>
 
         <div>
-          <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-ink-dim)]">
-            Output
+          <div className="mb-1.5 flex items-center justify-between gap-2">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-ink-dim)]">
+              Output
+            </span>
+            <button
+              title="Swap width and height"
+              onClick={() => { setWidth(height); setHeight(width) }}
+              className="text-[10px] text-[var(--color-ink-dim)] hover:text-[var(--color-ink)]"
+            >
+              ⇄ {width >= height ? 'landscape' : 'portrait'}
+            </button>
           </div>
+
+          <div className="mb-3 flex items-end gap-2">
+            <div className="min-w-0 flex-1">
+              <Field label="Preset">
+                <Select
+                  value={activePreset?.id ?? ''}
+                  onChange={(e) => {
+                    const found = presets?.find((p) => p.id === e.target.value)
+                    if (found) applyPreset(found)
+                    else setPresetId('')
+                  }}
+                >
+                  <option value="">
+                    {selectedPreset ? `${selectedPreset.name} (edited)` : 'Custom'}
+                  </option>
+                  {(presets ?? []).map((preset) => (
+                    <option key={preset.id} value={preset.id}>
+                      {preset.name} — {preset.width}×{preset.height}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+            </div>
+            <Button size="sm" variant="ghost" title="Save these settings as a new preset"
+                    onClick={() => savePreset.mutate()}>
+              Save as…
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={!selectedPreset}
+              title={selectedPreset ? `Overwrite “${selectedPreset.name}”` : 'Pick a preset to update'}
+              onClick={() => updatePreset.mutate()}
+            >
+              Update
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={!selectedPreset}
+              title={selectedPreset ? `Delete “${selectedPreset.name}”` : 'Pick a preset to delete'}
+              onClick={() => deletePreset.mutate()}
+            >
+              ✕
+            </Button>
+          </div>
+
           <div className="grid grid-cols-3 gap-3">
             <Field label="Width">
               <TextInput
@@ -240,6 +396,13 @@ export function RenderDialog({ open, onClose, project, playhead, selectedClip, o
             onChange={(e) => setName(e.target.value)}
           />
         </Field>
+
+        <button
+          onClick={() => restorePresets.mutate()}
+          className="text-[10px] text-[var(--color-ink-dim)] underline-offset-2 hover:underline"
+        >
+          Restore the built-in presets
+        </button>
 
         {rangeInvalid && (
           <Callout tone="bad">The out point has to come after the in point.</Callout>

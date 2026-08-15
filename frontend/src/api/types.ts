@@ -67,6 +67,7 @@ export interface RenderRequest {
   start_s?: number
   end_s?: number
   clip_id?: string
+  preset_id?: string | null
   /** Output overrides, applied for this render only. Omitted fields keep the project's settings. */
   fps?: number
   width?: number
@@ -93,6 +94,16 @@ export interface Step {
   notes: string
   ui_pos: Vec2
   ui_size: Size
+}
+
+/** What “apply to all shots” changed, so the result can say more than that it succeeded. */
+export interface ApplyParamsResult {
+  /** Step ids that were given the value. */
+  steps: string[]
+  /** The value written, per parameter key. */
+  values: Record<string, unknown>
+  /** Steps left alone, and why — a port fed by a link takes its value from upstream instead. */
+  skipped: string[]
 }
 
 /** What a value node holds. `media` points at an imported asset; the rest are literals. */
@@ -261,6 +272,27 @@ export interface Run {
   error: string | null
 }
 
+/** One shot's place in a render queue. */
+export interface QueuedShot {
+  shot_id: string
+  name: string
+  status: RunStatus
+  /** The run it became, once it started. Empty while still waiting. */
+  run_id: string
+  error: string | null
+}
+
+/** Several shots rendered one after another. */
+export interface ShotBatch {
+  id: string
+  project_id: string
+  shots: QueuedShot[]
+  status: RunStatus
+  force: boolean
+  started: string
+  finished: string | null
+}
+
 export interface ClipSource {
   kind: 'step_output' | 'asset'
   shot_id: string | null
@@ -340,6 +372,8 @@ export interface ProjectSettings {
   width: number
   height: number
   backend_id: string | null
+  /** Remembered from the last render — the dialog opens on these rather than on the timeline's size. */
+  render: RenderChoice
 }
 
 export interface Project {
@@ -405,6 +439,31 @@ export interface BackendStatus {
   shared_filesystem: boolean
 }
 
+/** A named output size and format. Built-ins are seeded on first run and are ordinary entries after that. */
+export interface RenderPreset {
+  id: string
+  name: string
+  width: number
+  height: number
+  /** Unset means the cut keeps its own rate. */
+  fps: number | null
+  container: string
+  video_codec: string
+  crf: number
+  builtin: boolean
+}
+
+/** What a project last rendered with, so the dialog opens where it was left. */
+export interface RenderChoice {
+  width: number | null
+  height: number | null
+  fps: number | null
+  container: string | null
+  video_codec: string | null
+  crf: number | null
+  preset_id: string | null
+}
+
 export interface AppSettings {
   root: string
   projects_dir: string
@@ -420,6 +479,7 @@ export interface AppSettings {
     retry_on_error: number
     default_seed_mode: SeedMode
   }
+  render_presets: RenderPreset[]
   render: {
     fps: number; width: number; height: number
     container: string; video_codec: string; crf: number; pix_fmt: string

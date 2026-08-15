@@ -26,6 +26,9 @@ CRITICAL_EVENTS = frozenset(
     {
         "run.started",
         "run.finished",
+        "shots.batch.started",
+        "shots.batch.progress",
+        "shots.batch.finished",
         "storyboard.pipeline.started",
         "storyboard.pipeline.finished",
         "storyboard.stage.started",
