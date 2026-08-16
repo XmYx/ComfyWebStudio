@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -194,7 +195,16 @@ def _has_audio(state, project, source: ClipSource) -> bool:
 
 
 def _default_duration(state, project, source: ClipSource | None, fallback: float) -> float:
-    """Length a new clip should take from its media, rather than making the user set it every time."""
+    """Length a new clip should take from its media, in whole frames of *this* timeline.
+
+    Counted in frames, not converted from seconds. A video's own length rarely lands on the timeline's
+    grid — 49 frames at 16 fps is 3.0625s, which is 73.5 frames at 24 — and a clip given the seconds
+    outright claims the whole of that last half frame. Nothing in the file plays there, so it holds the
+    previous picture instead: the overshoot everybody sees at the end of a placed clip.
+
+    So the media's frame count is the authority wherever it is known, and only the frames that fit
+    *whole* are taken. Coming up a fraction short is invisible; going over is not.
+    """
     if source is None:
         return fallback
     resolver = TimelineResolver(state.store, project)
@@ -202,13 +212,25 @@ def _default_duration(state, project, source: ClipSource | None, fallback: float
     if error or not artifacts:
         return fallback
 
+    fps = max(project.timeline.fps, 1.0)
     meta = artifacts[0].meta
-    duration = meta.get("duration")
-    if duration:
-        return float(duration)
-    if len(artifacts) > 1:  # an image sequence: one frame each at project fps
-        return len(artifacts) / max(project.timeline.fps, 1.0)
-    return fallback
+
+    # An image sequence is already a frame count: one picture per frame of this timeline.
+    if len(artifacts) > 1:
+        return len(artifacts) / fps
+
+    frames, media_fps = meta.get("frames"), meta.get("fps")
+    if frames and media_fps:
+        seconds = float(frames) / float(media_fps)
+    elif meta.get("duration"):
+        seconds = float(meta["duration"])
+    else:
+        return fallback
+
+    # The epsilon is for the last frame of an exact fit — 3.0 seconds at 24 is 71.99999999999999 frames
+    # in floating point, and flooring that would drop a frame that is really there.
+    whole = math.floor(seconds * fps + 1e-6)
+    return max(1, whole) / fps
 
 
 @router.post("/tracks/{track_id}/clips", status_code=201)
