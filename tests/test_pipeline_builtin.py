@@ -182,7 +182,7 @@ class TestTheDrawingAndShotPrompts:
 class TestTheShapeOfTheDefaultPipeline:
     def test_it_runs_in_the_order_the_flow_actually_goes(self):
         assert [s.id for s in builtin_pipeline().stages] == [
-            "write", "suggest_characters", "draw", "capture", "describe", "shot",
+            "write", "extend", "suggest_characters", "draw", "capture", "describe", "shot",
         ]
 
     def test_every_stage_knows_which_builtin_it_is(self):
@@ -237,7 +237,7 @@ class TestLayeringEditsOverIt:
         result = apply_overlay(builtin_pipeline(), PipelineOverlay(stages={"describe": edited}))
         assert result.stage("describe").system == "Look harder."
         assert result.stage("write").system == original.WRITER_SYSTEM
-        assert len(result.stages) == 6
+        assert len(result.stages) == 7
 
     def test_a_new_stage_is_appended(self):
         added = Stage(id="mood", name="Mood", kind="llm", scope="frame")
@@ -256,7 +256,7 @@ class TestLayeringEditsOverIt:
         # A board saved by an older build must not lose a stage a newer one added.
         result = apply_overlay(builtin_pipeline(), PipelineOverlay(order=["write", "draw"]))
         assert {s.id for s in result.stages} == {
-            "write", "suggest_characters", "draw", "capture", "describe", "shot",
+            "write", "extend", "suggest_characters", "draw", "capture", "describe", "shot",
         }
 
     def test_the_board_wins_over_the_app_which_wins_over_the_builtin(self):

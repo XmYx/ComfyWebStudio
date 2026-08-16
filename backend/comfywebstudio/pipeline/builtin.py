@@ -110,6 +110,52 @@ SHOT_PROMPT = "{frame.motion}"
 #: already — that is what the field is for — so this is mostly the house style catching up with it.
 PORTRAIT_PROMPT = "{character.appearance} {board.style}"
 
+EXTEND_PROMPT = """Write exactly {count} more shots for this sequence, to go {position}.
+
+PREMISE:
+{board.premise}
+
+[[HOUSE STYLE (apply to every image_prompt): {board.style}]]
+[[ASPECT: {board.aspect}]]
+[[CHARACTERS (use these names in the action, and their appearance in the image prompts):
+{characters}]]
+
+[[THE SHOTS THAT COME BEFORE:
+{story.before}]]
+
+[[THE SHOTS THAT COME AFTER:
+{story.after}]]
+
+Your shots have to fit that gap and carry it. Pick up from where the shots before leave off, and end
+somewhere the shots after can follow on from without a jump. Keep the same people, place and tone.
+
+Do not rewrite or repeat a shot that is already listed, and do not re-tell the story from the beginning.
+Write only the {count} new shots, in the order they should play.
+
+Answer with this exact shape:
+{"frames": [{"title": "...", "action": "...", "camera": "...", "image_prompt": "...",
+  "shot_prompt": "...", "characters": ["name", ...]}]}
+
+"characters" lists the names of any listed characters who appear in that shot; use [] when none do."""
+
+
+def _frame_fields() -> OutputField:
+    """The shape a written shot has. Shared by `write` and `extend` — two stages producing frames that
+    disagreed about what a frame is would be a bug waiting to be found in a render."""
+    return OutputField(
+        key="frames",
+        type="object_list",
+        writes="board.frames",
+        fields=[
+            OutputField(key="title", description="a few words naming the shot"),
+            OutputField(key="action", description="what happens, in prose"),
+            OutputField(key="camera", description="framing and movement"),
+            OutputField(key="image_prompt", description="what a single still looks like"),
+            OutputField(key="shot_prompt", description="how it moves; motion only"),
+            OutputField(key="characters", type="string_list", required=False),
+        ],
+    )
+
 
 def builtin_pipeline() -> Pipeline:
     """A fresh copy of the default flow. Never share one — callers layer edits over it."""
@@ -127,24 +173,28 @@ def builtin_pipeline() -> Pipeline:
                 system=WRITER_SYSTEM,
                 prompt=WRITE_PROMPT,
                 model=StageModel(role="write"),
-                outputs=[
-                    OutputField(
-                        key="frames",
-                        type="object_list",
-                        writes="board.frames",
-                        fields=[
-                            OutputField(key="title", description="a few words naming the shot"),
-                            OutputField(key="action", description="what happens, in prose"),
-                            OutputField(key="camera", description="framing and movement"),
-                            OutputField(
-                                key="image_prompt", description="what a single still looks like"
-                            ),
-                            OutputField(key="shot_prompt", description="how it moves; motion only"),
-                            OutputField(key="characters", type="string_list", required=False),
-                        ],
-                    ),
-                ],
+                outputs=[_frame_fields()],
                 builtin_id="write",
+                builtin_revision=BUILTIN_REVISION,
+            ),
+            Stage(
+                id="extend",
+                kind="llm",
+                scope="board",
+                name="Add more shots",
+                description=(
+                    "Write further shots into a sequence that already exists — at the top, at the "
+                    "bottom, or between two of them."
+                ),
+                system=WRITER_SYSTEM,
+                prompt=EXTEND_PROMPT,
+                model=StageModel(role="write"),
+                # Off in the whole-pipeline run: extending is something a person asks for at a
+                # particular place, and a flow that silently grew the board every time it was run would
+                # be its own kind of surprise.
+                enabled=False,
+                outputs=[_frame_fields()],
+                builtin_id="extend",
                 builtin_revision=BUILTIN_REVISION,
             ),
             Stage(

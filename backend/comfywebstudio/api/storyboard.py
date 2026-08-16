@@ -30,7 +30,7 @@ first, and everything downstream — describing, animating — works from the pi
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -419,6 +419,89 @@ async def write_board(
         data={
             "storyboard_id": board.id,
             "frames": len(written),
+            "model": _model_used(result),
+        },
+    )
+    return board
+
+
+class ExtendRequest(BaseModel):
+    """Write more shots into a sequence that already exists."""
+
+    #: How many to add.
+    count: int = 3
+    #: ``start`` puts them before everything, ``end`` after everything, ``after`` straight after one
+    #: frame that is already there.
+    at: Literal["start", "end", "after"] = "end"
+    #: Which frame to follow. Required for ``after``; ignored otherwise.
+    after_frame_id: str | None = None
+
+
+def _insert_at(board: Storyboard, body: ExtendRequest) -> int:
+    """Which index the new shots go in at."""
+    if body.at == "start":
+        return 0
+    if body.at == "end":
+        return len(board.frames)
+
+    if not body.after_frame_id:
+        raise ValidationFailed("Say which frame the new shots should follow.")
+    frame = board.frame(body.after_frame_id)
+    if frame is None:
+        raise NotFound(f"No frame {body.after_frame_id!r} on this storyboard")
+    return board.frames.index(frame) + 1
+
+
+@router.post("/{board_id}/extend")
+async def extend_board(
+    state: StateDep, project: ProjectDep, board_id: str, body: ExtendRequest
+) -> Storyboard:
+    """Add shots at the top, at the bottom, or between two that are already there.
+
+    The model is given the shots either side of the gap and told which side is which, so what comes back
+    picks up where the sequence left off instead of restating the premise from the beginning. That is the
+    whole difference between "write me three more shots" and "write me three shots that go *here*".
+
+    The stage writes into ``board.frames`` as writing always does; keeping the existing frames and
+    splicing the new ones in at the chosen index is this route's job, exactly as appending is for
+    ``/write``.
+    """
+    board = _board(project, board_id)
+    count = max(1, min(60, body.count))
+    index = _insert_at(board, body)
+
+    kept = list(board.frames)
+    before, after = kept[:index], kept[index:]
+    position = (
+        "at the very beginning, before everything below" if not before
+        else "at the very end, after everything above" if not after
+        else "between the shots above and the shots below"
+    )
+
+    result = await _run(
+        state, project, board, _stage(state, board, "extend"),
+        options={"count": count, "before": before, "after": after, "position": position},
+    )
+
+    written = list(board.frames)
+    # Numbered from their place in the joined list, not left to `reorder`. The new frames arrive numbered
+    # from zero like every freshly written frame, so the existing ones carry the same numbers — and
+    # `reorder` sorts by `order` before renumbering, which shuffles the two sets into each other.
+    board.frames = [*before, *written, *after]
+    for position, frame in enumerate(board.frames):
+        frame.order = position
+    board.reorder()
+    board.touch()
+    state.store.save(project)
+
+    state.events.emit(
+        "storyboard.written",
+        project_id=project.id,
+        data={
+            "storyboard_id": board.id,
+            "frames": len(written),
+            "added": len(written),
+            "at": body.at,
             "model": _model_used(result),
         },
     )

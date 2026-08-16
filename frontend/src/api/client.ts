@@ -351,6 +351,20 @@ export const api = {
       request<Storyboard>(`/api/projects/${projectId}/storyboards/${boardId}/write`, {
         method: 'POST', body: json(body),
       }),
+    /**
+     * Write more shots into a board that already has some.
+     *
+     * `at` says where they go; `after_frame_id` names the frame to follow when it is `'after'`. The
+     * model is given the shots either side, so what comes back joins up rather than restarting.
+     */
+    extend: (
+      projectId: string,
+      boardId: string,
+      body: { count: number; at: 'start' | 'end' | 'after'; after_frame_id?: string },
+    ) =>
+      request<Storyboard>(`/api/projects/${projectId}/storyboards/${boardId}/extend`, {
+        method: 'POST', body: json(body),
+      }),
     suggestCharacters: (projectId: string, boardId: string) =>
       request<StoryboardCharacter[]>(
         `/api/projects/${projectId}/storyboards/${boardId}/characters/suggest`,

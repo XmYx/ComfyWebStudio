@@ -370,6 +370,7 @@ function TrackArea({
   snapping: boolean
 }) {
   const toast = useToast()
+  const fail = (error: unknown) => toast.push('bad', (error as ApiError).message)
   const selectedClips = useStudio((s) => s.selectedClips)
   const selectClips = useStudio((s) => s.selectClips)
   const toggleClip = useStudio((s) => s.toggleClip)
@@ -790,6 +791,7 @@ function TrackArea({
                     onSnapGuide={setSnapGuide}
                     onSelect={(event) => clickClip(event, track, clip)}
                     alsoSelected={selectedIds.has(clip.id) ? selectedObjects : []}
+                    onFailed={fail}
                     onChanged={onChanged}
                     onContextMenu={(event) => {
                       onSelectClip({ trackId: track.id, clipId: clip.id })
@@ -946,7 +948,7 @@ function TrackHeader({
 
 function ClipBlock({
   project, track, clip, zoom, status, selected, snapping, playhead, onSnapGuide,
-  onSelect, onChanged, onContextMenu, alsoSelected,
+  onSelect, onChanged, onContextMenu, alsoSelected, onFailed,
 }: {
   project: Project
   track: Track
@@ -962,6 +964,8 @@ function ClipBlock({
   onContextMenu: (event: React.MouseEvent) => void
   /** The other selected clips, which a drag carries along. */
   alsoSelected: Array<{ track: Track; clip: Clip }>
+  /** Told when a drag could not be saved, so the clip does not silently keep a position it never got. */
+  onFailed: (error: unknown) => void
 }) {
   const dragState = useRef<{ mode: 'move' | 'trim'; x: number; start: number; duration: number } | null>(null)
 
@@ -971,9 +975,16 @@ function ClipBlock({
     dragState.current = { mode, x: event.clientX, start: clip.start, duration: clip.duration }
     const targets = snapTargets(project.timeline, playhead, clip.id)
 
-    /** Where this drag would put the clip, snapped. Alt holds it exactly where the pointer is. */
-    const resolve = (move: MouseEvent) => {
-      const state = dragState.current!
+    /**
+     * Where this drag would put the clip, snapped. Alt holds it exactly where the pointer is.
+     *
+     * The drag's own state is passed in rather than read from the ref. `onUp` clears the ref before it
+     * works out where the release landed, so reading it here threw on every single release — and since
+     * nothing awaits `onUp`, the rejection was swallowed and the clip simply kept the inline style the
+     * drag had given it until the next refetch quietly put it back. Neither moving nor trimming has ever
+     * been saved.
+     */
+    const resolve = (move: MouseEvent, state: NonNullable<typeof dragState.current>) => {
       const delta = (move.clientX - state.x) / zoom
       const on = snapping && !move.altKey
       if (state.mode === 'move') {
@@ -1012,7 +1023,7 @@ function ClipBlock({
       const element = document.getElementById(`clip-${clip.id}`)
       if (!element) return
       const state = dragState.current
-      const { start, duration, guide } = resolve(move)
+      const { start, duration, guide } = resolve(move, state)
       element.style.left = `${start * zoom}px`
       element.style.width = `${duration * zoom}px`
 
@@ -1034,7 +1045,7 @@ function ClipBlock({
       if (!state) return
 
       if (Math.abs(up.clientX - state.x) < 2) return
-      const { start, duration } = resolve(up)
+      const { start, duration } = resolve(up, state)
       const moved = start - state.start
       const grew = duration - state.duration
 
@@ -1049,11 +1060,17 @@ function ClipBlock({
 
       // Persisted once, on release — dragging fires far too often to PATCH every frame — and in the
       // order `travelOrder` gives, so that no clip lands on one that has not moved out of the way yet.
-      for (const item of travelOrder(carried, moved)) {
-        await api.timeline.updateClip(project.id, item.trackId, item.id,
-          state.mode === 'move'
-            ? { start: Math.max(0, item.start + moved) }
-            : { duration: Math.max(0.04, item.duration + grew) })
+      try {
+        for (const item of travelOrder(carried, moved)) {
+          await api.timeline.updateClip(project.id, item.trackId, item.id,
+            state.mode === 'move'
+              ? { start: Math.max(0, item.start + moved) }
+              : { duration: Math.max(0.04, item.duration + grew) })
+        }
+      } catch (error) {
+        // Nothing awaits this handler, so an unreported failure is an unhandled rejection and a clip
+        // left sitting where the drag put it, wrongly.
+        onFailed(error)
       }
       onChanged()
     }

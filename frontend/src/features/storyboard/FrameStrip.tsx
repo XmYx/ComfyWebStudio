@@ -23,6 +23,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { api, ApiError } from '@/api/client'
 import type { Artifact, Project, RunStatus, Storyboard, StoryboardFrame } from '@/api/types'
+import { AddShots } from './AddShots'
 import { isOurDrag, readDrag } from '@/lib/dnd'
 import { useStudio } from '@/store/studio'
 import {
@@ -192,9 +193,11 @@ export function FrameStrip({ project, board, onChanged }: Props) {
             >
               {draw.isPending ? <Spinner /> : null} Draw all
             </Button>
+            <AddShots project={project} board={board} onChanged={onChanged} />
             <Button
               size="sm"
               variant="ghost"
+              title="Add one empty frame to write yourself"
               onClick={async () => {
                 await api.storyboards.addFrame(project.id, board.id)
                 onChanged()
@@ -419,9 +422,16 @@ export function FrameStrip({ project, board, onChanged }: Props) {
                   >
                     {madeShot(frame) ? 'Shot made' : 'Make the shot'}
                   </Button>
+                  <AddShots
+                    project={project}
+                    board={board}
+                    onChanged={onChanged}
+                    afterFrameId={frame.id}
+                    className="ml-auto"
+                  />
                   {frame.action && (
-                    <span className={cx('ml-auto truncate text-[10px] text-[var(--color-ink-dim)]')}>
-                      {frame.action.slice(0, 70)}
+                    <span className={cx('truncate text-[10px] text-[var(--color-ink-dim)]')}>
+                      {frame.action.slice(0, 40)}
                     </span>
                   )}
                 </div>

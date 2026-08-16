@@ -108,13 +108,7 @@ class TimelineRenderer:
 
         with av.open(str(destination), mode="w") as container:
             stream = container.add_stream("flac", rate=rate, layout="stereo")
-            frame = av.AudioFrame.from_ndarray(
-                mixed.T.reshape(1, -1).astype(np.float32), format="flt", layout="stereo"
-            )
-            frame.sample_rate = rate
-            frame.pts = 0
-            container.mux(stream.encode(frame))
-            container.mux(stream.encode(None))
+            _encode_audio(av, container, stream, mixed, rate)
 
         return RenderResult(
             path=destination, kind="audio", duration=timeline.duration, frames=0, warnings=warnings
@@ -164,14 +158,12 @@ class TimelineRenderer:
 
             if audio_stream is not None:
                 self.on_progress(0.98, "Mixing audio")
-                mixed = self._mix_audio(audio_clips, duration, self.settings.audio_sample_rate)
-                frame = av.AudioFrame.from_ndarray(
-                    mixed.T.reshape(1, -1).astype(np.float32), format="flt", layout="stereo"
-                )
-                frame.sample_rate = self.settings.audio_sample_rate
-                frame.pts = 0
-                container.mux(audio_stream.encode(frame))
-                container.mux(audio_stream.encode(None))
+                # Mixed to the *video's* length, not the timeline's: the picture is a whole number of
+                # frames and the sound has to end with it. A mix a few milliseconds longer or shorter
+                # leaves a player with two streams that disagree about where the end is.
+                rate = self.settings.audio_sample_rate
+                mixed = self._mix_audio(audio_clips, total_frames / fps, rate)
+                _encode_audio(av, container, audio_stream, mixed, rate)
 
         self.on_progress(1.0, "Done")
         return RenderResult(
@@ -229,6 +221,41 @@ class TimelineRenderer:
         if peak > 1.0:
             mix /= peak
         return mix
+
+
+def _encode_audio(av_module, container, stream, mixed: np.ndarray, rate: int) -> None:
+    """Feed a mixed stereo buffer to an audio stream, in the frames its codec actually wants.
+
+    Two things here were wrong for as long as this file has existed, and they compounded.
+
+    **Layout.** ``mixed`` is ``(samples, 2)`` — interleaved, which is what ``flt`` means. Transposing it
+    first and flattening produced ``L0 L1 … Ln R0 R1 … Rn``, a *planar* buffer handed over as if it were
+    interleaved. The encoder then read every other sample as the other channel, so each channel played at
+    twice the pitch and the two arrived one after the other: the sound of every clip, heard twice.
+
+    **Frame size.** AAC encodes in fixed blocks of 1024 samples. Handing it the whole mix as one frame
+    leaves the timing to the encoder's internal buffering, which is where the few stray milliseconds at
+    the end came from. Chunked to ``frame_size`` with a running ``pts``, every block lands where it was
+    put.
+    """
+    frame_size = getattr(stream.codec_context, "frame_size", 0) or 1024
+    total = len(mixed)
+    written = 0
+
+    while written < total:
+        block = mixed[written : written + frame_size]
+        frame = av_module.AudioFrame.from_ndarray(
+            np.ascontiguousarray(block.reshape(1, -1), dtype=np.float32),
+            format="flt",
+            layout="stereo",
+        )
+        frame.sample_rate = rate
+        frame.time_base = Fraction(1, rate)
+        frame.pts = written
+        container.mux(stream.encode(frame))
+        written += len(block)
+
+    container.mux(stream.encode(None))
 
 
 def _pan_gains(pan: float) -> np.ndarray:

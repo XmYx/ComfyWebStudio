@@ -137,6 +137,121 @@ def i2v_prompt() -> dict:
     }
 
 
+# -- adding more shots ----------------------------------------------------------------------------------
+
+
+async def _written(client):
+    """A board with the two scripted shots on it."""
+    pid, bid, _d, _a = await storyboard_project(client)
+    board = (await client.post(f"/api/projects/{pid}/storyboards/{bid}/write", json={})).json()
+    return pid, bid, board
+
+
+async def test_more_shots_can_be_added_at_the_end(client):
+    pid, bid, board = await _written(client)
+    original = [f["id"] for f in board["frames"]]
+
+    extended = (
+        await client.post(
+            f"/api/projects/{pid}/storyboards/{bid}/extend", json={"count": 2, "at": "end"}
+        )
+    ).json()
+    ids = [f["id"] for f in extended["frames"]]
+    assert ids[: len(original)] == original, "what was there stayed where it was"
+    assert len(ids) == len(original) + 2
+    assert [f["order"] for f in extended["frames"]] == list(range(len(ids))), "renumbered in order"
+
+
+async def test_more_shots_can_be_added_at_the_beginning(client):
+    pid, bid, board = await _written(client)
+    original = [f["id"] for f in board["frames"]]
+
+    extended = (
+        await client.post(
+            f"/api/projects/{pid}/storyboards/{bid}/extend", json={"count": 2, "at": "start"}
+        )
+    ).json()
+    ids = [f["id"] for f in extended["frames"]]
+    assert ids[-len(original) :] == original, "the original shots were pushed down, not overwritten"
+    assert ids[: len(ids) - len(original)] and set(ids[:2]).isdisjoint(original), "the new ones lead"
+    assert [f["order"] for f in extended["frames"]] == list(range(len(ids)))
+
+
+async def test_more_shots_can_be_added_between_two_that_exist(client):
+    pid, bid, board = await _written(client)
+    first, second = board["frames"][0], board["frames"][1]
+
+    extended = (
+        await client.post(
+            f"/api/projects/{pid}/storyboards/{bid}/extend",
+            json={"count": 2, "at": "after", "after_frame_id": first["id"]},
+        )
+    ).json()
+    ids = [f["id"] for f in extended["frames"]]
+    assert ids[0] == first["id"]
+    assert ids[-1] == second["id"], "the shot that followed still follows"
+    assert len(ids) == 4
+
+
+async def test_the_model_is_told_what_comes_before_and_after(client):
+    """The whole point: shots written for a gap, not the premise restated from the top."""
+    pid, bid, board = await _written(client)
+    first = board["frames"][0]
+    ScriptedProvider.calls.clear()
+
+    await client.post(
+        f"/api/projects/{pid}/storyboards/{bid}/extend",
+        json={"count": 1, "at": "after", "after_frame_id": first["id"]},
+    )
+    prompt = ScriptedProvider.calls[-1]["prompt"]
+    assert "THE SHOTS THAT COME BEFORE" in prompt
+    assert board["frames"][0]["title"] in prompt
+    assert "THE SHOTS THAT COME AFTER" in prompt
+    assert board["frames"][1]["title"] in prompt
+    assert "between the shots above and the shots below" in prompt
+
+
+async def test_writing_at_the_beginning_does_not_pretend_there_is_anything_before(client):
+    """The optional block drops out rather than heading an empty list."""
+    pid, bid, _board = await _written(client)
+    ScriptedProvider.calls.clear()
+
+    await client.post(
+        f"/api/projects/{pid}/storyboards/{bid}/extend", json={"count": 1, "at": "start"}
+    )
+    prompt = ScriptedProvider.calls[-1]["prompt"]
+    assert "THE SHOTS THAT COME BEFORE" not in prompt
+    assert "THE SHOTS THAT COME AFTER" in prompt
+    assert "at the very beginning" in prompt
+
+
+async def test_how_many_to_add_is_asked_for_and_bounded(client):
+    pid, bid, _board = await _written(client)
+    ScriptedProvider.calls.clear()
+
+    await client.post(
+        f"/api/projects/{pid}/storyboards/{bid}/extend", json={"count": 500, "at": "end"}
+    )
+    assert "exactly 60 more shots" in ScriptedProvider.calls[-1]["prompt"], "clamped, not refused"
+
+
+async def test_adding_after_a_frame_that_is_not_there_is_refused(client):
+    pid, bid, _board = await _written(client)
+    response = await client.post(
+        f"/api/projects/{pid}/storyboards/{bid}/extend",
+        json={"count": 1, "at": "after", "after_frame_id": "frame_nope"},
+    )
+    assert response.status_code == 404
+
+
+async def test_adding_after_nothing_in_particular_is_refused(client):
+    pid, bid, _board = await _written(client)
+    response = await client.post(
+        f"/api/projects/{pid}/storyboards/{bid}/extend", json={"count": 1, "at": "after"}
+    )
+    assert response.status_code == 422
+
+
 async def storyboard_project(client, *, seed: bool = False):
     """A project with both workflows bound, and a written board."""
     project = await make_project(client)

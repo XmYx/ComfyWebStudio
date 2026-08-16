@@ -35,7 +35,7 @@ class TestSeeingTheFlow:
         pid, bid, _d, _a = await storyboard_project(client)
         payload = await board_pipeline(client, pid, bid)
         assert [s["id"] for s in payload["stages"]] == [
-            "write", "suggest_characters", "draw", "capture", "describe", "shot",
+            "write", "extend", "suggest_characters", "draw", "capture", "describe", "shot",
         ]
 
     async def test_a_stage_says_what_it_is_and_what_it_may_write_to(self, client):

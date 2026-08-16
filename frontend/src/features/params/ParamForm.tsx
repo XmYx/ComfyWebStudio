@@ -11,6 +11,7 @@ import type { ParamSpec } from '@/api/types'
 import { ContextMenu, useContextMenu, type MenuItem } from '@/components/ContextMenu'
 import { useCommandContext } from '@/features/menu/useCommandContext'
 import { Badge, Button, Select, TextArea, TextInput, cx } from '@/components/ui'
+import { choiceOptions, isMissing } from './choices'
 
 const SAVE_DEBOUNCE_MS = 400
 
@@ -227,13 +228,23 @@ const WIDGETS: Record<string, (props: WidgetProps) => ReactNode> = {
     )
   },
 
-  choice: ({ param, value, onChange }) => (
-    <Select value={String(value ?? '')} onChange={(e) => onChange(e.target.value)}>
-      {(param.choices ?? []).map((choice) => (
-        <option key={choice} value={choice}>{choice}</option>
-      ))}
-    </Select>
-  ),
+  choice: ({ param, value, onChange }) => {
+    const current = String(value ?? '')
+    const options = choiceOptions(current, param.choices ?? [])
+    const missing = isMissing(current, param.choices ?? [])
+    return (
+      <Select
+        value={current}
+        onChange={(e) => onChange(e.target.value)}
+        title={missing ? 'This workflow uses something this ComfyUI does not have installed.' : undefined}
+        className={missing ? 'border-[var(--color-warn)]' : undefined}
+      >
+        {options.map((choice) => (
+          <option key={choice.value} value={choice.value}>{choice.label}</option>
+        ))}
+      </Select>
+    )
+  },
 }
 
 /**

@@ -153,9 +153,13 @@ async def run_llm(
     started = time.monotonic()
     outcome = Outcome(runs=[entry])
 
+    # `before`/`after`/`position` are set only when a caller is writing into a particular place in the
+    # sequence. Everywhere else they are empty, and the optional blocks that mention them drop out.
     context = build_context(
         ctx.project, ctx.board, frame,
         count=options.get("count"), outputs=ctx.outputs, previous=ctx.previous,
+        before=options.get("before"), after=options.get("after"),
+        position=options.get("position", ""),
     )
     entry.system, system_unknown = render(stage.system, context)
     entry.prompt, prompt_unknown = render(stage.prompt, context)

@@ -81,11 +81,24 @@ def _probe_video(path: Path) -> dict[str, Any]:
         frames = int(stream.frames) if stream.frames else None
         if frames is None and duration and rate:
             frames = int(duration * float(rate))
+
+        # Frames over rate, whenever both are known. The container's own duration is a presentation
+        # length: it carries the edit list, the encoder's priming and a microsecond rounding, so a clip
+        # of exactly N frames routinely reports a few milliseconds more. A timeline that takes that at
+        # face value gives the clip N+1 frames — and the last one has nothing behind it, which is the
+        # held frame at the end of every freshly placed clip.
+        exact = False
+        if frames and rate:
+            duration = frames / float(rate)
+            exact = True
         info: dict[str, Any] = {
             "width": stream.codec_context.width,
             "height": stream.codec_context.height,
             "fps": float(rate) if rate else None,
-            "duration": round(duration, 4) if duration else None,
+            # Kept exact when it came from the frame count. Rounding 49/24 to six places gives
+            # 2.041667, which is a hair *over* 49 frames — enough for anything that rounds up to make it
+            # 50. Only the fallback, which was never exact to begin with, is tidied.
+            "duration": (duration if exact else round(duration, 6)) if duration else None,
             "frames": frames,
             "codec": stream.codec_context.name,
         }

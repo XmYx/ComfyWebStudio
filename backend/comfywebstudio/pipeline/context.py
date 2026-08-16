@@ -31,6 +31,22 @@ def character_block(board: Storyboard, only: list[str] | None = None) -> str:
     )
 
 
+def frame_block(frames: list[StoryboardFrame]) -> str:
+    """The shots, as a numbered outline a model can read the story from.
+
+    Enough to know what happens and how it is framed, and no more: handing over every image prompt as
+    well would spend most of the budget on descriptions of pictures the model is not being asked to
+    write, and push the shots it *is* being asked about out of the useful part of its attention.
+    """
+    lines = []
+    for frame in frames:
+        title = frame.title or f"Shot {frame.order + 1}"
+        action = frame.action or frame.image_prompt or ""
+        camera = f" ({frame.camera})" if frame.camera else ""
+        lines.append(f"{frame.order + 1}. {title} — {action}{camera}".rstrip(" —"))
+    return "\n".join(lines)
+
+
 def build_context(
     project: Any,
     board: Storyboard,
@@ -40,12 +56,19 @@ def build_context(
     outputs: dict[str, dict[str, Any]] | None = None,
     previous: str | None = None,
     character: StoryboardCharacter | None = None,
+    before: list[StoryboardFrame] | None = None,
+    after: list[StoryboardFrame] | None = None,
+    position: str = "",
 ) -> dict[str, str]:
     """The tokens available to a stage's templates.
 
     `outputs` carries what earlier stages in this pipeline run returned, keyed by stage id, reachable as
     ``{stage.<id>.<key>}``; `previous` names the stage whose outputs are also reachable as ``{prev.<key>}``.
     `character` is set when the work is about one person rather than one frame — drawing their reference.
+
+    `before` and `after` are the shots either side of a point new ones are being written into, and
+    `position` names that point in words. They are what lets a stage write shots that *join up*: told
+    only how many to write, a model restates the premise from the top every time.
     """
     characters = character_block(board)
     context: dict[str, str] = {
@@ -60,6 +83,14 @@ def build_context(
         "count": str(count if count is not None else len(board.frames)),
         "project.name": getattr(project, "name", "") or "",
     }
+    # Empty when there is nothing on that side, which is exactly what an `[[optional block]]` in a
+    # template needs to drop itself — writing at the very beginning should not carry a heading over
+    # nothing.
+    context["story.before"] = frame_block(before or [])
+    context["story.after"] = frame_block(after or [])
+    context["story.all"] = frame_block(board.frames)
+    context["position"] = position
+
     for key, value in board.fields.items():
         context[f"board.fields.{key}"] = value
 
