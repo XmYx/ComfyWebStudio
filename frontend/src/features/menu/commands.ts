@@ -92,6 +92,26 @@ function selectedClip(project: Project | null): { track: string; clip: Clip } | 
   return track && clip ? { track: track.id, clip } : null
 }
 
+/**
+ * The shots ticked in the shots panel.
+ *
+ * Ticking is deliberate and a plain click clears it, so a non-empty set means the user has just said
+ * "these ones" — which is why the edit commands look here before they look at the selected step. It
+ * survives only as ids; the shots themselves are resolved against the project so a deleted one drops out.
+ */
+function selectedShots(project: Project | null): Shot[] {
+  const ids = useStudio.getState().selectedShotIds
+  if (!project || !ids.length) return []
+  return project.shots.filter((s) => !s.template_edit_id && ids.includes(s.id))
+}
+
+async function duplicateShots(ctx: CommandContext, shots: Shot[]): Promise<void> {
+  let last = ''
+  for (const shot of shots) last = (await api.shots.duplicate(ctx.project!.id, shot.id)).id
+  if (last) useStudio.getState().setShot(last)
+  useStudio.getState().setSelectedShots([])
+}
+
 export const COMMANDS: Command[] = [
   // -- File ------------------------------------------------------------------------------------------
   {
@@ -300,10 +320,16 @@ export const COMMANDS: Command[] = [
     id: 'edit.copy',
     label: 'Copy',
     shortcut: 'Mod+C',
-    enabled: (ctx) => hasStep(ctx) || selectedClip(ctx.project) !== null,
+    enabled: (ctx) =>
+      hasStep(ctx) || selectedClip(ctx.project) !== null || selectedShots(ctx.project).length > 0,
     run: (ctx) => {
       const clip = selectedClip(ctx.project)
-      if (ctx.step) {
+      const shots = selectedShots(ctx.project)
+      if (shots.length) {
+        const label = shots.length === 1 ? shots[0].name : `${shots.length} shots`
+        useLayout.getState().setClipboard({ kind: 'shots', payload: shots.map((s) => s.id), label })
+        ctx.toast('info', `Copied ${label}.`)
+      } else if (ctx.step) {
         useLayout.getState().setClipboard({ kind: 'step', payload: ctx.step, label: ctx.step.name })
         ctx.toast('info', `Copied step “${ctx.step.name}”.`)
       } else if (clip) {
@@ -320,6 +346,18 @@ export const COMMANDS: Command[] = [
     run: async (ctx) => {
       const clipboard = useLayout.getState().clipboard
       if (!clipboard || !ctx.project) return
+
+      if (clipboard.kind === 'shots') {
+        // Pasting a shot is asking the server to duplicate it: only the server knows how to remap its
+        // steps, links and placed templates without two of them sharing an id.
+        const alive = ctx.project.shots.filter((s) => (clipboard.payload as string[]).includes(s.id))
+        if (!alive.length) return ctx.toast('bad', 'The copied shots are no longer in this project.')
+        return void guard(
+          ctx,
+          () => duplicateShots(ctx, alive),
+          alive.length === 1 ? 'Shot pasted.' : `${alive.length} shots pasted.`,
+        )
+      }
 
       if (clipboard.kind === 'step') {
         if (!ctx.shot) return ctx.toast('bad', 'Open a shot to paste a step into.')
@@ -360,10 +398,19 @@ export const COMMANDS: Command[] = [
   },
   {
     id: 'edit.duplicateStep',
-    label: 'Duplicate Step',
+    label: 'Duplicate',
     shortcut: 'Mod+D',
-    enabled: hasStep,
+    enabled: (ctx) => hasStep(ctx) || selectedShots(ctx.project).length > 0,
     run: async (ctx) => {
+      const shots = selectedShots(ctx.project)
+      if (shots.length) {
+        await guard(
+          ctx,
+          () => duplicateShots(ctx, shots),
+          shots.length === 1 ? `Duplicated “${shots[0].name}”.` : `Duplicated ${shots.length} shots.`,
+        )
+        return
+      }
       useLayout.getState().setClipboard({ kind: 'step', payload: ctx.step!, label: ctx.step!.name })
       const paste = COMMANDS.find((c) => c.id === 'edit.paste')!
       await paste.run(ctx)
@@ -374,10 +421,24 @@ export const COMMANDS: Command[] = [
     label: 'Delete',
     shortcut: 'Delete',
     danger: true,
-    enabled: (ctx) => hasStep(ctx) || selectedClip(ctx.project) !== null,
+    enabled: (ctx) =>
+      hasStep(ctx) || selectedClip(ctx.project) !== null || selectedShots(ctx.project).length > 0,
     run: async (ctx) => {
       const clip = selectedClip(ctx.project)
-      if (ctx.step) {
+      const shots = selectedShots(ctx.project)
+      if (shots.length) {
+        const what = shots.length === 1 ? `“${shots[0].name}”` : `${shots.length} shots`
+        if (!window.confirm(`Delete ${what} and their steps?`)) return
+        await guard(
+          ctx,
+          async () => {
+            for (const shot of shots) await api.shots.remove(ctx.project!.id, shot.id)
+          },
+          `Deleted ${what}.`,
+        )
+        useStudio.getState().setShot(null)
+        useStudio.getState().setSelectedShots([])
+      } else if (ctx.step) {
         await guard(ctx, () => api.steps.remove(ctx.project!.id, ctx.step!.id), 'Step deleted.')
         useStudio.getState().selectStep(null)
       } else if (clip) {

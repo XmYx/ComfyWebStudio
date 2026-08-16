@@ -3,7 +3,7 @@ import { useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { api, ApiError } from '@/api/client'
-import type { RunMode } from '@/api/types'
+import type { RunMode, Shot } from '@/api/types'
 import { useStudio } from '@/store/studio'
 import { selectWidgets, useLayout } from '@/store/layout'
 import { ShotCanvas } from '@/features/graph/ShotCanvas'
@@ -36,6 +36,8 @@ export function ShotsPage() {
   const openInstance_ = useStudio((s) => s.openInstance)
   const activeRun = useStudio((s) => s.activeRun)
   const queue = useStudio((s) => s.queue)
+  const selectedShotIds = useStudio((s) => s.selectedShotIds)
+  const setSelectedShots = useStudio((s) => s.setSelectedShots)
   const seedFromResults = useStudio((s) => s.seedFromResults)
   // The transport is shared, so a floating Monitor widget follows the same playhead as the timeline.
   const playhead = useStudio((s) => s.playhead)
@@ -191,8 +193,82 @@ export function ShotsPage() {
   const openInstance = shot?.instances.find((i) => i.id === openInstanceId) ?? null
   const running = activeRun?.status === 'running' || startRun.isPending
 
-  const shotMenu = (candidate: (typeof project.shots)[number]): MenuItem[] => [
-    { type: 'header', label: candidate.name },
+  /**
+   * Which shots an operation covers: the ticked ones when the shot under the pointer is among them,
+   * otherwise just that one.
+   *
+   * Right-clicking a shot outside the selection acts on *that* shot rather than on the ticked set. The
+   * alternative — the menu quietly operating on three shots elsewhere in the list — is the kind of
+   * surprise that loses work.
+   */
+  const targetsFor = (candidate: Shot): Shot[] => {
+    const ticked = shots.filter((s) => selectedShotIds.includes(s.id))
+    return ticked.length && ticked.some((s) => s.id === candidate.id) ? ticked : [candidate]
+  }
+
+  const many = (list: unknown[], one: string, more: string) =>
+    list.length === 1 ? one : `${list.length} ${more}`
+
+  const duplicateShots = async (targets: Array<{ id: string; name: string }>) => {
+    try {
+      let last = ''
+      // In list order and one at a time: each duplicate is its own save, so a failure halfway leaves
+      // the copies that succeeded rather than an ambiguous half-batch.
+      for (const target of targets) last = (await api.shots.duplicate(project.id, target.id)).id
+      if (last) setShot(last)
+      setSelectedShots([])
+      invalidate()
+      toast.push('ok', `Duplicated ${many(targets, `“${targets[0].name}”`, 'shots')}.`)
+    } catch (error) {
+      toast.push('bad', (error as ApiError).message)
+    }
+  }
+
+  const deleteShots = async (targets: Array<{ id: string; name: string }>) => {
+    const what = many(targets, `“${targets[0].name}”`, 'shots')
+    if (!confirm(`Delete ${what} and their steps?`)) return
+    try {
+      for (const target of targets) await api.shots.remove(project.id, target.id)
+      setShot(null)
+      setSelectedShots([])
+      invalidate()
+      toast.push('ok', `Deleted ${what}.`)
+    } catch (error) {
+      toast.push('bad', (error as ApiError).message)
+    }
+  }
+
+  const copyShots = (targets: Array<{ id: string; name: string }>) => {
+    useLayout.getState().setClipboard({
+      kind: 'shots',
+      payload: targets.map((t) => t.id),
+      label: many(targets, targets[0].name, 'shots'),
+    })
+    toast.push('info', `Copied ${many(targets, `“${targets[0].name}”`, 'shots')}.`)
+  }
+
+  /** Pasting a shot is asking the server to duplicate it — see the note on `Clipboard`. */
+  const pasteShots = async () => {
+    const clipboard = useLayout.getState().clipboard
+    if (!clipboard || clipboard.kind !== 'shots') return
+    const ids = clipboard.payload as string[]
+    const alive = shots.filter((s) => ids.includes(s.id))
+    if (!alive.length) {
+      toast.push('bad', 'The copied shots are no longer in this project.')
+      return
+    }
+    await duplicateShots(alive)
+    if (alive.length < ids.length) {
+      toast.push('info', `${ids.length - alive.length} copied shot(s) had been deleted.`)
+    }
+  }
+
+  const shotMenu = (candidate: (typeof project.shots)[number]): MenuItem[] => {
+    const targets = targetsFor(candidate)
+    const scope = many(targets, candidate.name, 'shots selected')
+    const clipboard = useLayout.getState().clipboard
+    return [
+    { type: 'header', label: scope },
     { type: 'action', label: 'Run shot', onSelect: () => startRun.mutate({ mode: 'shot' }) },
     {
       type: 'action',
@@ -213,12 +289,23 @@ export function ShotsPage() {
     },
     {
       type: 'action',
-      label: 'Duplicate shot',
-      onSelect: async () => {
-        const copy = await api.shots.duplicate(project.id, candidate.id)
-        setShot(copy.id)
-        invalidate()
-      },
+      label: `Duplicate ${many(targets, 'shot', 'shots')}`,
+      shortcut: 'Mod+D',
+      onSelect: () => void duplicateShots(targets),
+    },
+    { type: 'separator' },
+    {
+      type: 'action',
+      label: `Copy ${many(targets, 'shot', 'shots')}`,
+      shortcut: 'Mod+C',
+      onSelect: () => copyShots(targets),
+    },
+    {
+      type: 'action',
+      label: clipboard?.kind === 'shots' ? `Paste ${clipboard.label}` : 'Paste',
+      shortcut: 'Mod+V',
+      disabled: clipboard?.kind !== 'shots',
+      onSelect: () => void pasteShots(),
     },
     { type: 'separator' },
     {
@@ -242,16 +329,13 @@ export function ShotsPage() {
     { type: 'separator' },
     {
       type: 'action',
-      label: 'Delete shot',
+      label: `Delete ${many(targets, 'shot', 'shots')}`,
+      shortcut: 'Delete',
       danger: true,
-      onSelect: async () => {
-        if (!confirm(`Delete “${candidate.name}” and its steps?`)) return
-        await api.shots.remove(project.id, candidate.id)
-        setShot(null)
-        invalidate()
-      },
+      onSelect: () => void deleteShots(targets),
     },
   ]
+  }
 
   // Each panel is a widget the Dock places — docked into a slot, or floating in a window of its own.
   const shotsPanel = (

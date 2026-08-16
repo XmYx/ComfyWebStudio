@@ -26,9 +26,16 @@ export interface CanvasApi {
 }
 
 export interface Clipboard {
-  kind: 'step' | 'clip'
-  /** A copy, not a reference — the source can be deleted and the paste still works. */
-  payload: Step | Clip
+  kind: 'step' | 'clip' | 'shots'
+  /**
+   * A copy, not a reference — the source can be deleted and the paste still works.
+   *
+   * Except for `shots`, which holds *ids*: pasting a shot means asking the server to duplicate it, and
+   * the server is the only thing that knows how to remap a shot's steps, links and placed templates
+   * without two of them ending up sharing an id. A shot deleted between copy and paste is reported
+   * rather than half-restored from a stale snapshot.
+   */
+  payload: Step | Clip | string[]
   label: string
 }
 
